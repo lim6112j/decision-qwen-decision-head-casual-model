@@ -10,3 +10,6 @@ models/
 
 # OS
 .DS_Store
+
+# Local tooling
+.playwright-mcp/

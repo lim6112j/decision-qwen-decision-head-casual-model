@@ -97,6 +97,21 @@ def cmd_report(args):
     print(f"Report regenerated at {args.results_dir}")
 
 
+def cmd_ui(args):
+    """Start the web UI simulator."""
+    import uvicorn
+
+    cfg = load_config(args.config)
+    print(f"Starting web UI at http://{cfg.web.host}:{cfg.web.port} "
+          f"(llama-server on port {cfg.model.server_port})")
+    uvicorn.run(
+        "decision_lab.webapp.app:app",
+        host=cfg.web.host,
+        port=cfg.web.port,
+        log_level="info",
+    )
+
+
 def cmd_all(args):
     """Run full pipeline: generate → extract → train → eval → report."""
     args_data = argparse.Namespace(config=args.config, data_dir=args.data_dir)
@@ -151,6 +166,7 @@ def main():
         ("eval", cmd_eval),
         ("report", cmd_report),
         ("all", cmd_all),
+        ("ui", cmd_ui),
     ]:
         p = sub.add_parser(cmd, help=fn.__doc__ or "")
         p.set_defaults(func=fn)

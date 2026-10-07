@@ -54,12 +54,22 @@ class BenchmarkConfig:
 
 
 @dataclass
+class WebConfig:
+    host: str = "127.0.0.1"
+    port: int = 8000
+    max_steps: int = 50
+    num_layouts: int = 5
+    random_seed: int = 42
+
+
+@dataclass
 class Config:
     grid: GridConfig = field(default_factory=GridConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     head: HeadConfig = field(default_factory=HeadConfig)
     prompt_lm: PromptLMConfig = field(default_factory=PromptLMConfig)
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
+    web: WebConfig = field(default_factory=WebConfig)
 
 
 def load_config(path: str | Path = "configs/default.yaml") -> Config:
@@ -72,6 +82,7 @@ def load_config(path: str | Path = "configs/default.yaml") -> Config:
         head=HeadConfig(**raw.get("head", {})),
         prompt_lm=PromptLMConfig(**raw.get("prompt_lm", {})),
         benchmark=BenchmarkConfig(**raw.get("benchmark", {})),
+        web=WebConfig(**raw.get("web", {})),
     )
 
     _validate(cfg)

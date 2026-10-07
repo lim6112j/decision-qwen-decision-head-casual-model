@@ -51,3 +51,11 @@ prompt_lm:
 benchmark:
   warmup_runs: 5
   timed_runs: 50
+
+# Web UI simulator
+web:
+  host: "127.0.0.1"
+  port: 8000
+  max_steps: 50          # hard cap on steps per episode
+  num_layouts: 5         # pre-generated layouts offered in the UI
+  random_seed: 42        # seed for the pre-generated UI layouts
