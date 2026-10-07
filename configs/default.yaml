@@ -1,0 +1,53 @@
+# Gridworld
+grid:
+  size: 7                # grid side length
+  wall_density: 0.15      # fraction of cells that are walls
+  min_path_length: 5      # minimum BFS path length goal→any start
+  num_train_layouts: 40
+  num_indist_test_layouts: 10
+  num_heldout_test_layouts: 10
+  heldout_size_min: 8     # heldout layout size range includes 8x8
+  heldout_size_max: 10    # heldout layout size range includes 10x10
+  heldout_wall_extra: 0.05 # extra wall density on heldout layouts
+
+# Backbone (llama-server)
+model:
+  gguf_path: "models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf"
+  context_length: 2048
+  server_port: 8080
+  pooling: "last"         # "last" or "mean"
+
+# Decision Head
+head:
+  hidden_dim: 256
+  num_actions: 5
+  dropout: 0.1
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  batch_size: 64
+  max_epochs: 100
+  patience: 10
+
+# Prompt LM
+prompt_lm:
+  temperature: 0.0
+  max_tokens: 128
+  system_prompt_zero_shot: |
+    You are a gridworld agent. Your task is to navigate to the goal 'G' while avoiding obstacles '#'.
+    You can move: up, down, left, right, wait.
+    Given the grid state below, output ONLY the best single action.
+    Output format: Answer: <action>
+
+  system_prompt_cot: |
+    You are a gridworld agent. Your task is to navigate to the goal 'G' while avoiding obstacles '#'.
+    You can move: up, down, left, right, wait.
+    Given the grid state below, think step-by-step about the shortest path to the goal,
+    then output the best single action.
+    Output format:
+    Reasoning: <brief reasoning>
+    Answer: <action>
+
+# Benchmark
+benchmark:
+  warmup_runs: 5
+  timed_runs: 50

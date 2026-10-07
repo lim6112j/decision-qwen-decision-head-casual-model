@@ -1,0 +1,23 @@
+[project]
+name = "decision-lab"
+version = "0.1.0"
+description = "Benchmark: Qwen Decision Head vs Prompt-based Causal LM for gridworld action decisions"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
