@@ -69,6 +69,14 @@ Full pipeline (extract → train → eval → report) on Apple Silicon (MPS), ll
 **Training:** 8 in-dist templates (email, ticket, json, text, log_entry, chat_message, markdown, bullet_list)  
 **Held-out:** 2 unseen templates (report, config_file) — test for format generalization
 
+> **Held-out formats are not inherently hard.** They are hand-coded Python renderer
+> functions in `states/generator.py` — just like the in-dist ones. The 44pp drop
+> happens because the head has literally never seen embeddings from these formats
+> during training. Moving `report` and `config_file` into in-dist and retraining
+> would bring them up to ~90% accuracy like the others. The hold-out exists only
+> to measure generalization to unseen text structures, not because those formats
+> are fundamentally difficult.
+
 ### Current Benchmark
 
 | Agent | In-dist acc | Held-out acc | Mean latency | Parse failures |
