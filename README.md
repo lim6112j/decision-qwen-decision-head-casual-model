@@ -41,6 +41,9 @@ python -m decision_lab all
 
 # Or:
 bash scripts/run_all.sh
+
+# Interactive web simulator (select one of the 3 models, watch live episodes):
+python -m decision_lab ui         # opens http://127.0.0.1:8000
 ```
 
 ## Configuration
@@ -59,23 +62,29 @@ Output to `results/`:
 - `report.md` — human-readable comparison with tables
 - `metrics.json` — raw numbers for further analysis
 
-## Latest Benchmark Run (2026-10-07)
+## Latest Benchmark Run (2026-10-07, wall-restored)
 
-Full pipeline (`python -m decision_lab all`) on Apple Silicon (MPS), llama.cpp server, Qwen3.5-0.8B UD-Q4_K_XL GGUF. Wall time: ~51 min. Datasets: 1,200 train / 300 in-dist test / 300 held-out test states (held-out layouts are 8×8–10×10 with higher wall density).
+> **Correction (2026-10-07):** an earlier version of this table reported 99.3% / 89.0% for `head_trained`.
+> Those numbers were an artifact of a bug in `load_dataset` (`env/dataset.py`): layouts were rebuilt with the
+> goal but **without walls**, so feature extraction, training, and eval all ran on wall-free grids — a
+> trivially learnable geometry task. The bug is fixed; the pipeline was fully re-run
+> (re-extract → retrain → re-eval). Numbers below are the corrected ones.
+
+Full pipeline (extract → train → eval → report) on Apple Silicon (MPS), llama.cpp server, Qwen3.5-0.8B UD-Q4_K_XL GGUF. Datasets: 1,200 train / 300 in-dist test / 300 held-out test states (held-out layouts are 8×8–10×10 with higher wall density).
 
 | Agent | In-dist acc | Held-out acc | Mean latency | Parse failures |
 |---|---|---|---|---|
-| `head_trained` | **99.3%** | **89.0%** | 0.4 ms | 0 |
-| `head_random` | 0.0% | 5.7% | 0.3 ms | 0 |
-| `prompt_lm_zero_shot` | 5.7% | 5.3% | ~90 ms | 32 / 16 of 300 |
+| `head_trained` | **64.3%** | **46.0%** | 0.4 ms | 0 |
+| `head_random` | 16.3% | 23.7% | 0.6 ms | 0 |
+| `prompt_lm_zero_shot` | 8.7% | 2.3% | ~96 ms | 64 / 93 of 300 |
 
 Key findings:
 
-- **Trained head dominates the zero-shot LM**: 99.3% vs 5.7% accuracy at ~200× lower latency.
-- **Generalization gap is the headline number**: head accuracy drops 10.3pp on unseen larger layouts (99.3% → 89.0%).
-- **Zero-shot LM is at chance with a "Right" bias**: nearly all outputs are `Answer: Right` regardless of the grid state (avg 2.1 tokens).
+- **Trained head still clearly outperforms the zero-shot LM** (64.3% vs 8.7% in-dist) at ~250× lower latency — but the margin is far smaller than the wall-free numbers suggested.
+- **Navigating around walls is genuinely hard for the head**: with walls actually present in the state renders, a 2-layer MLP on frozen backbone embeddings reaches only 0.629 val accuracy (best, early stop at epoch 16). Chance is 20%.
+- **Generalization gap**: head accuracy drops 18.3pp on unseen larger layouts (64.3% → 46.0%).
+- **Zero-shot LM is at chance with a "Right" bias**: nearly all outputs are `Answer: Right` regardless of the grid state (avg 2.2 tokens), and roughly 1 in 5 outputs fails to parse as an action.
 - **Qwen3.5 is a thinking model**: without `enable_thinking: false` (passed as `chat_template_kwargs` in `LlamaServer.chat`), all 128 `max_tokens` are consumed inside `reasoning_content` and `content` comes back empty — every LM decision parse-fails. The flag is required for this benchmark.
-- Head training: best val_acc 0.996, early stop at epoch 57.
 
 Quick sanity check without the full pipeline (one question per test set, all three agents):
 

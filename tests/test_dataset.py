@@ -105,3 +105,32 @@ class TestLoadDataset:
             for s in states:
                 assert s.label is not None
                 assert isinstance(s.render(), str)
+
+    def test_load_restores_walls(self):
+        cfg = Config()
+        cfg.grid.num_train_layouts = 3
+        cfg.grid.num_indist_test_layouts = 1
+        cfg.grid.num_heldout_test_layouts = 1
+        cfg.grid.size = 7
+        cfg.grid.wall_density = 0.2
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            generate_gridworld_data(cfg, data_dir)
+
+            lines = [json.loads(l) for l in (data_dir / "train.jsonl").read_text().strip().splitlines()]
+            states = load_dataset(data_dir / "train.jsonl")
+
+            for d, state in zip(lines, states):
+                # every '#' in the rendered text must be a wall cell, 'G' the goal
+                grid_lines = [
+                    l for l in d["text"].splitlines()
+                    if l and not l.startswith(("Agent:", "Goal:"))
+                ]
+                for r, line_text in enumerate(grid_lines):
+                    for c, ch in enumerate(line_text):
+                        if ch == "#":
+                            assert state.layout.cells[r, c] == 1, f"wall missing at {(r, c)}"
+                        if ch == "G":
+                            assert state.layout.cells[r, c] == 2
+                assert state.label == d["action"]

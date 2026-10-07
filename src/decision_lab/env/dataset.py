@@ -8,7 +8,7 @@ from random import Random
 from typing import Optional
 
 from decision_lab.config import Config
-from decision_lab.env.gridworld import GridLayout, GridState, ACTION_NAMES
+from decision_lab.env.gridworld import GOAL, WALL, GridLayout, GridState, ACTION_NAMES
 
 STATE_SEED = 0x_DEC1DE
 
@@ -115,11 +115,36 @@ def _layouts_to_jsonl(
     return rows
 
 
-def load_dataset(path: Path) -> list[GridState]:
-    """Load JSONL into list of GridState objects (for inference/eval)."""
-    from decision_lab.env.gridworld import GridLayout
+def _layout_from_text(row: dict) -> GridLayout:
+    """Rebuild a layout (walls + goal) from the rendered ASCII in a JSONL row."""
     import numpy as np
 
+    grid_lines = [
+        line for line in row["text"].splitlines()
+        if line and not line.startswith(("Agent:", "Goal:"))
+    ]
+    cells = np.zeros((row["layout_rows"], row["layout_cols"]), dtype=np.int32)
+    for r, line in enumerate(grid_lines):
+        for c, ch in enumerate(line):
+            if ch == "#":
+                cells[r, c] = WALL
+            elif ch == "G":
+                cells[r, c] = GOAL
+
+    gr, gc = row["goal_pos"]
+    assert cells[gr, gc] == GOAL, (
+        f"layout {row['layout_id']}: goal_pos {row['goal_pos']} "
+        f"does not match rendered text"
+    )
+    return GridLayout(
+        rows=row["layout_rows"], cols=row["layout_cols"],
+        cells=cells, goal_pos=(gr, gc),
+    )
+
+
+def load_dataset(path: Path) -> list[GridState]:
+    """Load JSONL into list of GridState objects, restoring walls from the
+    rendered text (for inference/eval)."""
     state_cache: dict[int, GridLayout] = {}
     states = []
     for line in path.read_text().strip().splitlines():
@@ -128,13 +153,7 @@ def load_dataset(path: Path) -> list[GridState]:
         d = json.loads(line)
         lid = d["layout_id"]
         if lid not in state_cache:
-            cells = np.zeros((d["layout_rows"], d["layout_cols"]), dtype=np.int32)
-            gr, gc = d["goal_pos"]
-            cells[gr, gc] = 2
-            state_cache[lid] = GridLayout(
-                rows=d["layout_rows"], cols=d["layout_cols"],
-                cells=cells, goal_pos=(gr, gc),
-            )
+            state_cache[lid] = _layout_from_text(d)
         states.append(GridState(
             layout=state_cache[lid],
             agent_pos=tuple(d["agent_pos"]),
