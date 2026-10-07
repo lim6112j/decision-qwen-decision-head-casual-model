@@ -82,7 +82,8 @@ Key findings:
 
 - **Typed head dominates in-dist** (92.5%) at ~1,800× lower latency than prompt LM — but drops 44pp on held-out formats (48.7%). The head overfits to surface text patterns in the training templates.
 - **Prompt LM inverts**: does *better* on held-out (64.5% vs 60.5%) because it reads text directly rather than relying on format-dependent embeddings.
-- **Dynamic head** (82.3% in-dist, 38.7% held-out) supports any number of options at inference without retraining — trade ~10pp in-dist for full flexibility.
+- **Dynamic head** (82.2% in-dist, 39.1% held-out) supports any number of options at inference without retraining — trade ~10pp in-dist for full flexibility.
+- **Qwen backbone is never modified.** Training only touches the head MLP (~400K params for typed, ~100K for dynamic). The GGUF model file (`models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf`) is served read-only by llama-server for embedding extraction and chat completion. The backbone never sees gradients — all training happens on pre-extracted frozen embeddings.
 - **LoRA adapter on frozen embeddings does not help** held-out generalization. A post-hoc low-rank transformation (rank=64) trained on in-dist embeddings can only re-weight existing dimensions — it cannot bridge the fundamental gap between embeddings of different text formats. Held-out actually regressed (48.7% → 43.5% with adapter). The bottleneck is the frozen Qwen3.5-0.8B backbone, which produces format-specific embeddings that no amount of post-hoc linear transformation can align.
 
 ### Generalization: dynamic head on novel option sets (zero retraining)
