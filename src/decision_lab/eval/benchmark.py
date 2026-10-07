@@ -426,13 +426,17 @@ def _embed_options_batch(server, option_texts: list[str]) -> dict[str, np.ndarra
 def _load_dynamic_for_benchmark(
     cfg: Config, models_dir: Path, device: torch.device,
 ) -> tuple[DynamicDecisionHead, float]:
-    """Load trained dynamic head checkpoint or fall back to random init."""
+    """Load trained dynamic head checkpoint or fall back to random init.
+
+    A missing checkpoint falls back to random init (the honest "untrained"
+    baseline). A checkpoint that exists but fails to load is an *error*
+    (stale/corrupt artifact) and is raised rather than silently degrading
+    to random weights.
+    """
     path = models_dir / "head_dynamic.pt"
     try:
         head = load_dynamic_head(str(path), device=device)
-        temperature = getattr(head, "temperature", 1.0)
-        print(f"  loaded dynamic head from {path} (T={temperature:.3f})")
-    except (FileNotFoundError, ValueError, RuntimeError):
+    except FileNotFoundError:
         print(f"  no dynamic head checkpoint at {path}; using random init")
         head = create_random_dynamic_head(
             hidden_dim=cfg.dynamic_head.hidden_dim,
@@ -440,4 +444,14 @@ def _load_dynamic_for_benchmark(
             dropout=cfg.dynamic_head.dropout,
         ).to(device)
         temperature = 1.0
+    except (ValueError, RuntimeError) as exc:
+        raise RuntimeError(
+            f"dynamic head checkpoint at {path} exists but failed to load: {exc}. "
+            f"This indicates a stale or corrupt checkpoint — retrain with "
+            f"`python -m decision_lab train-dynamic` rather than silently "
+            f"using random init."
+        ) from exc
+    else:
+        temperature = getattr(head, "temperature", 1.0)
+        print(f"  loaded dynamic head from {path} (T={temperature:.3f})")
     return head, temperature

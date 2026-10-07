@@ -1,12 +1,17 @@
 """Tests for typed-question benchmark metrics (accuracy, ECE, latency)."""
 
 import numpy as np
+import pytest
+import torch
 
+from decision_lab.config import Config
 from decision_lab.eval.benchmark import (
     EvalRow,
+    _load_dynamic_for_benchmark,
     compute_metrics,
     expected_calibration_error,
 )
+from decision_lab.head.dynamic_model import DynamicDecisionHead
 
 QUESTION_SPEC = {
     "sentiment": {
@@ -98,3 +103,58 @@ class TestECE:
         confs = np.array([0.99] * 10)
         corrects = np.ones(10)
         assert expected_calibration_error(confs, corrects) < 0.05
+
+
+class TestLoadDynamicForBenchmark:
+    """The benchmark loader must fall back only on a *missing* checkpoint,
+    and raise loudly on a checkpoint that exists but fails to load (e.g. a
+    stale LoRA-tainted artifact from an older architecture)."""
+
+    @pytest.fixture
+    def cfg(self):
+        return Config()  # dataclass defaults include dynamic_head.* attrs
+
+    def test_missing_checkpoint_falls_back_to_random(self, cfg, tmp_path):
+        head, temperature = _load_dynamic_for_benchmark(
+            cfg, tmp_path, torch.device("cpu"),
+        )
+        assert isinstance(head, DynamicDecisionHead)
+        assert temperature == 1.0
+
+    def test_corrupt_checkpoint_raises(self, cfg, tmp_path):
+        # Simulate the stale LoRA-adapter checkpoint: valid state_dict plus
+        # extra keys the current architecture no longer has.
+        state = dict(DynamicDecisionHead().state_dict())
+        state["adapter.lora_A.weight"] = torch.zeros(64, 1024)
+        state["adapter.lora_B.weight"] = torch.zeros(1024, 64)
+        torch.save(
+            {
+                "model_state": state,
+                "arch": {"type": "dynamic", "input_dim": 1024, "hidden_dim": 256, "d_k": 128},
+                "temperature": 0.7,
+            },
+            tmp_path / "head_dynamic.pt",
+        )
+        with pytest.raises(RuntimeError, match="retrain"):
+            _load_dynamic_for_benchmark(cfg, tmp_path, torch.device("cpu"))
+
+    def test_valid_checkpoint_loads(self, cfg, tmp_path):
+        head = DynamicDecisionHead()
+        torch.save(
+            {
+                "model_state": head.state_dict(),
+                "arch": {
+                    "type": "dynamic",
+                    "input_dim": head.input_dim,
+                    "hidden_dim": head.hidden_dim,
+                    "d_k": head.d_k,
+                },
+                "temperature": 2.5,
+            },
+            tmp_path / "head_dynamic.pt",
+        )
+        loaded, temperature = _load_dynamic_for_benchmark(
+            cfg, tmp_path, torch.device("cpu"),
+        )
+        assert isinstance(loaded, DynamicDecisionHead)
+        assert temperature == 2.5
