@@ -180,6 +180,44 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .step-row-latest { background: rgba(91, 140, 255, 0.10); }
 .raw-output { color: var(--muted); font-size: 12px; max-width: 220px; }
 
+/* Clickable rows + inline step detail */
+#step-table tbody tr { cursor: pointer; }
+#step-table tbody tr:hover { background: rgba(91, 140, 255, 0.06); }
+#step-table tbody tr.selected { outline: 1px solid var(--accent); }
+
+#step-table tr.detail-row td {
+  padding: 0;
+  background: var(--bg);
+  cursor: default;
+}
+.detail-content {
+  padding: 12px;
+  border-left: 2px solid var(--accent);
+}
+.detail-content h4 {
+  margin: 0 0 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.detail-content h4 + pre { margin-top: 0; }
+.detail-content h4:not(:first-child) { margin-top: 10px; }
+.detail-content pre {
+  margin: 0;
+  padding: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.35;
+  white-space: pre;
+}
+.detail-verdict { font-weight: bold; }
+.detail-verdict.mark-good { color: var(--good); }
+.detail-verdict.mark-bad { color: var(--bad); }
+
 /* Summary + compare */
 .summary {
   margin-top: 14px;

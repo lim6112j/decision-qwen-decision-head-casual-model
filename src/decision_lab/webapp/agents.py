@@ -42,6 +42,8 @@ AGENT_INFOS: tuple[AgentInfo, ...] = (
 class HeadAgent:
     """Decides via live backbone embedding → MLP head forward pass."""
 
+    system_prompt = None   # no textual prompt: the state is embedded directly
+
     def __init__(self, head: DecisionHead, server, agent_id: str):
         self._head = head
         self._server = server
@@ -66,6 +68,10 @@ class PromptAgentAdapter:
     def __init__(self, agent: PromptAgent, agent_id: str = "prompt_lm_zero_shot"):
         self._agent = agent
         self.agent_id = agent_id
+
+    @property
+    def system_prompt(self) -> str:
+        return self._agent.system_prompt
 
     def decide(self, state: GridState) -> tuple[int | None, str, float]:
         t0 = time.perf_counter()

@@ -144,6 +144,7 @@ def _episode_stream(agent_id: str, layout_id: Optional[int]):
         "grid": _grid_payload(layout, start_pos),
         "start_pos": list(start_pos),
         "optimal_steps": optimal_steps,
+        "system_prompt": getattr(agent, "system_prompt", None),
     })
 
     steps = []
@@ -161,6 +162,7 @@ def _episode_stream(agent_id: str, layout_id: Optional[int]):
             "latency_ms": round(step.latency_ms, 1),
             "raw_output": step.raw_output,
             "reached_goal": step.reached_goal,
+            "state_text": step.state_text,
         })
 
     summary: EpisodeSummary = summarize(steps, optimal_steps)

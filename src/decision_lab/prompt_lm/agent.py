@@ -30,6 +30,10 @@ class PromptAgent:
         self._temperature = pc.temperature
         self._max_tokens = pc.max_tokens
 
+    @property
+    def system_prompt(self) -> str:
+        return self._system
+
     def decide(self, state: GridState) -> tuple[Optional[int], str]:
         """Return (action_index_or_None_if_parse_failed, raw_output)."""
         messages = [

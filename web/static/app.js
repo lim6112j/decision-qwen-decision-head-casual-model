@@ -24,6 +24,8 @@ const state = {
   gridSpec: null,      // {rows, cols, walls, goal_pos}
   agentCell: null,     // [r, c] currently rendered
   running: false,
+  systemPrompt: null,  // LM agents: system prompt shown in the step detail
+  steps: new Map(),    // step_idx -> step event data (for the detail panel)
 };
 
 /* ---------- server status ---------- */
@@ -168,6 +170,8 @@ function clearLog() {
   els.stepRows.innerHTML = "";
   els.stepCount.textContent = "";
   els.summary.classList.add("hidden");
+  state.steps.clear();
+  state.systemPrompt = null;
 }
 
 function appendStep(step) {
@@ -183,10 +187,59 @@ function appendStep(step) {
     <td>${step.latency_ms} ms</td>
     <td class="raw-output">${escapeHtml(step.raw_output)}</td>
   `;
+  tr.addEventListener("click", () => showStepDetail(step, tr));
   const prev = els.stepRows.querySelector(".step-row-latest");
   if (prev) prev.classList.remove("step-row-latest");
+  state.steps.set(step.step_idx, step);
   els.stepRows.appendChild(tr);
   els.stepCount.textContent = `(${step.step_idx + 1})`;
+}
+
+function showStepDetail(step, tr) {
+  // toggle closed if the same row is clicked again
+  const existing = tr.nextElementSibling;
+  if (existing && existing.classList.contains("detail-row")) {
+    existing.remove();
+    tr.classList.remove("selected");
+    return;
+  }
+
+  closeStepDetail();
+  for (const row of els.stepRows.children) row.classList.remove("selected");
+  tr.classList.add("selected");
+
+  const mark = step.correct ? "✓" : "✗";
+  const cls = step.correct ? "mark-good" : "mark-bad";
+  const question = state.systemPrompt
+    ? `System:\n${state.systemPrompt}\n\nUser:\n${step.state_text}`
+    : `${step.state_text}\n\n(no textual question — the state render is embedded ` +
+      `by the backbone and classified by the MLP head)`;
+
+  const detailRow = document.createElement("tr");
+  detailRow.className = "detail-row";
+  detailRow.innerHTML = `
+    <td colspan="6">
+      <div class="detail-content">
+        <h4>Step ${step.step_idx} —
+          <span class="detail-verdict ${cls}">chose ${step.action_name ?? "parse-fail"},
+          optimal ${step.optimal_action_name} ${mark}</span></h4>
+        <h4>State</h4>
+        <pre>${escapeHtml(step.state_text)}</pre>
+        <h4>Question</h4>
+        <pre>${escapeHtml(question)}</pre>
+      </div>
+    </td>
+  `;
+  // ignore clicks inside the expansion so copy/select doesn't collapse it
+  detailRow.addEventListener("click", (e) => e.stopPropagation());
+  tr.after(detailRow);
+}
+
+function closeStepDetail() {
+  const open = els.stepRows.querySelector(".detail-row");
+  if (open) open.remove();
+  const selected = els.stepRows.querySelector("tr.selected");
+  if (selected) selected.classList.remove("selected");
 }
 
 function showSummary(summary) {
@@ -270,6 +323,7 @@ async function runEpisode() {
       layout_id: selectedLayoutId(),
     }, async (event) => {
       if (event.event === "start") {
+        state.systemPrompt = event.data.system_prompt;
         renderGrid(event.data.grid);
       } else if (event.event === "step") {
         await sleep(STEP_PACE_MS);
@@ -301,7 +355,10 @@ async function runCompare() {
     await postSSE("/api/compare", { layout_id: selectedLayoutId() }, async (event) => {
       if (event.event === "agent_start") {
         els.stepRows.innerHTML = "";
+        state.steps.clear();
+        state.systemPrompt = null;
       } else if (event.event === "start") {
+        state.systemPrompt = event.data.system_prompt;
         renderGrid(event.data.grid);
       } else if (event.event === "step") {
         await sleep(STEP_PACE_MS);

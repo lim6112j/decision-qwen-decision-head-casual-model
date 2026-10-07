@@ -25,6 +25,7 @@ class StepResult:
     raw_output: str
     new_pos: tuple[int, int]
     reached_goal: bool
+    state_text: str                # rendered grid the decision was made on
 
 
 @dataclass
@@ -89,6 +90,7 @@ def run_episode(
             raw_output=raw_output,
             new_pos=new_state.agent_pos,
             reached_goal=new_state.is_terminal,
+            state_text=state.render(),
         )
         state = new_state
 
