@@ -65,6 +65,42 @@ def cmd_train(args):
     train_head(features, labels_by_qid, question_spec, cfg, args.models_dir / "head_trained.pt")
 
 
+def cmd_train_dynamic(args):
+    """Train dynamic decision head (attention-based) on extracted features."""
+    from decision_lab.backbone.llama_server import LlamaServer
+    from decision_lab.head.model import build_question_spec
+    from decision_lab.head.dynamic_train import generate_dynamic_training_data, train_dynamic_head
+    from decision_lab.states.dataset import load_dataset
+
+    cfg = load_config(args.config)
+    gguf = Path(cfg.model.gguf_path).expanduser().resolve()
+
+    train_path = args.data_dir / "train.jsonl"
+    if not train_path.exists():
+        print(f"No training data at {train_path}")
+        sys.exit(1)
+
+    features = np.load(args.data_dir / "features_train.npz")["features"]
+    states = load_dataset(train_path)
+    question_spec = build_question_spec(cfg.questions)
+
+    assert len(features) == len(states), f"{len(features)} != {len(states)}"
+
+    dcfg = cfg.dynamic_head
+    print(f"Training dynamic head: {dcfg.hidden_dim} hidden, d_k={dcfg.d_k}, "
+          f"anchor_epochs={dcfg.anchor_epochs}, variants={dcfg.variants_per_question}")
+
+    with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
+        samples = generate_dynamic_training_data(
+            states, features, question_spec, server,
+            num_variants_per_question=dcfg.variants_per_question,
+        )
+        train_dynamic_head(
+            samples, cfg, args.models_dir / "head_dynamic.pt",
+            anchor_fraction=dcfg.anchor_epochs / max(dcfg.max_epochs, 1),
+        )
+
+
 def cmd_eval(args):
     """Run benchmarks for all agents on test sets."""
     from decision_lab.backbone.llama_server import LlamaServer
@@ -166,6 +202,7 @@ def main():
         ("generate", cmd_generate),
         ("extract", cmd_extract),
         ("train", cmd_train),
+        ("train-dynamic", cmd_train_dynamic),
         ("eval", cmd_eval),
         ("report", cmd_report),
         ("all", cmd_all),

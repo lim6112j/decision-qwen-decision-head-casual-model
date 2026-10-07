@@ -18,7 +18,7 @@ from decision_lab.backbone.llama_server import LlamaServer
 from decision_lab.config import Config, load_config
 from decision_lab.head.model import build_question_spec
 from decision_lab.states.dataset import TextState, load_dataset
-from decision_lab.webapp.agents import AGENT_INFOS, build_agents
+from decision_lab.webapp.agents import AGENT_INFOS, DynamicHeadAgent, build_agents
 from decision_lab.webapp.simulator import evaluate_agent
 
 STATIC_DIR = PROJECT_ROOT / "web" / "static"
@@ -86,6 +86,16 @@ class RunRequest(BaseModel):
     agent_id: str = Field(min_length=1)
     doc_id: Optional[int] = None      # index into state.states
     custom_text: Optional[str] = None  # overrides doc_id when provided
+
+
+class DynamicDecideRequest(BaseModel):
+    """Request to evaluate a state against fully dynamic question configs."""
+    doc_id: Optional[int] = None
+    custom_text: Optional[str] = None
+    questions: list[dict] = Field(min_length=1)
+    """Each dict: {"type": "choice", "options": [...], "question": "..."}
+       or {"type": "score", "levels": [...], "question": "..."}
+       or {"type": "noul", "question": "..."}"""
 
 
 def _sse(event: str, data: dict) -> str:
@@ -191,6 +201,48 @@ async def compare(req: RunRequest):
                     yield event
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.post("/api/decide-dynamic")
+async def decide_dynamic(req: DynamicDecideRequest):
+    """Evaluate a state against fully dynamic question configs.
+
+    Uses the trained dynamic head agent. Returns decoded answers for each
+    question in the request — option/level labels determine the output space.
+    """
+    if state is None:
+        raise HTTPException(status_code=503, detail="server not ready")
+
+    dynamic_agent = state.agents.get("head_dynamic")
+    if dynamic_agent is None or not isinstance(dynamic_agent, DynamicHeadAgent):
+        raise HTTPException(
+            status_code=400,
+            detail="dynamic head agent not available; train with `python -m decision_lab train-dynamic`",
+        )
+
+    s = _resolve_state_dynamic(req)
+    try:
+        answers, latency_ms = dynamic_agent.decide_dynamic(s, req.questions)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"dynamic decision failed: {exc}") from exc
+
+    return {
+        "state": _state_payload(s),
+        "answers": answers,
+        "latency_ms": round(latency_ms, 1),
+    }
+
+
+def _resolve_state_dynamic(req: DynamicDecideRequest) -> "TextState":
+    """Resolve state for dynamic decision endpoint."""
+    if req.custom_text:
+        return TextState(doc_id=-1, state_type="custom", text=req.custom_text, labels={})
+    if req.doc_id is None:
+        raise HTTPException(status_code=400, detail="provide doc_id or custom_text")
+    for s in (state.states if state else []):
+        if s.doc_id == req.doc_id:
+            return s
+    raise HTTPException(status_code=404, detail=f"doc_id {req.doc_id} not found")
 
 
 @app.get("/")

@@ -49,20 +49,21 @@ main {
   align-items: start;
 }
 
-#controls, #state-panel, #results-panel {
+#controls, #dynamic-panel, #state-panel, #results-panel {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 16px;
 }
 
-#controls h2, #state-panel h2, #results-panel h2 {
+#controls h2, #dynamic-panel h2, #state-panel h2, #results-panel h2 {
   margin: 4px 0 12px;
   font-size: 13px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--muted);
 }
+.hint { text-transform: none; letter-spacing: 0; color: var(--muted); font-size: 12px; }
 
 /* Model cards */
 .agent-card {
@@ -248,3 +249,111 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .hidden { display: none; }
 .loading { color: var(--muted); }
+
+/* Dynamic question builder */
+.dynamic-question-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.dq-header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.dq-card-num {
+  color: var(--accent);
+  font-weight: bold;
+  font-size: 12px;
+  min-width: 24px;
+}
+.dq-header select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+.dq-question-text {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+  resize: vertical;
+  margin-bottom: 8px;
+}
+.dq-options-label {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 4px;
+}
+.dq-remove, .dq-option-remove {
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 4px;
+  flex: 0;
+}
+.dq-remove:hover, .dq-option-remove:hover { color: var(--bad); }
+.dq-options { margin-bottom: 6px; }
+.dq-option-row {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 4px;
+  align-items: center;
+}
+.dq-option-input {
+  flex: 1;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+.dq-noul-hint {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 0;
+  font-style: italic;
+}
+.dq-add-option {
+  background: transparent;
+  color: var(--accent);
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  padding: 4px 12px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  width: 100%;
+}
+.dq-add-option:hover { border-color: var(--accent); }
+
+#add-question-btn {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+#run-dynamic-btn {
+  background: var(--accent);
+  color: white;
+  border: none;
+}
+
+.dynamic-result { border-color: var(--accent); }

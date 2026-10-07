@@ -17,6 +17,16 @@ from decision_lab.head.model import (
     load_head,
     predict_all,
 )
+from decision_lab.head.dynamic_model import (
+    DynamicDecisionHead,
+    create_random_dynamic_head,
+    decode_dynamic_answer,
+    load_dynamic_head,
+    make_choice_question,
+    make_noul_question,
+    make_score_question,
+    question_option_texts,
+)
 from decision_lab.states.dataset import load_dataset
 
 # Latency is measured on a subsample; accuracy is measured on every state.
@@ -88,6 +98,93 @@ def benchmark_head(
             latency_ms=float(np.mean(latencies)),
         ))
 
+    return results
+
+
+def benchmark_dynamic_head(
+    states,
+    features: np.ndarray,
+    head: DynamicDecisionHead,
+    question_spec: dict,
+    option_emb_cache: dict[str, torch.Tensor],
+    temperature: float,
+    agent_id: str,
+    device: torch.device,
+) -> list[EvalRow]:
+    """Run the dynamic head agent on all states using the fixed question bank.
+
+    Args:
+        option_emb_cache: {option_text: (input_dim,) tensor on device} —
+            pre-embedded option texts from the backbone.
+    """
+    head.eval()
+    head.to(device)
+    results = []
+
+    for i, s in enumerate(states):
+        feat = torch.tensor(features[i], dtype=torch.float32, device=device).unsqueeze(0)
+
+        # Warmup + timed runs
+        latencies = []
+        with torch.no_grad():
+            for _ in range(HEAD_WARMUP_RUNS):
+                _run_dynamic_forward(head, feat, question_spec, option_emb_cache)
+            for _ in range(HEAD_TIMED_RUNS):
+                t0 = time.perf_counter()
+                decoded = _run_dynamic_forward(
+                    head, feat, question_spec, option_emb_cache, temperature,
+                )
+                latencies.append((time.perf_counter() - t0) * 1000)
+
+        results.append(EvalRow(
+            agent_id=agent_id,
+            doc_id=s.doc_id,
+            predictions={qid: d["predicted"] for qid, d in decoded.items()},
+            gold_labels=dict(s.labels),
+            confidence={qid: d["confidence"] for qid, d in decoded.items()},
+            latency_ms=float(np.mean(latencies)),
+        ))
+
+    return results
+
+
+def _run_dynamic_forward(
+    head: DynamicDecisionHead,
+    state_tensor: torch.Tensor,
+    question_spec: dict,
+    option_emb_cache: dict[str, torch.Tensor],
+    temperature: float = 1.0,
+) -> dict:
+    """Run dynamic head on one state against the fixed question bank.
+
+    Returns {qid: decoded answer dict} — same format as predict_all for TypedDecisionHead.
+    """
+    results = {}
+    for qid, spec in question_spec.items():
+        kind = spec["type"]
+        if kind == "noul":
+            scores = head.forward_noul(state_tensor)
+            results[qid] = decode_dynamic_answer(
+                make_noul_question(spec.get("question", qid)), scores, temperature,
+            )
+        elif kind == "choice":
+            option_texts = spec["options"]
+            opt_embs = torch.stack(
+                [option_emb_cache[t] for t in option_texts]
+            )  # (n_opts, D)
+            scores = head.forward_choice(state_tensor, opt_embs)
+            results[qid] = decode_dynamic_answer(
+                make_choice_question(option_texts, qid), scores, temperature,
+            )
+        else:  # score
+            level_texts = spec["levels"]
+            opt_embs = torch.stack(
+                [option_emb_cache[t] for t in level_texts]
+            )  # (n_levels, D)
+            scores = head.forward_score(state_tensor, opt_embs)
+            results[qid] = decode_dynamic_answer(
+                make_score_question(level_texts, qid), scores, temperature,
+            )
     return results
 
 
@@ -270,7 +367,24 @@ def run_benchmark(
         rows = benchmark_head(states, features, head_random, {}, "head_random", device)
         all_metrics[test_name]["head_random"] = compute_metrics(rows, question_spec)
 
-        # 3. Prompt LM zero-shot
+        # 3. Dynamic head (attention-based, option values as inputs)
+        # Pre-embed all option texts via backbone
+        unique_option_texts = _collect_option_texts(question_spec)
+        option_emb_cache_np = _embed_options_batch(server, unique_option_texts)
+        option_emb_cache = {
+            t: torch.tensor(emb, dtype=torch.float32, device=device)
+            for t, emb in option_emb_cache_np.items()
+        }
+
+        dynamic_head, dynamic_temp = _load_dynamic_for_benchmark(cfg, models_dir, device)
+        print(f"  [{test_name}] benchmarking head_dynamic...")
+        rows = benchmark_dynamic_head(
+            states, features, dynamic_head, question_spec,
+            option_emb_cache, dynamic_temp, "head_dynamic", device,
+        )
+        all_metrics[test_name]["head_dynamic"] = compute_metrics(rows, question_spec)
+
+        # 4. Prompt LM zero-shot
         agent_zero = PromptAgent(cfg, server, mode=PromptMode.ZERO_SHOT)
         print(f"  [{test_name}] benchmarking prompt_lm_zero_shot...")
         rows = benchmark_prompt(states, agent_zero, "prompt_lm_zero_shot",
@@ -278,3 +392,49 @@ def run_benchmark(
         all_metrics[test_name]["prompt_lm_zero_shot"] = compute_metrics(rows, question_spec)
 
     return all_metrics
+
+
+def _collect_option_texts(question_spec: dict) -> list[str]:
+    """Collect all unique option/level texts from the question spec."""
+    texts: set[str] = set()
+    for spec in question_spec.values():
+        kind = spec["type"]
+        if kind == "choice":
+            texts.update(spec["options"])
+        elif kind == "score":
+            texts.update(spec["levels"])
+        elif kind == "noul":
+            texts.update(["false", "true"])
+    return sorted(texts)
+
+
+def _embed_options_batch(server, option_texts: list[str]) -> dict[str, np.ndarray]:
+    """Batch-embed option texts via the backbone."""
+    result = {}
+    batch_size = 64
+    for i in range(0, len(option_texts), batch_size):
+        batch = option_texts[i : i + batch_size]
+        embs = server.embed(batch)
+        for text, emb in zip(batch, embs):
+            result[text] = np.array(emb, dtype=np.float32)
+    return result
+
+
+def _load_dynamic_for_benchmark(
+    cfg: Config, models_dir: Path, device: torch.device,
+) -> tuple[DynamicDecisionHead, float]:
+    """Load trained dynamic head checkpoint or fall back to random init."""
+    path = models_dir / "head_dynamic.pt"
+    try:
+        head = load_dynamic_head(str(path), device=device)
+        temperature = getattr(head, "temperature", 1.0)
+        print(f"  loaded dynamic head from {path} (T={temperature:.3f})")
+    except (FileNotFoundError, ValueError, RuntimeError):
+        print(f"  no dynamic head checkpoint at {path}; using random init")
+        head = create_random_dynamic_head(
+            hidden_dim=cfg.dynamic_head.hidden_dim,
+            d_k=cfg.dynamic_head.d_k,
+            dropout=cfg.dynamic_head.dropout,
+        ).to(device)
+        temperature = 1.0
+    return head, temperature

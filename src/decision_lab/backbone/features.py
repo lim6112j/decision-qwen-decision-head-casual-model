@@ -40,3 +40,23 @@ def extract_features(
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(cache_path, features=features)
     return features
+
+
+def embed_options(server, option_texts: list[str], batch_size: int = 64) -> dict[str, np.ndarray]:
+    """Embed option/value texts via the frozen backbone.
+
+    Args:
+        server: LlamaServer instance (must be running).
+        option_texts: list of unique option text strings.
+        batch_size: texts to batch per embedding request.
+
+    Returns:
+        {text: (input_dim,) float32 embedding vector}
+    """
+    result = {}
+    for i in range(0, len(option_texts), batch_size):
+        batch = option_texts[i : i + batch_size]
+        embs = server.embed(batch)
+        for text, emb in zip(batch, embs):
+            result[text] = np.array(emb, dtype=np.float32)
+    return result

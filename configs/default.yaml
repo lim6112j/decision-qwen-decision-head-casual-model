@@ -45,6 +45,19 @@ head:
   max_epochs: 100
   patience: 10
 
+# Dynamic Decision Head (attention-based slot filling)
+dynamic_head:
+  hidden_dim: 256
+  d_k: 128
+  dropout: 0.1
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  batch_size: 64
+  max_epochs: 100
+  patience: 10
+  anchor_epochs: 30
+  variants_per_question: 3
+
 # Post-training temperature calibration (per question)
 calibration:
   holdout_fraction: 0.1

@@ -21,6 +21,7 @@ const state = {
   questions: {},        // {qid: {type, options?/levels?/question}}
   selectedAgent: null,
   running: false,
+  loadedStates: [],     // cached state list for lookup
 };
 
 /* ---------- server status ---------- */
@@ -41,6 +42,7 @@ function setReady(ready) {
   els.status.title = ready ? "server ready" : "server unavailable";
   els.runBtn.disabled = !ready || state.running;
   els.compareBtn.disabled = !ready || state.running;
+  els.runDynamicBtn.disabled = !ready;
   if (ready && els.agentCards.querySelector(".loading")) {
     loadAgents();
     loadStates();
@@ -103,7 +105,7 @@ async function loadStates() {
     customOpt.value = "custom";
     customOpt.textContent = "Custom text (paste below)";
     els.stateSelect.appendChild(customOpt);
-    els.stateSelect.addEventListener("change", toggleCustomText);
+    state.loadedStates = body.states;
     if (body.states.length > 0) renderState(body.states[0]);
   } catch (err) {
     els.stateSelect.innerHTML = `<option>Failed to load states: ${err}</option>`;
@@ -113,6 +115,17 @@ async function loadStates() {
 function toggleCustomText() {
   const isCustom = els.stateSelect.value === "custom";
   els.customText.classList.toggle("hidden", !isCustom);
+}
+
+function renderSelectedState() {
+  const val = els.stateSelect.value;
+  if (val === "custom") {
+    showCustomState();
+    return;
+  }
+  const docId = Number(val);
+  const s = state.loadedStates.find(st => st.doc_id === docId);
+  if (s) renderState(s);
 }
 
 async function loadQuestions() {
@@ -375,5 +388,256 @@ function setButtonsDisabled(disabled) {
 els.runBtn.addEventListener("click", runOne);
 els.compareBtn.addEventListener("click", runCompare);
 els.customText.addEventListener("input", showCustomState);
+els.stateSelect.addEventListener("change", () => {
+  toggleCustomText();
+  renderSelectedState();
+});
+
+/* ---------- dynamic question builder ---------- */
+
+const DYNAMIC_API_BASE = `${API_BASE}/api/decide-dynamic`;
+const QUESTION_TEMPLATES = [
+  {
+    type: "choice",
+    options: ["first", "second", "third"],
+    question: "",
+  },
+  {
+    type: "score",
+    levels: ["Bottom", "Low", "Mid", "High", "Top"],
+    question: "",
+  },
+  {
+    type: "noul",
+    question: "Is this actionable?",
+  },
+];
+
+function addDynamicQuestion(qConfig) {
+  const cfg = qConfig || { type: "choice", options: ["option-a", "option-b"], question: "" };
+  const idx = Date.now();
+  const card = document.createElement("div");
+  card.className = "dynamic-question-card";
+  card.dataset.idx = idx;
+
+  const cardNum = els.dynamicBuilder.querySelectorAll(".dynamic-question-card").length + 1;
+  const typeLabel = cfg.type === "noul" ? "Noul (bool)" : cfg.type === "score" ? "Score" : "Choice";
+
+  card.innerHTML = `
+    <div class="dq-header">
+      <span class="dq-card-num">#${cardNum}</span>
+      <select class="dq-type">
+        <option value="choice" ${cfg.type === "choice" ? "selected" : ""}>Choice</option>
+        <option value="score" ${cfg.type === "score" ? "selected" : ""}>Score</option>
+        <option value="noul" ${cfg.type === "noul" ? "selected" : ""}>Noul (bool)</option>
+      </select>
+      <button class="dq-remove" title="Remove this question">✕</button>
+    </div>
+    <textarea class="dq-question-text" rows="2"
+              placeholder="What question are you asking? e.g. 'What is the sentiment?'">${escapeHtml(cfg.question || "")}</textarea>
+    <div class="dq-options-label">Options:</div>
+    <div class="dq-options">
+      ${renderOptionInputs(cfg)}
+    </div>
+    <button class="dq-add-option">+ Add option</button>
+  `;
+
+  card.querySelector(".dq-remove").addEventListener("click", () => {
+    card.remove();
+    renumberCards();
+  });
+  card.querySelector(".dq-type").addEventListener("change", (e) => {
+    const optsDiv = card.querySelector(".dq-options");
+    const addBtn = card.querySelector(".dq-add-option");
+    const newType = e.target.value;
+    if (newType === "noul") {
+      optsDiv.innerHTML = `<div class="dq-noul-hint">Boolean (true/false) — values are always fixed.</div>`;
+      addBtn.classList.add("hidden");
+    } else {
+      const existing = collectOptions(card);
+      const defaults = newType === "choice"
+        ? (existing.length >= 2 ? existing : ["option-a", "option-b"])
+        : (existing.length >= 2 ? existing : ["Low", "High"]);
+      optsDiv.innerHTML = renderOptionInputs({ type: newType, [newType === "choice" ? "options" : "levels"]: defaults });
+      addBtn.classList.remove("hidden");
+    }
+  });
+  card.querySelector(".dq-add-option").addEventListener("click", () => {
+    const optsDiv = card.querySelector(".dq-options");
+    const rows = optsDiv.querySelectorAll(".dq-option-row");
+    const row = document.createElement("div");
+    row.className = "dq-option-row";
+    row.innerHTML = `
+      <input type="text" class="dq-option-input" value="new-option-${rows.length + 1}">
+      <button class="dq-option-remove">✕</button>
+    `;
+    row.querySelector(".dq-option-remove").addEventListener("click", () => row.remove());
+    optsDiv.appendChild(row);
+  });
+
+  // Prepend so new cards appear at the top (immediately visible)
+  const firstCard = els.dynamicBuilder.querySelector(".dynamic-question-card");
+  if (firstCard) {
+    els.dynamicBuilder.insertBefore(card, firstCard);
+  } else {
+    els.dynamicBuilder.appendChild(card);
+  }
+  renumberCards();
+}
+
+function renumberCards() {
+  const cards = els.dynamicBuilder.querySelectorAll(".dynamic-question-card");
+  cards.forEach((card, i) => {
+    const num = card.querySelector(".dq-card-num");
+    if (num) num.textContent = `#${i + 1}`;
+  });
+}
+
+function renderOptionInputs(cfg) {
+  const items = cfg.type === "choice" ? (cfg.options || ["option-a", "option-b"])
+              : cfg.type === "score" ? (cfg.levels || ["Low", "High"])
+              : [];
+  if (cfg.type === "noul") return `<div class="dq-noul-hint">Boolean (true/false) — values are always fixed.</div>`;
+  return items.map((v, i) => `
+    <div class="dq-option-row">
+      <input type="text" class="dq-option-input" value="${escapeHtml(v)}">
+      ${i >= 2 ? '<button class="dq-option-remove">✕</button>' : ''}
+    </div>
+  `).join("");
+}
+
+function collectOptions(card) {
+  const inputs = card.querySelectorAll(".dq-option-input");
+  return Array.from(inputs).map(el => el.value.trim()).filter(Boolean);
+}
+
+function collectDynamicQuestions() {
+  const questions = [];
+  for (const card of els.dynamicBuilder.querySelectorAll(".dynamic-question-card")) {
+    const type = card.querySelector(".dq-type").value;
+    const questionText = card.querySelector(".dq-question-text").value.trim();
+    if (type === "noul") {
+      questions.push({ type: "noul", question: questionText || "Is this true?" });
+    } else if (type === "choice") {
+      const options = collectOptions(card);
+      if (options.length < 2) continue;
+      questions.push({ type: "choice", options, question: questionText });
+    } else {
+      const levels = collectOptions(card);
+      if (levels.length < 2) continue;
+      questions.push({ type: "score", levels, question: questionText });
+    }
+  }
+  return questions;
+}
+
+async function runDynamic() {
+  const questions = collectDynamicQuestions();
+  if (questions.length === 0) {
+    els.dynamicSummary.className = "summary failure";
+    els.dynamicSummary.textContent = "Add at least one valid question with ≥2 options/levels.";
+    els.dynamicSummary.classList.remove("hidden");
+    return;
+  }
+
+  els.dynamicSummary.className = "summary";
+  els.dynamicSummary.textContent = "Running…";
+  els.dynamicSummary.classList.remove("hidden");
+  els.runDynamicBtn.disabled = true;
+
+  try {
+    const res = await fetch(DYNAMIC_API_BASE, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...currentStatePayload(),
+        questions,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    renderDynamicResults(data);
+  } catch (err) {
+    els.dynamicSummary.className = "summary failure";
+    els.dynamicSummary.innerHTML = `<strong>Error:</strong> ${escapeHtml(err.message)}`;
+    els.dynamicSummary.classList.remove("hidden");
+  } finally {
+    els.runDynamicBtn.disabled = false;
+  }
+}
+
+function renderDynamicResults(data) {
+  const card = document.createElement("div");
+  card.className = "agent-result";
+
+  const header = document.createElement("div");
+  header.className = "agent-result-header";
+  header.innerHTML = `
+    <div class="name">Dynamic Head</div>
+    <div class="meta">${data.latency_ms} ms · ${data.answers.length} questions</div>
+  `;
+  card.appendChild(header);
+
+  const table = document.createElement("table");
+  table.className = "question-table";
+  table.innerHTML = `
+    <thead>
+      <tr><th>Question</th><th>Type</th><th>Predicted</th><th>Distribution</th><th>Conf.</th></tr>
+    </thead>`;
+  const tbody = document.createElement("tbody");
+
+  for (const ans of data.answers) {
+    const tr = document.createElement("tr");
+    const conf = ans.confidence ? ans.confidence.toFixed(3) : "—";
+    const type = ans.distribution
+      ? (Object.keys(ans.distribution).length === 2
+          && "true" in ans.distribution ? "noul" : "choice")
+      : "score";
+
+    tr.innerHTML = `
+      <td>${escapeHtml(ans.question || "—")}</td>
+      <td><span class="type-badge type-${type}">${type}</span></td>
+      <td class="predicted">${escapeHtml(String(ans.predicted ?? "—"))}</td>
+      <td class="dist-cell"></td>
+      <td>${conf}</td>
+    `;
+    tr.querySelector(".dist-cell").appendChild(renderDistribution({ distribution: ans.distribution }));
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  card.appendChild(table);
+
+  // Replace previous dynamic results
+  const existing = els.results.querySelector(".dynamic-result");
+  if (existing) existing.remove();
+  card.classList.add("dynamic-result");
+  els.results.prepend(card);
+
+  els.dynamicSummary.className = "summary success";
+  els.dynamicSummary.textContent =
+    `Done — ${data.answers.length} questions answered in ${data.latency_ms} ms`;
+  els.dynamicSummary.classList.remove("hidden");
+}
+
+function loadDefaultQuestions() {
+  for (const tmpl of QUESTION_TEMPLATES) {
+    addDynamicQuestion(tmpl);
+  }
+}
+
+els.addQuestionBtn = document.getElementById("add-question-btn");
+els.runDynamicBtn = document.getElementById("run-dynamic-btn");
+els.dynamicBuilder = document.getElementById("dynamic-builder");
+els.dynamicSummary = document.getElementById("dynamic-summary");
+
+els.addQuestionBtn.addEventListener("click", () => addDynamicQuestion());
+els.runDynamicBtn.addEventListener("click", runDynamic);
+
+// Load default templates on init
+loadDefaultQuestions();
+
 pollStatus();
 setInterval(pollStatus, 5000);

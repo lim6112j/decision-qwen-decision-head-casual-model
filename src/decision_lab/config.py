@@ -49,6 +49,22 @@ class HeadConfig:
 
 
 @dataclass
+class DynamicHeadConfig:
+    hidden_dim: int = 256
+    d_k: int = 128
+    dropout: float = 0.1
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-5
+    batch_size: int = 64
+    max_epochs: int = 100
+    patience: int = 10
+    # Curriculum: epochs before introducing varied option sets
+    anchor_epochs: int = 30
+    # How many option-set variants per question
+    variants_per_question: int = 3
+
+
+@dataclass
 class CalibrationConfig:
     holdout_fraction: float = 0.1
     lr: float = 1e-2
@@ -85,6 +101,7 @@ class Config:
     questions: QuestionsConfig = field(default_factory=QuestionsConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     head: HeadConfig = field(default_factory=HeadConfig)
+    dynamic_head: DynamicHeadConfig = field(default_factory=DynamicHeadConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     prompt_lm: PromptLMConfig = field(default_factory=PromptLMConfig)
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
@@ -100,6 +117,7 @@ def load_config(path: str | Path = "configs/default.yaml") -> Config:
         questions=QuestionsConfig(**raw.get("questions", {})),
         model=ModelConfig(**raw.get("model", {})),
         head=HeadConfig(**raw.get("head", {})),
+        dynamic_head=DynamicHeadConfig(**raw.get("dynamic_head", {})),
         calibration=CalibrationConfig(**raw.get("calibration", {})),
         prompt_lm=PromptLMConfig(**raw.get("prompt_lm", {})),
         benchmark=BenchmarkConfig(**raw.get("benchmark", {})),
