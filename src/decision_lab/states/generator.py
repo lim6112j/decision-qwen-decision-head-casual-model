@@ -13,7 +13,9 @@ from random import Random
 from decision_lab.config import Config
 from decision_lab.states.dataset import TextState, save_dataset
 
-IN_DIST_TEMPLATES: tuple[str, ...] = ("email", "ticket", "json", "text")
+IN_DIST_TEMPLATES: tuple[str, ...] = (
+    "email", "ticket", "json", "text", "log_entry", "chat_message", "markdown", "bullet_list",
+)
 
 SENTIMENTS: tuple[str, ...] = ("positive", "negative", "neutral")
 URGENCIES: tuple[str, ...] = ("low", "medium", "high", "critical")
@@ -306,6 +308,85 @@ def _render_config_file(rng: Random, lat: Latents) -> str:
     )
 
 
+def _render_chat_message(rng: Random, lat: Latents) -> str:
+    """Simulate a multi-turn chat conversation."""
+    agent_name = rng.choice(("Alex", "Sam", "Taylor"))
+    customer_name = rng.choice(FIRST_NAMES)
+    ts = rng.choice(("10:14", "14:37", "09:52"))
+
+    sentiment_line = _sentiment_phrase(rng, lat.sentiment)
+    urgency_note = f"Priority: {lat.urgency.upper()}" if lat.urgency in ("high", "critical") else ""
+
+    lines = [
+        f"[{ts}] {agent_name} (support): Hi {customer_name}, how can I help?",
+        f"[{ts}] {customer_name}: {sentiment_line}",
+    ]
+    if urgency_note:
+        lines.append(f"[{ts}] {agent_name} (support): Noted — {urgency_note}. {_action_sentence(lat.actionable)}")
+    else:
+        lines.append(f"[{ts}] {agent_name} (support): Thanks for the update. {_action_sentence(lat.actionable)}")
+
+    if lat.quality >= 2:
+        lines.append(f"[{ts}] {agent_name} (support): I've logged this at detail level {lat.quality}/3.")
+    if lat.pii:
+        name, email, _ = _person(rng)
+        lines.append(f"[{ts}] System: ticket created for {name} ({email})")
+    else:
+        lines.append(f"[{ts}] System: anonymous ticket created")
+    return "\n".join(lines)
+
+
+def _render_markdown(rng: Random, lat: Latents) -> str:
+    """Render as a structured Markdown document."""
+    qw = _quality_words(lat.quality)
+    sentiment = _sentiment_phrase(rng, lat.sentiment)
+    action_check = "[x]" if lat.actionable else "[ ]"
+
+    lines = [
+        f"# Status Update",
+        f"",
+        f"**Urgency:** `{lat.urgency.upper()}`",
+        f"**Quality:** {qw} ({lat.quality}/3)",
+        f"",
+        f"## Summary",
+        f"{sentiment}",
+        f"",
+        f"## Action Items",
+        f"- {action_check} Follow-up required",
+    ]
+    if lat.quality >= 2:
+        lines.append(f"- [x] Documentation updated")
+        lines.append(f"- [x] Review checklist completed")
+    if lat.pii:
+        _, email, phone = _person(rng)
+        lines.extend(["", "## Contact", f"- Email: `{email}`", f"- Phone: {phone}"])
+    else:
+        lines.extend(["", "## Contact", "- [redacted] — use support portal"])
+    return "\n".join(lines)
+
+
+def _render_bullet_list(rng: Random, lat: Latents) -> str:
+    """Render as a terse bullet-point summary."""
+    sentiment = _sentiment_phrase(rng, lat.sentiment)
+    qw = _quality_words(lat.quality)
+    urgency = _urgency_words(lat.urgency)
+
+    lines = [
+        f"• Status: {sentiment.split('.')[0]}",
+        f"• Priority: {lat.urgency} ({urgency})",
+        f"• Quality: {qw}",
+        f"• Action needed: {'yes' if lat.actionable else 'no'}",
+    ]
+    if lat.quality >= 2:
+        lines.append(f"• Detail level: {lat.quality}/3")
+    if lat.pii:
+        name, email, _ = _person(rng)
+        lines.append(f"• Contact: {name} — {email}")
+    else:
+        lines.append("• Contact: [redacted]")
+    return "\n".join(lines)
+
+
 def _quality_words(quality: int) -> str:
     return ("incomplete", "minimal", "adequate", "thorough")[quality]
 
@@ -315,7 +396,10 @@ _RENDERERS = {
     "ticket": _render_ticket,
     "json": _render_json,
     "text": _render_text,
-    "report": _render_report,
     "log_entry": _render_log_entry,
+    "chat_message": _render_chat_message,
+    "markdown": _render_markdown,
+    "bullet_list": _render_bullet_list,
+    "report": _render_report,
     "config_file": _render_config_file,
 }

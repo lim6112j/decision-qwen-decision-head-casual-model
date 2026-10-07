@@ -1,10 +1,10 @@
 # Synthetic state generator
 generator:
-  num_train: 5000
+  num_train: 10000
   num_test_indist: 1000
   num_test_heldout: 1000
   seed: 42
-  heldout_templates: ["report", "log_entry", "config_file"]
+  heldout_templates: ["report", "config_file"]
 
 # Fixed question bank (single forward pass evaluates all questions per state)
 questions:
