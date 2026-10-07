@@ -163,7 +163,10 @@ def _run_dynamic_forward(
     for qid, spec in question_spec.items():
         kind = spec["type"]
         if kind == "noul":
-            scores = head.forward_noul(state_tensor)
+            opt_embs = torch.stack([
+                option_emb_cache["false"], option_emb_cache["true"]
+            ])  # (2, D)
+            scores = head.forward_choice(state_tensor, opt_embs)
             results[qid] = decode_dynamic_answer(
                 make_noul_question(spec.get("question", qid)), scores, temperature,
             )

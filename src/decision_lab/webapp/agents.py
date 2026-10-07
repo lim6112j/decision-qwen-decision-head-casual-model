@@ -164,7 +164,9 @@ class DynamicHeadAgent:
             for qid, spec in self._question_spec.items():
                 kind = spec["type"]
                 if kind == "noul":
-                    scores = self._head.forward_noul(state_tensor)
+                    cache = self._ensure_options_embedded(["false", "true"])
+                    opt_embs = torch.stack([cache["false"], cache["true"]])
+                    scores = self._head.forward_choice(state_tensor, opt_embs)
                     results[qid] = decode_dynamic_answer(
                         make_noul_question(spec.get("question", qid)),
                         scores,
@@ -217,7 +219,9 @@ class DynamicHeadAgent:
             for q in questions:
                 kind = q["type"]
                 if kind == "noul":
-                    scores = self._head.forward_noul(state_tensor)
+                    cache = self._ensure_options_embedded(["false", "true"])
+                    opt_embs = torch.stack([cache["false"], cache["true"]])
+                    scores = self._head.forward_choice(state_tensor, opt_embs)
                     results.append(decode_dynamic_answer(q, scores, self._temperature))
                 else:
                     option_texts = question_option_texts(q)
