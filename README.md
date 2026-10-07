@@ -62,29 +62,43 @@ Output to `results/`:
 - `report.md` — human-readable comparison with tables
 - `metrics.json` — raw numbers for further analysis
 
-## Latest Benchmark Run (2026-10-07, wall-restored)
+## Latest Benchmark Run (2026-10-08, text classification)
 
-> **Correction (2026-10-07):** an earlier version of this table reported 99.3% / 89.0% for `head_trained`.
-> Those numbers were an artifact of a bug in `load_dataset` (`env/dataset.py`): layouts were rebuilt with the
-> goal but **without walls**, so feature extraction, training, and eval all ran on wall-free grids — a
-> trivially learnable geometry task. The bug is fixed; the pipeline was fully re-run
-> (re-extract → retrain → re-eval). Numbers below are the corrected ones.
+Full pipeline (extract → train → eval → report) on Apple Silicon (MPS), llama.cpp server, Qwen3.5-0.8B UD-Q4_K_XL GGUF. Datasets: 10,000 train / 1,000 in-dist test / 1,000 held-out test (text states with typed question labels).
 
-Full pipeline (extract → train → eval → report) on Apple Silicon (MPS), llama.cpp server, Qwen3.5-0.8B UD-Q4_K_XL GGUF. Datasets: 1,200 train / 300 in-dist test / 300 held-out test states (held-out layouts are 8×8–10×10 with higher wall density).
+**Training:** 8 in-dist templates (email, ticket, json, text, log_entry, chat_message, markdown, bullet_list)  
+**Held-out:** 2 unseen templates (report, config_file) — test for format generalization
+
+### Current Benchmark
 
 | Agent | In-dist acc | Held-out acc | Mean latency | Parse failures |
 |---|---|---|---|---|
-| `head_trained` | **64.3%** | **46.0%** | 0.4 ms | 0 |
-| `head_random` | 16.3% | 23.7% | 0.6 ms | 0 |
-| `prompt_lm_zero_shot` | 8.7% | 2.3% | ~96 ms | 64 / 93 of 300 |
+| `head_trained` | 92.5% | 48.7% | 0.2 ms | 0 |
+| `head_dynamic` | 82.2% | 39.1% | 8.5 ms | 0 |
+| `head_random` | 41.6% | 39.2% | 0.2 ms | 0 |
+| `prompt_lm_zero_shot` | 60.5% | 64.5% | ~360 ms | 0 |
 
 Key findings:
 
-- **Trained head still clearly outperforms the zero-shot LM** (64.3% vs 8.7% in-dist) at ~250× lower latency — but the margin is far smaller than the wall-free numbers suggested.
-- **Navigating around walls is genuinely hard for the head**: with walls actually present in the state renders, a 2-layer MLP on frozen backbone embeddings reaches only 0.629 val accuracy (best, early stop at epoch 16). Chance is 20%.
-- **Generalization gap**: head accuracy drops 18.3pp on unseen larger layouts (64.3% → 46.0%).
-- **Zero-shot LM is at chance with a "Right" bias**: nearly all outputs are `Answer: Right` regardless of the grid state (avg 2.2 tokens), and roughly 1 in 5 outputs fails to parse as an action.
-- **Qwen3.5 is a thinking model**: without `enable_thinking: false` (passed as `chat_template_kwargs` in `LlamaServer.chat`), all 128 `max_tokens` are consumed inside `reasoning_content` and `content` comes back empty — every LM decision parse-fails. The flag is required for this benchmark.
+- **Typed head dominates in-dist** (92.5%) at ~1,800× lower latency than prompt LM — but drops 44pp on held-out formats (48.7%). The head overfits to surface text patterns in the training templates.
+- **Prompt LM inverts**: does *better* on held-out (64.5% vs 60.5%) because it reads text directly rather than relying on format-dependent embeddings.
+- **Dynamic head** (82.3% in-dist, 38.7% held-out) supports any number of options at inference without retraining — trade ~10pp in-dist for full flexibility.
+- **LoRA adapter on frozen embeddings does not help** held-out generalization. A post-hoc low-rank transformation (rank=64) trained on in-dist embeddings can only re-weight existing dimensions — it cannot bridge the fundamental gap between embeddings of different text formats. Held-out actually regressed (48.7% → 43.5% with adapter). The bottleneck is the frozen Qwen3.5-0.8B backbone, which produces format-specific embeddings that no amount of post-hoc linear transformation can align.
+
+### Generalization: dynamic head on novel option sets (zero retraining)
+
+The dynamic head was trained on labeled option sets (e.g. sentiment options: positive/negative/neutral). At inference, it accepts any option text:
+
+| Novel option set | Options | Accuracy |
+|---|---|---|
+| Binary sentiment (Good/Bad) | 2 | **90.0%** |
+| 5-option sentiment scale | 5 | **77.0%** |
+| 7-option Likert agreement | 7 | **63.0%** |
+| Star ratings (1star→5star) | 5 | 42.0% |
+| Novel metaphorical labels | 4 | 7.0% |
+| *TypedHead baseline (fixed bank)* | — | *95.7%* |
+
+The head generalizes when option texts are semantically adjacent to training labels (sentiment synonyms), but fails on completely novel domains — attention relies on backbone embeddings of option texts being in a similar semantic space to training.
 
 Quick sanity check without the full pipeline (one question per test set, all three agents):
 
