@@ -91,6 +91,9 @@ class LlamaServer:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": False,
+            # Qwen3.5 is a thinking model; without this it burns all max_tokens
+            # inside reasoning_content and content comes back empty.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         r = requests.post(f"{self.base_url}/v1/chat/completions", json=body, timeout=120)
         r.raise_for_status()
