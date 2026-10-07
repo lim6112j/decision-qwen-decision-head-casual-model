@@ -1,108 +1,129 @@
-"""Episode engine: run an agent through a gridworld, one decision per step.
-
-Framework-free so it can be unit-tested with a scripted agent.
+"""Single-state evaluation engine: run agents over a text state, one answer
+per question. Framework-free so it can be unit-tested with scripted agents.
 """
 
-from dataclasses import dataclass
-from itertools import product
-from typing import Callable, Iterator, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
 
-from decision_lab.env.gridworld import ACTION_NAMES, INF, GridLayout, GridState
+from decision_lab.head.model import is_correct
+
+DecideFn = Callable[[Any], tuple[dict, str, float]]
+"""Returns (answers, raw_output, latency_ms).
+
+answers is either {qid: decoded answer dict} (head agents) or
+{qid: predicted value} (prompt agents); missing qids are parse failures.
+"""
 
 
 @dataclass
-class StepResult:
-    """One decision step in an episode."""
+class QuestionOutput:
+    """One question's answer from one agent."""
 
-    step_idx: int
-    agent_pos: tuple[int, int]
-    action: Optional[int]          # predicted action; None if parse failed
-    action_name: Optional[str]
-    optimal_action: int
-    optimal_action_name: str
-    correct: bool
+    question_id: str
+    question_type: str            # choice / score / noul
+    predicted: Any                # option key / level index / bool; None if failed
+    predicted_label: str          # display string
+    distribution: Optional[dict[str, float]]   # {class label: probability}
+    confidence: Optional[float]
+    expected: Optional[float]     # score questions only (expected rubric level)
+    gold: Any
+    gold_label: str
+    correct: Optional[bool]       # None when the agent gave no answer
+
+
+@dataclass
+class AgentOutput:
+    """One agent's full result over a state."""
+
+    agent_id: str
+    agent_name: str
     latency_ms: float
     raw_output: str
-    new_pos: tuple[int, int]
-    reached_goal: bool
-    state_text: str                # rendered grid the decision was made on
-
-
-@dataclass
-class EpisodeSummary:
-    """Final outcome of an episode."""
-
-    success: bool                  # goal reached within max_steps
-    steps_used: int
-    optimal_steps: int             # BFS distance from start to goal
-    correct_actions: int
-    total_actions: int             # steps with a parsed action
-    parse_failures: int
+    questions: list[QuestionOutput] = field(default_factory=list)
 
     @property
-    def action_accuracy(self) -> float:
-        return self.correct_actions / self.total_actions if self.total_actions else 0.0
+    def mean_accuracy(self) -> Optional[float]:
+        """Mean correctness over questions with gold labels; None if no gold."""
+        judged = [q.correct for q in self.questions if q.correct is not None]
+        return sum(judged) / len(judged) if judged else None
+
+    @property
+    def parse_failures(self) -> int:
+        return sum(1 for q in self.questions if q.predicted is None)
 
 
-DecideFn = Callable[[GridState], tuple[Optional[int], str, float]]
-"""Returns (action_index_or_None, raw_output, latency_ms)."""
+def _predicted_label(spec_entry: dict, predicted) -> str:
+    if predicted is None:
+        return "—"
+    kind = spec_entry["type"]
+    if kind == "choice":
+        return str(predicted)
+    if kind == "score":
+        levels = spec_entry["levels"]
+        idx = min(int(predicted), len(levels) - 1)
+        return f"{idx} ({levels[idx]})"
+    return "true" if predicted else "false"
 
 
-def pick_start_pos(layout: GridLayout) -> tuple[int, int]:
-    """Pick the empty cell with the largest finite BFS distance to the goal."""
-    distances = layout.bfs_distances()
-    best_pos = layout.goal_pos
-    best_dist = 0
-    for r, c in product(range(layout.rows), range(layout.cols)):
-        if layout.cells[r, c] != 1 and (r, c) != layout.goal_pos:
-            if distances[r, c] < INF and distances[r, c] > best_dist:
-                best_dist = distances[r, c]
-                best_pos = (r, c)
-    return best_pos
+def _gold_label(spec_entry: dict, gold) -> str:
+    if gold is None:
+        return "—"
+    kind = spec_entry["type"]
+    if kind == "score":
+        idx = min(int(gold), len(spec_entry["levels"]) - 1)
+        return f"{idx} ({spec_entry['levels'][idx]})"
+    if kind == "noul":
+        return "true" if gold else "false"
+    return str(gold)
 
 
-def run_episode(
-    layout: GridLayout,
-    start_pos: tuple[int, int],
-    decide_fn: DecideFn,
-    max_steps: int,
-) -> Iterator[StepResult]:
-    """Yield one StepResult per step until the goal is reached or budget spent."""
-    state = GridState(layout=layout, agent_pos=start_pos)
-
-    for step_idx in range(max_steps):
-        if state.is_terminal:
-            return
-
-        action, raw_output, latency_ms = decide_fn(state)
-        optimal = state.label
-
-        new_state = state.step(4 if action is None else action)
-        yield StepResult(
-            step_idx=step_idx,
-            agent_pos=state.agent_pos,
-            action=action,
-            action_name=ACTION_NAMES[action] if action is not None else None,
-            optimal_action=optimal,
-            optimal_action_name=ACTION_NAMES[optimal] if optimal is not None else "none",
-            correct=(action == optimal),
-            latency_ms=latency_ms,
-            raw_output=raw_output,
-            new_pos=new_state.agent_pos,
-            reached_goal=new_state.is_terminal,
-            state_text=state.render(),
+def _normalize_answer(raw_answer) -> tuple[Optional[Any], Optional[dict], Optional[float], Optional[float]]:
+    """Accept both decoded dicts (head) and bare values (prompt agent)."""
+    if isinstance(raw_answer, dict) and "predicted" in raw_answer:
+        return (
+            raw_answer.get("predicted"),
+            raw_answer.get("distribution"),
+            raw_answer.get("confidence"),
+            raw_answer.get("expected"),
         )
-        state = new_state
+    return raw_answer, None, None, None
 
 
-def summarize(steps: list[StepResult], optimal_steps: int) -> EpisodeSummary:
-    """Aggregate step results into an episode summary."""
-    reached = bool(steps) and steps[-1].reached_goal
-    return EpisodeSummary(
-        success=reached,
-        steps_used=len(steps),
-        optimal_steps=optimal_steps,
-        correct_actions=sum(1 for s in steps if s.correct),
-        total_actions=sum(1 for s in steps if s.action is not None),
-        parse_failures=sum(1 for s in steps if s.action is None),
+def evaluate_agent(
+    agent_id: str,
+    agent_name: str,
+    state,
+    decide_fn: DecideFn,
+    question_spec: dict,
+) -> AgentOutput:
+    """Run one agent over one state; compare against gold labels when present."""
+    answers, raw_output, latency_ms = decide_fn(state)
+
+    questions = []
+    for qid, spec_entry in question_spec.items():
+        predicted, distribution, confidence, expected = _normalize_answer(answers.get(qid))
+        gold = state.labels.get(qid) if state.labels else None
+        questions.append(QuestionOutput(
+            question_id=qid,
+            question_type=spec_entry["type"],
+            predicted=predicted,
+            predicted_label=_predicted_label(spec_entry, predicted),
+            distribution=distribution,
+            confidence=confidence,
+            expected=expected,
+            gold=gold,
+            gold_label=_gold_label(spec_entry, gold),
+            correct=(
+                is_correct(spec_entry, predicted, gold)
+                if gold is not None
+                else None
+            ),
+        ))
+
+    return AgentOutput(
+        agent_id=agent_id,
+        agent_name=agent_name,
+        latency_ms=latency_ms,
+        raw_output=raw_output,
+        questions=questions,
     )

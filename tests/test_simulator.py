@@ -1,147 +1,90 @@
-"""Tests for the web simulator episode engine."""
+"""Tests for the single-state evaluation engine (scripted agents)."""
 
-import numpy as np
-import pytest
-from random import Random
+from decision_lab.head.model import is_correct
+from decision_lab.states.dataset import TextState
+from decision_lab.webapp.simulator import evaluate_agent
 
-from decision_lab.env.gridworld import GOAL, GridLayout, GridState
-from decision_lab.webapp.simulator import pick_start_pos, run_episode, summarize
+QUESTION_SPEC = {
+    "sentiment": {
+        "type": "choice",
+        "options": ["positive", "negative", "neutral"],
+        "option_descriptions": {},
+    },
+    "quality": {"type": "score", "levels": ["Poor", "Fair", "Good", "Excellent"]},
+    "is_urgent": {"type": "noul", "question": "…"},
+}
 
-
-def make_layout(rows=3, cols=3):
-    cells = np.zeros((rows, cols), dtype=np.int32)
-    cells[rows - 1, cols - 1] = GOAL
-    return GridLayout(rows=rows, cols=cols, cells=cells, goal_pos=(rows - 1, cols - 1))
-
-
-class TestPickStartPos:
-    def test_picks_farthest_cell(self):
-        layout = make_layout()
-        # corner (0,0) is farthest from goal (2,2)
-        assert pick_start_pos(layout) == (0, 0)
-
-    def test_never_picks_wall_or_goal(self):
-        rng = Random(42)
-        layout = GridLayout.random(
-            rows=7, cols=7, wall_density=0.3,
-            min_path_length=5, rng=rng,
-        )
-        pos = pick_start_pos(layout)
-        r, c = pos
-        assert layout.cells[r, c] != 1
-        assert pos != layout.goal_pos
-
-    def test_never_picks_unreachable_cell(self):
-        # (0,0) is walled off from the goal — must not be chosen despite
-        # having INF distance (which would win a naive max()).
-        cells = np.zeros((3, 3), dtype=np.int32)
-        cells[0, 0] = 1
-        cells[0, 1] = 1
-        cells[1, 0] = 1
-        cells[2, 2] = GOAL
-        layout = GridLayout(rows=3, cols=3, cells=cells, goal_pos=(2, 2))
-        assert pick_start_pos(layout) != (0, 0)
-        assert layout.bfs_distances()[pick_start_pos(layout)] < 10**9
+GOLD = {"sentiment": "negative", "quality": 1, "is_urgent": True}
+STATE = TextState(doc_id=1, state_type="email", text="Angry email!", labels=dict(GOLD))
 
 
-class TestRunEpisode:
-    def test_optimal_agent_reaches_goal(self):
-        layout = make_layout()
-        start = (0, 0)
-        distances = layout.bfs_distances()
-        optimal_steps = int(distances[start])
+class ScriptedHeadAgent:
+    """Returns decoded-answer dicts (like TypedHeadAgent)."""
 
-        def optimal_decide(state):
-            return state.label, "", 1.0
+    def __init__(self, answers, latency=5.0):
+        self._answers = answers
+        self._latency = latency
 
-        steps = list(run_episode(layout, start, optimal_decide, max_steps=50))
-        summary = summarize(steps, optimal_steps)
-
-        assert summary.success
-        assert summary.steps_used == optimal_steps
-        assert summary.action_accuracy == 1.0
-
-    def test_stops_at_max_steps(self):
-        layout = make_layout()
-        start = (0, 0)
-
-        def wait_decide(state):
-            return 4, "", 0.5  # wait forever
-
-        steps = list(run_episode(layout, start, wait_decide, max_steps=5))
-
-        assert len(steps) == 5
-        summary = summarize(steps, optimal_steps=4)
-        assert not summary.success
-
-    def test_parse_failure_treated_as_wait(self):
-        layout = make_layout()
-        start = (1, 1)  # any move works here, wait should keep it in place
-
-        def broken_decide(state):
-            return None, "garbage output", 2.0
-
-        steps = list(run_episode(layout, start, broken_decide, max_steps=1))
-
-        assert len(steps) == 1
-        assert steps[0].action is None
-        assert steps[0].new_pos == steps[0].agent_pos  # didn't move
-        assert steps[0].raw_output == "garbage output"
-        summary = summarize(steps, optimal_steps=2)
-        assert summary.parse_failures == 1
-        assert summary.total_actions == 0
-
-    def test_step_results_carry_optimal_labels(self):
-        layout = make_layout()
-        start = (0, 0)
-
-        def always_wrong_decide(state):
-            return 0, "", 0.1  # always up
-
-        steps = list(run_episode(layout, start, always_wrong_decide, max_steps=2))
-
-        for step in steps:
-            assert step.optimal_action in (1, 3)  # down or right toward goal
-            assert not step.correct
-
-    def test_does_not_mutate_layout(self):
-        layout = make_layout()
-        start = (0, 0)
-        cells_before = layout.cells.copy()
-
-        def optimal_decide(state):
-            return state.label, "", 0.0
-
-        list(run_episode(layout, start, optimal_decide, max_steps=50))
-        assert np.array_equal(layout.cells, cells_before)
-
-    def test_zero_max_steps_yields_nothing(self):
-        layout = make_layout()
-
-        def optimal_decide(state):
-            return state.label, "", 0.0
-
-        assert list(run_episode(layout, (0, 0), optimal_decide, max_steps=0)) == []
+    def decide(self, state):
+        decoded = {
+            "sentiment": {
+                "predicted": self._answers["sentiment"],
+                "distribution": {"negative": 0.8, "neutral": 0.1, "positive": 0.1},
+                "confidence": 0.8,
+            },
+            "quality": {
+                "predicted": self._answers["quality"],
+                "expected": float(self._answers["quality"]),
+                "distribution": {"Poor": 0.1, "Fair": 0.8, "Good": 0.1, "Excellent": 0.0},
+                "confidence": 0.8,
+            },
+            "is_urgent": {
+                "predicted": self._answers["is_urgent"],
+                "distribution": {"true": 0.9, "false": 0.1},
+                "confidence": 0.9,
+            },
+        }
+        return decoded, "", self._latency
 
 
-class TestSummarize:
-    def test_empty_steps(self):
-        summary = summarize([], optimal_steps=3)
-        assert not summary.success
-        assert summary.action_accuracy == 0.0
+class TestEvaluateAgent:
+    def test_head_agent_scoring(self):
+        out = evaluate_agent("a", "Agent A", STATE,
+                             ScriptedHeadAgent(GOLD).decide, QUESTION_SPEC)
+        assert out.mean_accuracy == 1.0
+        assert out.parse_failures == 0
+        assert all(q.correct for q in out.questions)
+        assert out.questions[0].distribution is not None
+        assert out.questions[0].confidence == 0.8
 
-    def test_parse_failure_counted(self):
-        layout = make_layout()
-        start = (0, 0)
-        calls = {"count": 0}
+    def test_wrong_answers_scored_against_gold(self):
+        wrong = {"sentiment": "positive", "quality": 3, "is_urgent": False}
+        out = evaluate_agent("a", "Agent A", STATE,
+                             ScriptedHeadAgent(wrong).decide, QUESTION_SPEC)
+        assert out.mean_accuracy == 0.0
 
-        def half_broken(state):
-            calls["count"] += 1
-            if calls["count"] == 1:
-                return None, "oops", 0.0
-            return state.label, "", 0.0
+    def test_prompt_agent_missing_questions(self):
+        def decide(state):
+            return {"sentiment": "negative"}, "raw text", 1.0
 
-        steps = list(run_episode(layout, start, half_broken, max_steps=20))
-        summary = summarize(steps, optimal_steps=4)
-        assert summary.parse_failures == 1
-        assert summary.success  # recovers via optimal moves afterward
+        out = evaluate_agent("p", "Prompt", STATE, decide, QUESTION_SPEC)
+        assert out.parse_failures == 2
+        assert abs(out.mean_accuracy - 1 / 3) < 1e-9
+        # prompt answers carry no distribution/confidence
+        sentiment = next(q for q in out.questions if q.question_id == "sentiment")
+        assert sentiment.distribution is None
+        assert sentiment.confidence is None
+
+    def test_custom_state_has_no_gold(self):
+        custom = TextState(doc_id=-1, state_type="custom", text="hello", labels={})
+        out = evaluate_agent("a", "Agent A", custom,
+                             ScriptedHeadAgent(GOLD).decide, QUESTION_SPEC)
+        assert out.mean_accuracy is None
+        assert all(q.correct is None for q in out.questions)
+        assert all(q.gold is None for q in out.questions)
+
+
+def test_is_correct_none_is_wrong():
+    spec = {"type": "noul"}
+    assert not is_correct(spec, None, True)
+    assert is_correct(spec, False, False)

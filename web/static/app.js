@@ -1,31 +1,26 @@
-/* Decision Lab web simulator: SSE-driven gridworld playback. */
+/* Decision Lab typed-question UI: SSE-driven single-state evaluation. */
 
-const STEP_PACE_MS = 350;   // rendering delay between steps (head agents decide in ~ms)
 const API_BASE = "";
+const BAR_MAX_WIDTH = 220;   // px for probability bars
 
 const els = {
   status: document.getElementById("status"),
   agentCards: document.getElementById("agent-cards"),
-  layoutSelect: document.getElementById("layout-select"),
+  stateSelect: document.getElementById("state-select"),
+  customText: document.getElementById("custom-text"),
   runBtn: document.getElementById("run-btn"),
   compareBtn: document.getElementById("compare-btn"),
-  grid: document.getElementById("grid"),
+  stateTypeBadge: document.getElementById("state-type-badge"),
+  stateText: document.getElementById("state-text"),
+  results: document.getElementById("results"),
   summary: document.getElementById("summary"),
-  stepRows: document.getElementById("step-rows"),
-  stepCount: document.getElementById("step-count"),
-  comparePanel: document.getElementById("compare-panel"),
-  compareRows: document.getElementById("compare-rows"),
-  compareLabel: document.getElementById("compare-layout-label"),
 };
 
 const state = {
   agents: [],
+  questions: {},        // {qid: {type, options?/levels?/question}}
   selectedAgent: null,
-  gridSpec: null,      // {rows, cols, walls, goal_pos}
-  agentCell: null,     // [r, c] currently rendered
   running: false,
-  systemPrompt: null,  // LM agents: system prompt shown in the step detail
-  steps: new Map(),    // step_idx -> step event data (for the detail panel)
 };
 
 /* ---------- server status ---------- */
@@ -48,11 +43,12 @@ function setReady(ready) {
   els.compareBtn.disabled = !ready || state.running;
   if (ready && els.agentCards.querySelector(".loading")) {
     loadAgents();
-    loadLayouts();
+    loadStates();
+    loadQuestions();
   }
 }
 
-/* ---------- model selection (3 cards) ---------- */
+/* ---------- model selection ---------- */
 
 async function loadAgents() {
   try {
@@ -78,7 +74,6 @@ function renderAgentCards() {
     label.addEventListener("click", () => selectAgent(agent.agent_id));
     els.agentCards.appendChild(label);
   }
-  // default to the trained head
   selectAgent(state.agents[0]?.agent_id);
 }
 
@@ -91,168 +86,177 @@ function selectAgent(agentId) {
   }
 }
 
-/* ---------- layouts ---------- */
+/* ---------- states + question bank ---------- */
 
-async function loadLayouts() {
+async function loadStates() {
   try {
-    const res = await fetch(`${API_BASE}/api/layouts`);
+    const res = await fetch(`${API_BASE}/api/states`);
     const body = await res.json();
-    els.layoutSelect.innerHTML = "";
-    for (const layout of body.layouts) {
+    els.stateSelect.innerHTML = "";
+    for (const s of body.states) {
       const opt = document.createElement("option");
-      opt.value = layout.layout_id;
-      opt.textContent =
-        `Layout ${layout.layout_id} (${layout.rows}×${layout.cols}, optimal ${layout.optimal_from_start})`;
-      els.layoutSelect.appendChild(opt);
+      opt.value = s.doc_id;
+      opt.textContent = `#${s.doc_id} · ${s.state_type}`;
+      els.stateSelect.appendChild(opt);
     }
-    const randomOpt = document.createElement("option");
-    randomOpt.value = "random";
-    randomOpt.textContent = "Random layout (new each run)";
-    els.layoutSelect.appendChild(randomOpt);
+    const customOpt = document.createElement("option");
+    customOpt.value = "custom";
+    customOpt.textContent = "Custom text (paste below)";
+    els.stateSelect.appendChild(customOpt);
+    els.stateSelect.addEventListener("change", toggleCustomText);
+    if (body.states.length > 0) renderState(body.states[0]);
   } catch (err) {
-    els.layoutSelect.innerHTML = `<option>Failed to load layouts: ${err}</option>`;
+    els.stateSelect.innerHTML = `<option>Failed to load states: ${err}</option>`;
   }
 }
 
-function selectedLayoutId() {
-  const value = els.layoutSelect.value;
-  return value === "random" ? null : Number(value);
+function toggleCustomText() {
+  const isCustom = els.stateSelect.value === "custom";
+  els.customText.classList.toggle("hidden", !isCustom);
 }
 
-/* ---------- grid rendering ---------- */
-
-function renderGrid(spec) {
-  state.gridSpec = spec;
-  state.agentCell = spec.agent_pos;
-  els.grid.style.gridTemplateColumns = `repeat(${spec.cols}, 44px)`;
-  els.grid.innerHTML = "";
-  for (let r = 0; r < spec.rows; r++) {
-    for (let c = 0; c < spec.cols; c++) {
-      const cell = document.createElement("div");
-      cell.className = "cell";
-      cell.dataset.pos = `${r},${c}`;
-      if (spec.walls[r][c]) cell.classList.add("wall");
-      if (r === spec.goal_pos[0] && c === spec.goal_pos[1]) cell.classList.add("goal");
-      els.grid.appendChild(cell);
-    }
+async function loadQuestions() {
+  try {
+    const res = await fetch(`${API_BASE}/api/questions`);
+    const body = await res.json();
+    state.questions = body.questions;
+  } catch {
+    state.questions = {};
   }
-  paintAgent(spec.agent_pos);
 }
 
-function paintAgent(pos) {
-  if (state.agentCell) {
-    const prev = cellAt(state.agentCell);
-    if (prev) {
-      prev.classList.remove("agent", "agent-goal");
-      if (isGoal(state.agentCell)) prev.classList.add("goal");
-    }
+function questionType(qid) {
+  return state.questions[qid]?.type ?? "choice";
+}
+
+/* ---------- state panel ---------- */
+
+function renderState(s) {
+  els.stateText.classList.remove("loading");
+  els.stateText.textContent = s.text;
+  els.stateTypeBadge.textContent = s.state_type;
+  els.stateTypeBadge.classList.remove("hidden");
+}
+
+function showCustomState() {
+  const text = els.customText.value.trim();
+  els.stateText.classList.remove("loading");
+  els.stateText.textContent = text || "(empty — type some text above)";
+  els.stateTypeBadge.textContent = "custom";
+  els.stateTypeBadge.classList.remove("hidden");
+}
+
+function currentStatePayload() {
+  if (els.stateSelect.value === "custom") {
+    return { custom_text: els.customText.value };
   }
-  const cell = cellAt(pos);
-  if (cell) {
-    cell.classList.add("agent");
-    if (isGoal(pos)) cell.classList.add("agent-goal");
-  }
-  state.agentCell = pos;
+  return { doc_id: Number(els.stateSelect.value) };
 }
 
-function cellAt(pos) {
-  return els.grid.querySelector(`[data-pos="${pos[0]},${pos[1]}"]`);
-}
+/* ---------- results rendering ---------- */
 
-function isGoal(pos) {
-  return state.gridSpec &&
-    pos[0] === state.gridSpec.goal_pos[0] && pos[1] === state.gridSpec.goal_pos[1];
-}
-
-/* ---------- step log ---------- */
-
-function clearLog() {
-  els.stepRows.innerHTML = "";
-  els.stepCount.textContent = "";
+function clearResults() {
+  els.results.innerHTML = "";
   els.summary.classList.add("hidden");
-  state.steps.clear();
-  state.systemPrompt = null;
 }
 
-function appendStep(step) {
-  const tr = document.createElement("tr");
-  const mark = step.correct ? "✓" : "✗";
-  const cls = step.correct ? "mark-good" : "mark-bad";
-  tr.className = `step-row-latest ${cls}`;
-  tr.innerHTML = `
-    <td>${step.step_idx}</td>
-    <td>${step.action_name ?? "parse-fail"}</td>
-    <td>${step.optimal_action_name}</td>
-    <td class="${cls}">${mark}</td>
-    <td>${step.latency_ms} ms</td>
-    <td class="raw-output">${escapeHtml(step.raw_output)}</td>
+function renderAgentResult(out) {
+  const card = document.createElement("div");
+  card.className = "agent-result";
+
+  const acc = out.mean_accuracy;
+  const accText = acc === null ? "no gold labels" : `${(acc * 100).toFixed(1)}% correct`;
+  const accCls = acc === null ? "" : (acc >= 0.75 ? "mark-good" : (acc >= 0.5 ? "" : "mark-bad"));
+
+  const header = document.createElement("div");
+  header.className = "agent-result-header";
+  header.innerHTML = `
+    <div class="name">${escapeHtml(out.agent_name)}</div>
+    <div class="meta">${accText} · ${out.latency_ms} ms · parse failures: ${out.parse_failures}</div>
   `;
-  tr.addEventListener("click", () => showStepDetail(step, tr));
-  const prev = els.stepRows.querySelector(".step-row-latest");
-  if (prev) prev.classList.remove("step-row-latest");
-  state.steps.set(step.step_idx, step);
-  els.stepRows.appendChild(tr);
-  els.stepCount.textContent = `(${step.step_idx + 1})`;
+  card.appendChild(header);
+
+  const table = document.createElement("table");
+  table.className = "question-table";
+  table.innerHTML = `
+    <thead>
+      <tr><th>Question</th><th>Type</th><th>Predicted</th><th>Distribution</th><th>Conf.</th><th>Gold</th><th></th></tr>
+    </thead>`;
+  const tbody = document.createElement("tbody");
+  for (const q of out.questions) {
+    tbody.appendChild(renderQuestionRow(q));
+  }
+  table.appendChild(tbody);
+  card.appendChild(table);
+
+  if (out.raw_output) {
+    const raw = document.createElement("details");
+    raw.className = "raw-output-details";
+    raw.innerHTML = `<summary>LM raw output</summary><pre>${escapeHtml(out.raw_output)}</pre>`;
+    card.appendChild(raw);
+  }
+
+  els.results.appendChild(card);
 }
 
-function showStepDetail(step, tr) {
-  // toggle closed if the same row is clicked again
-  const existing = tr.nextElementSibling;
-  if (existing && existing.classList.contains("detail-row")) {
-    existing.remove();
-    tr.classList.remove("selected");
+function renderQuestionRow(q) {
+  const tr = document.createElement("tr");
+  if (q.correct === true) tr.classList.add("mark-good-row");
+  else if (q.correct === false) tr.classList.add("mark-bad-row");
+
+  const mark = q.correct === null ? "" : (q.correct ? "✓" : "✗");
+  const cls = q.correct === false ? "mark-bad" : "mark-good";
+  const conf = q.confidence === null || q.confidence === undefined
+    ? "—" : q.confidence.toFixed(3);
+
+  tr.innerHTML = `
+    <td>${escapeHtml(q.question_id)}</td>
+    <td><span class="type-badge type-${q.question_type}">${q.question_type}</span></td>
+    <td class="predicted">${escapeHtml(q.predicted_label)}</td>
+    <td class="dist-cell"></td>
+    <td>${conf}</td>
+    <td class="gold">${escapeHtml(q.gold_label)}</td>
+    <td class="${cls}">${mark}</td>
+  `;
+  tr.querySelector(".dist-cell").appendChild(renderDistribution(q));
+  return tr;
+}
+
+function renderDistribution(q) {
+  const wrap = document.createElement("div");
+  wrap.className = "dist";
+  if (!q.distribution) {
+    wrap.innerHTML = `<span class="dist-none">—</span>`;
+    return wrap;
+  }
+  const entries = Object.entries(q.distribution)
+    .sort((a, b) => b[1] - a[1]);
+  for (const [label, prob] of entries) {
+    const row = document.createElement("div");
+    row.className = "dist-row";
+    const pct = (prob * 100).toFixed(1);
+    row.innerHTML = `
+      <span class="dist-label">${escapeHtml(label)}</span>
+      <span class="dist-bar-track"><span class="dist-bar" style="width:${(prob * BAR_MAX_WIDTH).toFixed(0)}px"></span></span>
+      <span class="dist-pct">${pct}%</span>
+    `;
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
+function showSummary(agentOutputs) {
+  const judged = agentOutputs.filter((o) => o.mean_accuracy !== null);
+  if (judged.length === 0) {
+    els.summary.className = "summary success";
+    els.summary.textContent = "Done. (No gold labels — custom text is scored by inspection only.)";
     return;
   }
-
-  closeStepDetail();
-  for (const row of els.stepRows.children) row.classList.remove("selected");
-  tr.classList.add("selected");
-
-  const mark = step.correct ? "✓" : "✗";
-  const cls = step.correct ? "mark-good" : "mark-bad";
-  const question = state.systemPrompt
-    ? `System:\n${state.systemPrompt}\n\nUser: the grid state shown above`
-    : `Given the grid state shown above, output ONLY the best single action ` +
-      `(up / down / left / right / wait).\n` +
-      `(answered implicitly: the state render is embedded by the backbone and ` +
-      `classified by the MLP head)`;
-
-  const detailRow = document.createElement("tr");
-  detailRow.className = "detail-row";
-  detailRow.innerHTML = `
-    <td colspan="6">
-      <div class="detail-content">
-        <h4>Step ${step.step_idx} —
-          <span class="detail-verdict ${cls}">chose ${step.action_name ?? "parse-fail"},
-          optimal ${step.optimal_action_name} ${mark}</span></h4>
-        <h4>State</h4>
-        <pre>${escapeHtml(step.state_text)}</pre>
-        <h4>Question</h4>
-        <pre>${escapeHtml(question)}</pre>
-      </div>
-    </td>
-  `;
-  // ignore clicks inside the expansion so copy/select doesn't collapse it
-  detailRow.addEventListener("click", (e) => e.stopPropagation());
-  tr.after(detailRow);
-}
-
-function closeStepDetail() {
-  const open = els.stepRows.querySelector(".detail-row");
-  if (open) open.remove();
-  const selected = els.stepRows.querySelector("tr.selected");
-  if (selected) selected.classList.remove("selected");
-}
-
-function showSummary(summary) {
-  const cls = summary.success ? "success" : "failure";
-  const verdict = summary.success
-    ? `Reached the goal in ${summary.steps_used} steps (optimal ${summary.optimal_steps}).`
-    : `Did not reach the goal in ${summary.steps_used} steps (optimal ${summary.optimal_steps}).`;
-  els.summary.className = `summary ${cls}`;
-  els.summary.innerHTML = `${verdict}<br>
-    Action accuracy: ${(summary.action_accuracy * 100).toFixed(1)}% ·
-    Parse failures: ${summary.parse_failures}`;
+  const best = judged.reduce((a, b) => (b.mean_accuracy > a.mean_accuracy ? b : a));
+  els.summary.className = "summary success";
+  els.summary.innerHTML =
+    `Best: <strong>${escapeHtml(best.agent_name)}</strong> — ` +
+    `${(best.mean_accuracy * 100).toFixed(1)}% correct in ${best.latency_ms} ms`;
 }
 
 function showError(message) {
@@ -308,31 +312,25 @@ function parseSSEBlock(block) {
   return data ? { event, data: JSON.parse(data) } : null;
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 /* ---------- run / compare ---------- */
 
-async function runEpisode() {
+async function runOne() {
   if (!state.selectedAgent || state.running) return;
   state.running = true;
   setButtonsDisabled(true);
-  clearLog();
-  els.comparePanel.classList.add("hidden");
+  clearResults();
+  if (els.stateSelect.value === "custom") showCustomState();
 
   try {
     await postSSE("/api/run", {
       agent_id: state.selectedAgent,
-      layout_id: selectedLayoutId(),
-    }, async (event) => {
+      ...currentStatePayload(),
+    }, (event) => {
       if (event.event === "start") {
-        state.systemPrompt = event.data.system_prompt;
-        renderGrid(event.data.grid);
-      } else if (event.event === "step") {
-        await sleep(STEP_PACE_MS);
-        paintAgent(event.data.new_pos);
-        appendStep(event.data);
-      } else if (event.event === "summary") {
-        showSummary(event.data);
+        renderState(event.data.state);
+      } else if (event.event === "result") {
+        renderAgentResult(event.data);
+        showSummary([event.data]);
       }
     });
   } catch (err) {
@@ -347,28 +345,16 @@ async function runCompare() {
   if (state.running) return;
   state.running = true;
   setButtonsDisabled(true);
-  clearLog();
-  els.compareRows.innerHTML = "";
-  els.comparePanel.classList.remove("hidden");
-  els.compareLabel.textContent = `(layout ${els.layoutSelect.selectedOptions[0]?.textContent ?? ""})`;
+  clearResults();
+  if (els.stateSelect.value === "custom") showCustomState();
 
-  const summaries = [];
+  const outputs = [];
   try {
-    await postSSE("/api/compare", { layout_id: selectedLayoutId() }, async (event) => {
-      if (event.event === "agent_start") {
-        els.stepRows.innerHTML = "";
-        state.steps.clear();
-        state.systemPrompt = null;
-      } else if (event.event === "start") {
-        state.systemPrompt = event.data.system_prompt;
-        renderGrid(event.data.grid);
-      } else if (event.event === "step") {
-        await sleep(STEP_PACE_MS);
-        paintAgent(event.data.new_pos);
-        appendStep(event.data);
-      } else if (event.event === "summary") {
-        summaries.push(event.data);
-        appendCompareRow(event.data, summaries);
+    await postSSE("/api/compare", currentStatePayload(), (event) => {
+      if (event.event === "result") {
+        outputs.push(event.data);
+        renderAgentResult(event.data);
+        showSummary(outputs);
       }
     });
   } catch (err) {
@@ -379,30 +365,15 @@ async function runCompare() {
   }
 }
 
-function appendCompareRow(summary, summaries) {
-  const agent = state.agents.find(a => a.agent_id === summary.agent_id);
-  const name = agent ? agent.name : `Model ${summaries.length}`;
-  const tr = document.createElement("tr");
-  const cls = summary.success ? "mark-good" : "mark-bad";
-  tr.innerHTML = `
-    <td>${name}</td>
-    <td class="${cls}">${summary.success ? "reached goal" : "failed"}</td>
-    <td>${summary.steps_used}</td>
-    <td>${summary.optimal_steps}</td>
-    <td>${(summary.action_accuracy * 100).toFixed(1)}%</td>
-    <td>${summary.parse_failures}</td>
-  `;
-  els.compareRows.appendChild(tr);
-}
-
 function setButtonsDisabled(disabled) {
-  els.runBtn.disabled = disabled;
+  els.runBtn.disabled = disabled || !state.selectedAgent;
   els.compareBtn.disabled = disabled;
 }
 
 /* ---------- init ---------- */
 
-els.runBtn.addEventListener("click", runEpisode);
+els.runBtn.addEventListener("click", runOne);
 els.compareBtn.addEventListener("click", runCompare);
+els.customText.addEventListener("input", showCustomState);
 pollStatus();
 setInterval(pollStatus, 5000);

@@ -1,11 +1,10 @@
-"""Prompt-based agent: zero-shot and CoT variants for gridworld decisions."""
+"""Prompt-based agent: answers the full typed question bank via chat completion."""
 
 from enum import Enum
-from typing import Optional
 
 from decision_lab.config import Config
-from decision_lab.env.gridworld import GridState
-from decision_lab.prompt_lm.parser import parse_action
+from decision_lab.head.model import build_question_spec
+from decision_lab.prompt_lm.parser import parse_typed_answers
 
 
 class PromptMode(Enum):
@@ -14,7 +13,7 @@ class PromptMode(Enum):
 
 
 class PromptAgent:
-    """Decides gridworld actions via chat completion (prompt-based)."""
+    """Answers all bank questions for a text state in one chat completion."""
 
     def __init__(
         self,
@@ -34,12 +33,12 @@ class PromptAgent:
     def system_prompt(self) -> str:
         return self._system
 
-    def decide(self, state: GridState) -> tuple[Optional[int], str]:
-        """Return (action_index_or_None_if_parse_failed, raw_output)."""
+    def decide(self, state) -> tuple[dict, str]:
+        """Return ({qid: predicted value or None if parse failed}, raw_output)."""
         messages = [
             {"role": "system", "content": self._system},
             {"role": "user", "content": state.render()},
         ]
         raw = self._server.chat(messages, temperature=self._temperature, max_tokens=self._max_tokens)
-        action = parse_action(raw)
-        return action, raw
+        answers = parse_typed_answers(raw, build_question_spec(self._cfg.questions))
+        return answers, raw

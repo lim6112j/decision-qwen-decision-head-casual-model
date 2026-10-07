@@ -1,14 +1,32 @@
-# Gridworld
-grid:
-  size: 7                # grid side length
-  wall_density: 0.15      # fraction of cells that are walls
-  min_path_length: 5      # minimum BFS path length goal→any start
-  num_train_layouts: 40
-  num_indist_test_layouts: 10
-  num_heldout_test_layouts: 10
-  heldout_size_min: 8     # heldout layout size range includes 8x8
-  heldout_size_max: 10    # heldout layout size range includes 10x10
-  heldout_wall_extra: 0.05 # extra wall density on heldout layouts
+# Synthetic state generator
+generator:
+  num_train: 5000
+  num_test_indist: 1000
+  num_test_heldout: 1000
+  seed: 42
+  heldout_templates: ["report", "log_entry", "config_file"]
+
+# Fixed question bank (single forward pass evaluates all questions per state)
+questions:
+  choice:
+    sentiment:
+      options:
+        positive: "Positive sentiment"
+        negative: "Negative sentiment"
+        neutral: "Neutral sentiment"
+    urgency:
+      options:
+        low: "Low priority"
+        medium: "Medium priority"
+        high: "High priority"
+        critical: "Requires immediate attention"
+  score:
+    quality:
+      levels: ["Poor", "Fair", "Good", "Excellent"]   # rubric levels 0..3
+  noul:
+    is_actionable: "Does this state require a response or action?"
+    contains_pii: "Does this state contain personally identifiable information?"
+    is_urgent: "Is this state time-sensitive?"
 
 # Backbone (llama-server)
 model:
@@ -17,10 +35,9 @@ model:
   server_port: 8080
   pooling: "last"         # "last" or "mean"
 
-# Decision Head
+# Typed Decision Head
 head:
   hidden_dim: 256
-  num_actions: 5
   dropout: 0.1
   learning_rate: 0.001
   weight_decay: 0.00001
@@ -28,34 +45,49 @@ head:
   max_epochs: 100
   patience: 10
 
+# Post-training temperature calibration (per question)
+calibration:
+  holdout_fraction: 0.1
+  lr: 0.01
+  max_iter: 1000
+
 # Prompt LM
 prompt_lm:
   temperature: 0.0
-  max_tokens: 128
+  max_tokens: 256
   system_prompt_zero_shot: |
-    You are a gridworld agent. Your task is to navigate to the goal 'G' while avoiding obstacles '#'.
-    You can move: up, down, left, right, wait.
-    Given the grid state below, output ONLY the best single action.
-    Output format: Answer: <action>
+    You are a text analysis assistant. Given the document below, answer each
+    question precisely using ONLY the document content.
+    Output format (one line per question, exactly these keys):
+    sentiment: <positive|negative|neutral>
+    urgency: <low|medium|high|critical>
+    quality: <0|1|2|3>
+    is_actionable: <true|false>
+    contains_pii: <true|false>
+    is_urgent: <true|false>
 
   system_prompt_cot: |
-    You are a gridworld agent. Your task is to navigate to the goal 'G' while avoiding obstacles '#'.
-    You can move: up, down, left, right, wait.
-    Given the grid state below, think step-by-step about the shortest path to the goal,
-    then output the best single action.
+    You are a text analysis assistant. Given the document below, think
+    step-by-step about each question, then answer.
     Output format:
     Reasoning: <brief reasoning>
-    Answer: <action>
+    sentiment: <positive|negative|neutral>
+    urgency: <low|medium|high|critical>
+    quality: <0|1|2|3>
+    is_actionable: <true|false>
+    contains_pii: <true|false>
+    is_urgent: <true|false>
 
 # Benchmark
 benchmark:
   warmup_runs: 5
   timed_runs: 50
+  max_test_states: 200      # subsample test sets (0 = full set)
+  latency_sample_size: 5    # states used for warmup/timed latency runs
 
-# Web UI simulator
+# Web UI
 web:
   host: "127.0.0.1"
   port: 8000
-  max_steps: 50          # hard cap on steps per episode
-  num_layouts: 5         # pre-generated layouts offered in the UI
-  random_seed: 42        # seed for the pre-generated UI layouts
+  num_states: 8          # pre-generated states offered in the UI
+  random_seed: 42

@@ -1,7 +1,7 @@
 [project]
 name = "decision-lab"
 version = "0.1.0"
-description = "Benchmark: Qwen Decision Head vs Prompt-based Causal LM for gridworld action decisions"
+description = "Benchmark: typed decision head (choice/score/noul) vs prompt-based causal LM over text states"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",

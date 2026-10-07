@@ -11,14 +11,15 @@ from decision_lab.config import load_config
 
 
 def cmd_generate(args):
-    """Generate synthetic gridworld datasets."""
-    from decision_lab.env.dataset import generate_gridworld_data
+    """Generate synthetic text-state datasets with typed-question labels."""
+    from decision_lab.states.generator import generate_dataset
 
     cfg = load_config(args.config)
-    print(f"Generating gridworld data (size={cfg.grid.size}, layouts: "
-          f"{cfg.grid.num_train_layouts}t/{cfg.grid.num_indist_test_layouts}i/"
-          f"{cfg.grid.num_heldout_test_layouts}h)")
-    generate_gridworld_data(cfg, args.data_dir)
+    q = cfg.questions
+    print(f"Generating text states (train={cfg.generator.num_train}, "
+          f"indist={cfg.generator.num_test_indist}, heldout={cfg.generator.num_test_heldout}; "
+          f"questions: {len(q.choice)} choice / {len(q.score)} score / {len(q.noul)} noul)")
+    generate_dataset(cfg, args.data_dir)
 
 
 def cmd_extract(args):
@@ -42,9 +43,10 @@ def cmd_extract(args):
 
 
 def cmd_train(args):
-    """Train decision head on extracted features."""
-    from decision_lab.head.train import train_head
-    from decision_lab.env.dataset import load_dataset
+    """Train typed decision head on extracted features."""
+    from decision_lab.head.model import build_question_spec
+    from decision_lab.head.train import encode_labels, train_head
+    from decision_lab.states.dataset import load_dataset
 
     cfg = load_config(args.config)
 
@@ -55,11 +57,12 @@ def cmd_train(args):
 
     features = np.load(args.data_dir / "features_train.npz")["features"]
     states = load_dataset(train_path)
-    labels = np.array([s.label for s in states], dtype=np.int64)
+    question_spec = build_question_spec(cfg.questions)
+    labels_by_qid = encode_labels(states, question_spec)
 
-    assert len(features) == len(labels), f"{len(features)} != {len(labels)}"
+    assert len(features) == len(states), f"{len(features)} != {len(states)}"
 
-    train_head(features, labels, cfg, args.models_dir / "head_trained.pt")
+    train_head(features, labels_by_qid, question_spec, cfg, args.models_dir / "head_trained.pt")
 
 
 def cmd_eval(args):
@@ -98,7 +101,7 @@ def cmd_report(args):
 
 
 def cmd_ui(args):
-    """Start the web UI simulator."""
+    """Start the web UI."""
     import uvicorn
 
     cfg = load_config(args.config)
@@ -156,7 +159,7 @@ def cmd_all(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Decision Lab — Head vs LM benchmark")
+    parser = argparse.ArgumentParser(description="Decision Lab — Typed head vs LM benchmark")
     sub = parser.add_subparsers(dest="command", required=True)
 
     for cmd, fn in [

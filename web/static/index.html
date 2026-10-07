@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Decision Lab — Gridworld Simulator</title>
+  <title>Decision Lab — Typed Question Analysis</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%235b8cff'/></svg>">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <header>
     <h1>Decision Lab</h1>
-    <p class="subtitle">Gridworld simulator — live model calls on a local Qwen3.5 backbone</p>
+    <p class="subtitle">Typed question analysis — choice / score / noul in a single forward pass</p>
     <span id="status" class="status-dot" title="checking server…"></span>
   </header>
 
@@ -21,50 +21,29 @@
         <p class="loading">Loading models…</p>
       </div>
 
-      <h2>Layout</h2>
-      <select id="layout-select" aria-label="Layout"></select>
+      <h2>State</h2>
+      <select id="state-select" aria-label="State selection"></select>
+      <textarea id="custom-text" class="hidden" rows="8"
+                placeholder='Paste raw text, an email, a ticket, or a JSON document…'></textarea>
 
       <div class="button-row">
-        <button id="run-btn" disabled>Run episode</button>
+        <button id="run-btn" disabled>Run</button>
         <button id="compare-btn" disabled>Compare all 3</button>
       </div>
 
       <div id="summary" class="summary hidden"></div>
     </section>
 
-    <section id="grid-panel">
-      <div id="grid" aria-label="Gridworld"></div>
-      <div id="legend">
-        <span class="legend-item"><span class="cell agent"></span> agent</span>
-        <span class="legend-item"><span class="cell goal"></span> goal</span>
-        <span class="legend-item"><span class="cell wall"></span> wall</span>
-        <span class="legend-item"><span class="cell empty"></span> empty</span>
-      </div>
+    <section id="state-panel">
+      <h2>State <span id="state-type-badge" class="type-badge hidden"></span></h2>
+      <pre id="state-text" class="state-text loading">No state selected yet.</pre>
     </section>
 
-    <section id="log-panel">
-      <h2>Steps <span id="step-count"></span></h2>
-      <table id="step-table">
-        <thead>
-          <tr>
-            <th>#</th><th>Action</th><th>Optimal</th><th>✓/✗</th>
-            <th>Latency</th><th>LM output</th>
-          </tr>
-        </thead>
-        <tbody id="step-rows"></tbody>
-      </table>
+    <section id="results-panel">
+      <h2>Results</h2>
+      <div id="results"></div>
     </section>
   </main>
-
-  <section id="compare-panel" class="hidden">
-    <h2>Comparison <span id="compare-layout-label"></span></h2>
-    <table id="compare-table">
-      <thead>
-        <tr><th>Model</th><th>Result</th><th>Steps</th><th>Optimal</th><th>Action accuracy</th><th>Parse failures</th></tr>
-      </thead>
-      <tbody id="compare-rows"></tbody>
-    </table>
-  </section>
 
   <script src="/static/app.js"></script>
 </body>

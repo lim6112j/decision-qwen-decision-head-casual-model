@@ -1,8 +1,9 @@
-"""FastAPI app: SSE-streamed gridworld simulation with selectable models."""
+"""FastAPI app: SSE-streamed typed-question evaluation with selectable models."""
 
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
 from random import Random
 from typing import Optional
@@ -12,30 +13,28 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from decision_lab import PROJECT_ROOT, CONFIG_DIR
+from decision_lab import CONFIG_DIR, DATA_DIR, PROJECT_ROOT
 from decision_lab.backbone.llama_server import LlamaServer
 from decision_lab.config import Config, load_config
-from decision_lab.env.gridworld import GridLayout, GridState
+from decision_lab.head.model import build_question_spec
+from decision_lab.states.dataset import TextState, load_dataset
 from decision_lab.webapp.agents import AGENT_INFOS, build_agents
-from decision_lab.webapp.simulator import (
-    EpisodeSummary,
-    pick_start_pos,
-    run_episode,
-    summarize,
-)
+from decision_lab.webapp.simulator import evaluate_agent
 
 STATIC_DIR = PROJECT_ROOT / "web" / "static"
+TEXT_PREVIEW_CHARS = 160
 
 
 class WebAppState:
-    """Holds config, llama-server, layouts, and the 3 agents."""
+    """Holds config, llama-server, the pre-generated states, and the 3 agents."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.server: Optional[LlamaServer] = None
         self.agents = {}
-        self.layouts: list[GridLayout] = []
-        self.episode_lock = asyncio.Lock()
+        self.states: list[TextState] = []
+        self.question_spec: dict = {}
+        self.run_lock = asyncio.Lock()
 
     def start(self) -> None:
         gguf = Path(self.cfg.model.gguf_path).expanduser().resolve()
@@ -46,24 +45,25 @@ class WebAppState:
         )
         self.server.start()
         self.agents = build_agents(self.cfg, self.server)
-        self.layouts = self._generate_layouts()
+        self.question_spec = build_question_spec(self.cfg.questions)
+        self.states = self._load_states()
 
     def stop(self) -> None:
         if self.server:
             self.server.stop()
             self.server = None
 
-    def _generate_layouts(self) -> list[GridLayout]:
+    def _load_states(self) -> list[TextState]:
+        """Sample pre-generated states from the in-distribution test set."""
+        path = DATA_DIR / "test_indist.jsonl"
+        if not path.exists():
+            print(f"  warning: no states at {path}; UI will offer custom text only")
+            return []
+        states = load_dataset(path)
         rng = Random(self.cfg.web.random_seed)
-        g = self.cfg.grid
-        layouts = []
-        for _ in range(self.cfg.web.num_layouts):
-            layouts.append(GridLayout.random(
-                rows=g.size, cols=g.size,
-                wall_density=g.wall_density,
-                min_path_length=g.min_path_length, rng=rng,
-            ))
-        return layouts
+        picked = rng.sample(states, min(self.cfg.web.num_states, len(states)))
+        picked.sort(key=lambda s: s.doc_id)
+        return picked
 
 
 state: Optional[WebAppState] = None
@@ -79,51 +79,17 @@ async def lifespan(app: FastAPI):
     state.stop()
 
 
-app = FastAPI(title="Decision Lab Simulator", lifespan=lifespan)
+app = FastAPI(title="Decision Lab — Typed Question Analysis", lifespan=lifespan)
 
 
 class RunRequest(BaseModel):
     agent_id: str = Field(min_length=1)
-    layout_id: Optional[int] = None   # None → fresh random layout
-
-
-class CompareRequest(BaseModel):
-    layout_id: Optional[int] = None
+    doc_id: Optional[int] = None      # index into state.states
+    custom_text: Optional[str] = None  # overrides doc_id when provided
 
 
 def _sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-
-def _resolve_layout(layout_id: Optional[int], rng: Random) -> tuple[GridLayout, tuple[int, int]]:
-    """Return (layout, start_pos) for a layout id, or a fresh random layout."""
-    if layout_id is None:
-        layout = _random_layout(rng)
-    else:
-        if not 0 <= layout_id < len(state.layouts):
-            raise HTTPException(status_code=404, detail=f"layout_id {layout_id} out of range")
-        layout = state.layouts[layout_id]
-    return layout, pick_start_pos(layout)
-
-
-def _random_layout(rng: Random) -> GridLayout:
-    g = state.cfg.grid
-    return GridLayout.random(
-        rows=g.size, cols=g.size,
-        wall_density=g.wall_density,
-        min_path_length=g.min_path_length, rng=rng,
-    )
-
-
-def _grid_payload(layout: GridLayout, agent_pos: tuple[int, int]) -> dict:
-    return {
-        "rows": layout.rows,
-        "cols": layout.cols,
-        "walls": [[int(layout.cells[r, c]) == 1 for c in range(layout.cols)]
-                  for r in range(layout.rows)],
-        "goal_pos": list(layout.goal_pos),
-        "agent_pos": list(agent_pos),
-    }
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _get_agent(agent_id: str):
@@ -132,48 +98,50 @@ def _get_agent(agent_id: str):
     return state.agents[agent_id]
 
 
-def _episode_stream(agent_id: str, layout_id: Optional[int]):
-    """Generator yielding SSE events for a single episode run."""
+def _resolve_state(req: RunRequest) -> TextState:
+    """Custom text wins; otherwise pick a pre-generated state by doc_id."""
+    if req.custom_text:
+        return TextState(doc_id=-1, state_type="custom", text=req.custom_text, labels={})
+    if req.doc_id is None:
+        raise HTTPException(status_code=400, detail="provide doc_id or custom_text")
+    for s in state.states:
+        if s.doc_id == req.doc_id:
+            return s
+    raise HTTPException(status_code=404, detail=f"doc_id {req.doc_id} not found")
+
+
+def _state_payload(s: TextState) -> dict:
+    return {
+        "doc_id": s.doc_id,
+        "state_type": s.state_type,
+        "text": s.text,
+        "has_gold": bool(s.labels),
+    }
+
+
+def _agent_output_payload(out) -> dict:
+    d = asdict(out)
+    d["latency_ms"] = round(out.latency_ms, 1)
+    d["mean_accuracy"] = out.mean_accuracy
+    d["parse_failures"] = out.parse_failures
+    return d
+
+
+def _run_stream(agent_id: str, s: TextState):
+    """Generator yielding SSE events for a single agent over one state."""
     agent = _get_agent(agent_id)
-    layout, start_pos = _resolve_layout(layout_id, Random())
-    start_state = GridState(layout=layout, agent_pos=start_pos)
-    optimal_steps = int(layout.bfs_distances()[start_pos])
+    info = next(i for i in AGENT_INFOS if i.agent_id == agent_id)
 
     yield _sse("start", {
         "agent_id": agent_id,
-        "grid": _grid_payload(layout, start_pos),
-        "start_pos": list(start_pos),
-        "optimal_steps": optimal_steps,
+        "agent_name": info.name,
+        "state": _state_payload(s),
         "system_prompt": getattr(agent, "system_prompt", None),
     })
 
-    steps = []
-    for step in run_episode(layout, start_pos, agent.decide, state.cfg.web.max_steps):
-        steps.append(step)
-        yield _sse("step", {
-            "step_idx": step.step_idx,
-            "agent_pos": list(step.agent_pos),
-            "new_pos": list(step.new_pos),
-            "action": step.action,
-            "action_name": step.action_name,
-            "optimal_action": step.optimal_action,
-            "optimal_action_name": step.optimal_action_name,
-            "correct": step.correct,
-            "latency_ms": round(step.latency_ms, 1),
-            "raw_output": step.raw_output,
-            "reached_goal": step.reached_goal,
-            "state_text": step.state_text,
-        })
-
-    summary: EpisodeSummary = summarize(steps, optimal_steps)
-    yield _sse("summary", {
-        "agent_id": agent_id,
-        "success": summary.success,
-        "steps_used": summary.steps_used,
-        "optimal_steps": summary.optimal_steps,
-        "action_accuracy": round(summary.action_accuracy, 3),
-        "parse_failures": summary.parse_failures,
-    })
+    out = evaluate_agent(agent_id, info.name, s, agent.decide, state.question_spec)
+    yield _sse("result", _agent_output_payload(out))
+    yield _sse("done", {"agent_id": agent_id})
 
 
 @app.get("/api/agents")
@@ -181,20 +149,15 @@ def list_agents():
     return {"agents": [vars(info) for info in AGENT_INFOS]}
 
 
-@app.get("/api/layouts")
-def list_layouts():
-    return {
-        "layouts": [
-            {
-                "layout_id": i,
-                "rows": ly.rows,
-                "cols": ly.cols,
-                "optimal_from_start": int(ly.bfs_distances()[pick_start_pos(ly)]),
-                "ascii": ly.to_text(pick_start_pos(ly)),
-            }
-            for i, ly in enumerate(state.layouts)
-        ]
-    }
+@app.get("/api/states")
+def list_states():
+    return {"states": [_state_payload(s) for s in state.states]}
+
+
+@app.get("/api/questions")
+def list_questions():
+    """The fixed question bank, for the UI's result table."""
+    return {"questions": state.question_spec}
 
 
 @app.get("/api/status")
@@ -205,24 +168,26 @@ def status():
 @app.post("/api/run")
 async def run(req: RunRequest):
     _get_agent(req.agent_id)  # validate before opening the stream
+    s = _resolve_state(req)
 
     async def generate():
-        # Hold the lock for the whole stream: the generator body runs
-        # lazily after this handler returns.
-        async with state.episode_lock:
-            for event in _episode_stream(req.agent_id, req.layout_id):
+        async with state.run_lock:
+            for event in _run_stream(req.agent_id, s):
                 yield event
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @app.post("/api/compare")
-async def compare(req: CompareRequest):
+async def compare(req: RunRequest):
+    s = _resolve_state(req)
+
     async def generate():
-        async with state.episode_lock:
+        async with state.run_lock:
             for info in AGENT_INFOS:
+                _get_agent(info.agent_id)
                 yield _sse("agent_start", {"agent_id": info.agent_id, "name": info.name})
-                for event in _episode_stream(info.agent_id, req.layout_id):
+                for event in _run_stream(info.agent_id, s):
                     yield event
 
     return StreamingResponse(generate(), media_type="text/event-stream")

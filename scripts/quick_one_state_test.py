@@ -1,9 +1,9 @@
-"""Quick one-state test: ask each model the same single gridworld question.
+"""Quick one-state test: ask each model the same typed questions over one state.
 
 Standalone — does not modify any existing code. Usage:
     .venv/bin/python scripts/quick_one_state_test.py [num_states]
 
-Prints each model's predicted action vs ground truth, plus latency per decision.
+Prints each model's predicted answers vs ground truth, plus latency per decision.
 """
 
 import json
@@ -18,8 +18,13 @@ import torch
 
 from decision_lab.backbone.llama_server import LlamaServer
 from decision_lab.config import load_config
-from decision_lab.env.gridworld import ACTION_NAMES
-from decision_lab.head.model import DecisionHead, get_device, load_head
+from decision_lab.head.model import (
+    build_question_spec,
+    create_random_head,
+    get_device,
+    load_head,
+    predict_all,
+)
 from decision_lab.prompt_lm.agent import PromptAgent, PromptMode
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,46 +32,45 @@ DATA_DIR = ROOT / "data"
 MODELS_DIR = ROOT / "models"
 
 
+def _format_answers(decoded: dict) -> str:
+    parts = []
+    for qid, d in decoded.items():
+        pred = d["predicted"]
+        shown = str(pred).lower() if isinstance(pred, bool) else pred
+        parts.append(f"{qid}={shown} ({d['confidence']:.2f})")
+    return "  ".join(parts)
+
+
 def main():
     num_states = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     cfg = load_config(ROOT / "configs" / "default.yaml")
+    question_spec = build_question_spec(cfg.questions)
 
-    # One question per test set, read straight from JSONL (no caches needed)
-    questions = {}
+    # One state per test set, read straight from JSONL (no caches needed)
+    rows_by_split = {}
     for split in ["test_indist", "test_heldout"]:
         with open(DATA_DIR / f"{split}.jsonl") as f:
-            rows = [json.loads(next(f)) for _ in range(num_states)]
-        questions[split] = rows
+            rows_by_split[split] = [json.loads(next(f)) for _ in range(num_states)]
 
     gguf = Path(cfg.model.gguf_path).expanduser().resolve()
     device = get_device()
 
-    head_trained = load_head(
-        str(MODELS_DIR / "head_trained.pt"),
-        hidden_dim=cfg.head.hidden_dim,
-        num_actions=cfg.head.num_actions,
-        dropout=cfg.head.dropout,
-    ).to(device).eval()
-
-    head_random = DecisionHead(
-        hidden_dim=cfg.head.hidden_dim,
-        num_actions=cfg.head.num_actions,
-        dropout=cfg.head.dropout,
-    ).to(device).eval()
+    head_trained = load_head(str(MODELS_DIR / "head_trained.pt"), device=device).eval()
+    head_random = create_random_head(question_spec).to(device).eval()
 
     with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
         agent_zero = PromptAgent(cfg, server, mode=PromptMode.ZERO_SHOT)
 
-        for split, rows in questions.items():
-            print(f"\n{'=' * 60}\n{split} — {len(rows)} question(s)\n{'=' * 60}")
+        for split, rows in rows_by_split.items():
+            print(f"\n{'=' * 60}\n{split} — {len(rows)} state(s)\n{'=' * 60}")
             for row in rows:
-                gt = row["action"]
-                print(f"\nQuestion: agent={row['agent_pos']} goal={row['goal_pos']} "
-                      f"| ground truth: {ACTION_NAMES[gt]} ({gt})")
+                gold = row["labels"]
+                print(f"\nState: {row['state_type']} (doc {row['doc_id']})")
                 print(row["text"])
+                print(f"  gold: {gold}")
                 print("-" * 40)
 
-                # head_trained / head_random: embed the state text, then predict
+                # head_trained / head_random: embed the state text, single forward pass
                 embed_t0 = time.perf_counter()
                 feat = np.array(server.embed([row["text"]]), dtype=np.float32)
                 embed_ms = (time.perf_counter() - embed_t0) * 1000
@@ -75,26 +79,21 @@ def main():
                 for agent_id, head in [("head_trained", head_trained), ("head_random", head_random)]:
                     t0 = time.perf_counter()
                     with torch.no_grad():
-                        pred = head(x).argmax(dim=1).item()
+                        decoded = predict_all(head.question_spec, head(x), head.temperatures)
                     ms = (time.perf_counter() - t0) * 1000
-                    verdict = "OK" if pred == gt else "MISS"
-                    print(f"  [{agent_id:14s}] answer: {ACTION_NAMES[pred]} ({pred})  "
-                          f"{verdict}  | head {ms:.1f} ms (+ embed {embed_ms:.0f} ms)")
+                    print(f"  [{agent_id:14s}] {_format_answers(decoded)}  "
+                          f"| head {ms:.1f} ms (+ embed {embed_ms:.0f} ms)")
 
-                # prompt_lm_zero_shot — reuse the JSONL text directly via a tiny shim
+                # prompt_lm_zero_shot — chat completion answers in text
                 class ShimState:
                     def render(self):
                         return row["text"]
 
                 t0 = time.perf_counter()
-                action, raw = agent_zero.decide(ShimState())
+                answers, raw = agent_zero.decide(ShimState())
                 ms = (time.perf_counter() - t0) * 1000
-                if action is None:
-                    verdict, shown = "PARSE-FAIL", repr(raw)
-                else:
-                    verdict = "OK" if action == gt else "MISS"
-                    shown = f"{ACTION_NAMES[action]} ({action})"
-                print(f"  [{'prompt_lm_zero_shot':14s}] answer: {shown}  {verdict}  | {ms:.0f} ms")
+                shown = "  ".join(f"{qid}={ans}" for qid, ans in answers.items())
+                print(f"  [{'prompt_lm_zero_shot':14s}] {shown or 'PARSE-FAIL'}  | {ms:.0f} ms")
                 print(f"    raw: {raw!r}")
 
 

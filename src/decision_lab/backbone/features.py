@@ -21,7 +21,7 @@ def extract_features(
         server: LlamaServer instance (must be running).
         batch_size: texts to batch per embedding request.
     """
-    from decision_lab.env.dataset import load_dataset
+    from decision_lab.states.dataset import load_dataset
 
     if cache_path.exists():
         data = np.load(cache_path)
