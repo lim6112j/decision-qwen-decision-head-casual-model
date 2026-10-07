@@ -211,9 +211,11 @@ function showStepDetail(step, tr) {
   const mark = step.correct ? "✓" : "✗";
   const cls = step.correct ? "mark-good" : "mark-bad";
   const question = state.systemPrompt
-    ? `System:\n${state.systemPrompt}\n\nUser:\n${step.state_text}`
-    : `${step.state_text}\n\n(no textual question — the state render is embedded ` +
-      `by the backbone and classified by the MLP head)`;
+    ? `System:\n${state.systemPrompt}\n\nUser: the grid state shown above`
+    : `Given the grid state shown above, output ONLY the best single action ` +
+      `(up / down / left / right / wait).\n` +
+      `(answered implicitly: the state render is embedded by the backbone and ` +
+      `classified by the MLP head)`;
 
   const detailRow = document.createElement("tr");
   detailRow.className = "detail-row";
