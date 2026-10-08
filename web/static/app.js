@@ -9,7 +9,6 @@ const els = {
   stateSelect: document.getElementById("state-select"),
   customText: document.getElementById("custom-text"),
   runBtn: document.getElementById("run-btn"),
-  compareBtn: document.getElementById("compare-btn"),
   stateTypeBadge: document.getElementById("state-type-badge"),
   stateText: document.getElementById("state-text"),
   results: document.getElementById("results"),
@@ -41,7 +40,6 @@ function setReady(ready) {
   els.status.classList.toggle("down", !ready);
   els.status.title = ready ? "server ready" : "server unavailable";
   els.runBtn.disabled = !ready || state.running;
-  els.compareBtn.disabled = !ready || state.running;
   els.runDynamicBtn.disabled = !ready;
   if (ready && els.agentCards.querySelector(".loading")) {
     loadAgents();
@@ -325,7 +323,7 @@ function parseSSEBlock(block) {
   return data ? { event, data: JSON.parse(data) } : null;
 }
 
-/* ---------- run / compare ---------- */
+/* ---------- run ---------- */
 
 async function runOne() {
   if (!state.selectedAgent || state.running) return;
@@ -354,39 +352,13 @@ async function runOne() {
   }
 }
 
-async function runCompare() {
-  if (state.running) return;
-  state.running = true;
-  setButtonsDisabled(true);
-  clearResults();
-  if (els.stateSelect.value === "custom") showCustomState();
-
-  const outputs = [];
-  try {
-    await postSSE("/api/compare", currentStatePayload(), (event) => {
-      if (event.event === "result") {
-        outputs.push(event.data);
-        renderAgentResult(event.data);
-        showSummary(outputs);
-      }
-    });
-  } catch (err) {
-    showError(err.message);
-  } finally {
-    state.running = false;
-    setButtonsDisabled(false);
-  }
-}
-
 function setButtonsDisabled(disabled) {
   els.runBtn.disabled = disabled || !state.selectedAgent;
-  els.compareBtn.disabled = disabled;
 }
 
 /* ---------- init ---------- */
 
 els.runBtn.addEventListener("click", runOne);
-els.compareBtn.addEventListener("click", runCompare);
 els.customText.addEventListener("input", showCustomState);
 els.stateSelect.addEventListener("change", () => {
   toggleCustomText();
