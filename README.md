@@ -50,6 +50,12 @@ python -m decision_lab ui         # opens http://127.0.0.1:8000
 
 Edit `configs/default.yaml` to adjust gridworld size, model path, head hyperparameters, etc.
 
+## HTTP API
+
+Other projects can call the trained dynamic head over HTTP (no code import):
+start the UI service and `POST /api/decide-dynamic` with your own text and
+question configs — see [docs/http-api.md](docs/http-api.md).
+
 ## Tests
 
 ```bash
