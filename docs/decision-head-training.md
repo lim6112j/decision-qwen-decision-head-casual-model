@@ -36,6 +36,46 @@ logits = query · keys^T / √d_k  →  softmax → argmax
   → "left/right/stay" 편향 사건의 원인 (§5 참고).
 - 온도(T)는 학습 후 캘리브레이션 홀드아웃에서 LBFGS로 전역 1개를 피팅해 체크포인트에 저장.
 
+### v2: 필드 세트 cross-attention (2026-10-09)
+
+v1의 근본 한계 — 상태 텍스트 전체가 **풀링된 단일 벡터** 1개로만 헤드에 들어감 — 을
+풀기 위해 상태를 **필드/문장 단위 임베딩 세트**로 바꾸고 option이 그 세트에
+cross-attention하게 재구성했다 (checkpoint arch `state_set: true`):
+
+```
+필드 세트 (B, M, 1024) ──field_enc (공유)──→ F (B, M, H)
+option (N, 1024) ──opt_query──→ q (B, N, d_k)
+필드 ──field_key──→ K (B, M, d_k)
+α_ij = softmax_i(q_j·k_i/√d_k)   ← 필드 축, 마스크된 패딩 필드 제외
+z_j = Σ_i α_ij·F_i → score_head(z_j) → logits (B, N)
+```
+
+- **오염 국소화**: OOD 토큰 하나가 상태 벡터 전체가 아니라 그 토큰이 속한 필드만
+  오염시킨다. JSON/로그 같은 비-prose 포맷은 필드 단위로 쪼개면 문법 토큰(`{`, `"`,
+  `=`)에 기하 정보가 희석되지 않는다.
+- **직접 매칭**: 헤드가 "공이 오른쪽이라는 문장" ↔ "right" 옵션을 필드 수준에서
+  매칭할 수 있다.
+- **요약 필드**: 전체 텍스트 임베딩을 field 0으로 항상 prepend
+  (`dynamic_head.include_summary_field: true`). M≥1 보장 + 전역 컨텍스트.
+- **noul 정리**: v1에 있던 전용 `noul_head`는 한 번도 학습되지 않은 죽은 경로였다
+  (학습/서빙은 둘 다 attention 경로). v2에서 noul은 `["false","true"]` 옵션 어텐션
+  경로로 통일 — 학습·서빙·벤치마크가 같은 경로를 쓴다.
+- **청킹 일관성 불변식 (가장 중요)**: 학습 시 필드 분할과 추론 시 필드 분할이
+  같아야 한다. 단일 진실원천은 `states/fields.py`의 `state_fields` /
+  `split_state_fields` (JSON→leaf, 줄바꿈, `KEY=VALUE` 토큰, 문장 순으로 시도,
+  16필드 컷)이고, 피처 추출(`backbone/features.py:extract_field_features`)과
+  서빙(`webapp/agents.py:_state_tensor`)이 둘 다 이 함수를 경유한다. Breakout
+  렌더러는 필드를 직접 내보내지만(`(text, fields)`), **휴리스틱 분할 결과가
+  렌더러 필드와 정확히 일치함을 테스트로 강제한다**
+  (`tests/test_fields.py::TestBreakoutChunkingConsistency`) — 그래서 HTTP
+  `custom_fields`를 생략한 caller도 학습과 같은 청킹을 얻는다.
+- **캐시 형식**: `features_{split}_fields.npz` — ragged 저장
+  (`features (ΣM_i, 1024)` + `field_counts (N,)`). 기존 pooled
+  `features_*.npz`는 typed 헤드가 그대로 쓴다.
+- **하위 호환**: v1 체크포인트는 그대로 로드된다 (arch 플래그 분기,
+  `models/head_dynamic_v1.pt`에 백업 보관). v1 헤드에 3D 필드 세트를 넣으면
+  field 0(=요약=전체 텍스트 임베딩)을 읽어 구 동작과 동일하다.
+
 ## 2. Last-token pooling — 가장 중요한 함정
 
 Qwen 같은 causal 모델의 문장 임베딩은 **마지막 토큰의 hidden state** 하나다.
@@ -148,8 +188,10 @@ python -m decision_lab eval && python -m decision_lab report
 |---|---|
 | 문서 상태 생성기 | `src/decision_lab/states/generator.py` |
 | Breakout 상태 생성기 | `src/decision_lab/states/breakout.py` |
-| 동적 헤드 모델/디코딩 | `src/decision_lab/head/dynamic_model.py` |
+| 필드 분할 (청킹 단일 진실원천) | `src/decision_lab/states/fields.py` |
+| 동적 헤드 모델/디코딩 (v1/v2) | `src/decision_lab/head/dynamic_model.py` |
 | 동적 헤드 학습 (커리큘럼, 온도) | `src/decision_lab/head/dynamic_train.py` |
+| 피처 추출 (pooled + ragged 필드) | `src/decision_lab/backbone/features.py` |
 | 동적 헤드 서빙 | `src/decision_lab/webapp/agents.py` |
 | 벤치마크 (혼동 행렬 포함) | `src/decision_lab/eval/benchmark.py` |
 | HTTP API 문서 | `docs/http-api.md` |

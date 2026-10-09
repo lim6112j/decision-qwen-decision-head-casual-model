@@ -4,13 +4,14 @@ Phase 1 (anchor): Train on the fixed question bank to establish a baseline.
 Phase 2 (generalize): Introduce varied option sets so the head learns that
   options are inputs, not architectural constants.
 
-Training samples are (state_embedding, option_embeddings, gold_idx) tuples.
+Training samples are (state_field_set, option_embeddings, gold_idx) tuples.
+State field sets are ragged (M_i, input_dim) arrays — padded + masked per
+batch at collate time, never materialized as one giant padded tensor.
 Option embeddings are pre-computed via the frozen backbone and cached.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from random import Random
@@ -19,7 +20,6 @@ from typing import Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 
 from decision_lab.config import Config
 from decision_lab.head.dynamic_model import (
@@ -41,18 +41,50 @@ from decision_lab.head.dynamic_model import (
 class DynamicTrainingSample:
     """One (state, options, gold) training instance.
 
-    state_emb:     (input_dim,) float32 vector
+    state_fields_emb: (M, input_dim) float32 — the state's field-set
+        embeddings (M = 1 for the pooled-vector v1 path)
     option_embs:   (n_opts, input_dim) float32 — embedded option texts
     gold_idx:      int — which option is correct
     question_type: "choice" | "score" | "noul"
     question_text: str — for logging
     """
 
-    state_emb: np.ndarray
+    state_fields_emb: np.ndarray
     option_embs: np.ndarray
     gold_idx: int
     question_type: str
     question_text: str = ""
+
+
+def collate_dynamic_batch(
+    samples: Sequence[DynamicTrainingSample],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad + stack a batch of samples → (states, state_mask, options, golds).
+
+    states:     (B, M_max, input_dim) — zero-padded
+    state_mask: (B, M_max) bool — True where a real field exists
+    options:    (B, N_max, input_dim) — zero-padded
+    golds:      (B,) long
+    """
+    batch = len(samples)
+    max_m = max(s.state_fields_emb.shape[0] for s in samples)
+    max_n = max(s.option_embs.shape[0] for s in samples)
+    dim = samples[0].state_fields_emb.shape[-1]
+
+    xb = torch.zeros(batch, max_m, dim, dtype=torch.float32)
+    mask = torch.zeros(batch, max_m, dtype=torch.bool)
+    ob = torch.zeros(batch, max_n, dim, dtype=torch.float32)
+    yb = torch.tensor([s.gold_idx for s in samples], dtype=torch.long)
+
+    for i, s in enumerate(samples):
+        m = s.state_fields_emb.shape[0]
+        xb[i, :m] = torch.from_numpy(np.asarray(s.state_fields_emb, dtype=np.float32))
+        mask[i, :m] = True
+        n = s.option_embs.shape[0]
+        ob[i, :n] = torch.from_numpy(np.asarray(s.option_embs, dtype=np.float32))
+
+    return xb.to(device), mask.to(device), ob.to(device), yb.to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +240,7 @@ def generate_variant_questions(
 
 def generate_dynamic_training_data(
     states,
-    features: np.ndarray,
+    field_features: Sequence[np.ndarray],
     base_spec: dict,
     server,
     rng: Random | None = None,
@@ -221,7 +253,8 @@ def generate_dynamic_training_data(
 
     Args:
         states: list of TextState objects with gold labels.
-        features: (N, input_dim) pre-extracted state embeddings.
+        field_features: per-state (M_i, input_dim) field-set embeddings,
+            aligned with ``states`` (v1 pooled vectors = M_i == 1).
         base_spec: normalized question bank from build_question_spec(cfg.questions).
         server: LlamaServer (must be running) for embedding option texts.
         rng: random state for shuffling.
@@ -288,7 +321,7 @@ def generate_dynamic_training_data(
 
     samples = []
     for i, state in enumerate(states):
-        state_emb = features[i]
+        state_fields_emb = field_features[i]
         for qc in all_question_configs:
             q = qc["question"]
             qid = qc["qid"]
@@ -300,7 +333,7 @@ def generate_dynamic_training_data(
             kind = q["type"]
             if kind == "noul":
                 gold_idx = 1 if bool(gold) else 0
-                # noul uses dedicated head — option embeddings are [false, true]
+                # noul goes through the attention path with [false, true]
                 opt_embs = np.stack([text_to_emb["false"], text_to_emb["true"]])
             else:
                 # Map gold label to variant option index
@@ -321,7 +354,7 @@ def generate_dynamic_training_data(
                 opt_embs = np.stack([text_to_emb[t] for t in option_texts])
 
             samples.append(DynamicTrainingSample(
-                state_emb=state_emb,
+                state_fields_emb=state_fields_emb,
                 option_embs=opt_embs,
                 gold_idx=gold_idx,
                 question_type=kind,
@@ -355,7 +388,7 @@ def train_dynamic_head(
         model_path: where to save the checkpoint.
         anchor_fraction: fraction of max_epochs spent on anchor-only training.
     """
-    hc = cfg.head
+    hc = cfg.dynamic_head
     device = get_device()
     print(f"Training dynamic head on device: {device} ({len(samples)} samples)")
 
@@ -363,25 +396,6 @@ def train_dynamic_head(
     base_samples = [s for s in samples if "variant" not in s.question_text]
     variant_samples = [s for s in samples if "variant" in s.question_text]
     print(f"  anchor samples: {len(base_samples)}, variant samples: {len(variant_samples)}")
-
-    # Pack into tensors (once; phases index into these instead of packing copies)
-    def pack_samples(s_list: list[DynamicTrainingSample]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (state_embs, option_embs_stack, gold_idxs, n_opts_per_sample)."""
-        states = torch.tensor(np.stack([s.state_emb for s in s_list]), dtype=torch.float32)
-        golds = torch.tensor([s.gold_idx for s in s_list], dtype=torch.long)
-
-        # Pad option embeddings to max n_opts
-        max_opts = max(s.option_embs.shape[0] for s in s_list)
-        opt_dim = s_list[0].option_embs.shape[1]
-        opt_padded = torch.zeros(len(s_list), max_opts, opt_dim, dtype=torch.float32)
-        n_opts = torch.zeros(len(s_list), dtype=torch.long)
-        for i, s in enumerate(s_list):
-            n = s.option_embs.shape[0]
-            opt_padded[i, :n] = torch.tensor(s.option_embs, dtype=torch.float32)
-            n_opts[i] = n
-        return states, opt_padded, golds, n_opts
-
-    x_all, opts_all, y_all, n_all = pack_samples(list(samples))
 
     # Curriculum pools: base vs variant samples (by question text)
     is_variant = torch.tensor(
@@ -413,12 +427,13 @@ def train_dynamic_head(
           f"calibration holdout: {calib_n} "
           f"(anchor pool: {len(anchor_pool)})")
 
-    # Model
+    # Model — v2 field-set architecture
     model = DynamicDecisionHead(
         input_dim=1024,
         hidden_dim=hc.hidden_dim,
-        d_k=128,
+        d_k=hc.d_k,
         dropout=hc.dropout,
+        state_set=True,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=hc.learning_rate, weight_decay=hc.weight_decay)
@@ -428,6 +443,10 @@ def train_dynamic_head(
     best_val_acc = -1.0
     best_state = None
     patience_counter = 0
+
+    def batch_at(positions: torch.Tensor, start: int, batch_size: int) -> list[DynamicTrainingSample]:
+        bpos = positions[start : start + batch_size]
+        return [samples[i] for i in bpos.tolist()]
 
     batch_size = hc.batch_size
     for epoch in range(1, hc.max_epochs + 1):
@@ -446,22 +465,16 @@ def train_dynamic_head(
         order = pool[torch.randperm(len(pool))]
 
         for start in range(0, len(order), batch_size):
-            bpos = order[start : start + batch_size]
-            xb = x_all[bpos].to(device)
-            ob = opts_all[bpos].to(device)
-            yb = y_all[bpos].to(device)
+            xb, mask, ob, yb = collate_dynamic_batch(
+                batch_at(order, start, batch_size), device,
+            )
 
             optimizer.zero_grad()
-            # Forward pass: attention over options
-            h = model.trunk(xb)
-            q = model.query_proj(h)
-            K = model.key_proj(ob)
-            scores = torch.bmm(K, q.unsqueeze(-1)).squeeze(-1) / math.sqrt(model.d_k)
-
+            scores = model.forward_choice(xb, ob, mask)          # (B, N)
             loss = F.cross_entropy(scores, yb)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item() * len(bpos)
+            train_loss += loss.item() * len(yb)
 
         train_loss /= len(order)
 
@@ -471,18 +484,13 @@ def train_dynamic_head(
         val_total = 0
         with torch.no_grad():
             for start in range(0, len(val_positions), batch_size):
-                bpos = val_positions[start : start + batch_size]
-                xb = x_all[bpos].to(device)
-                ob = opts_all[bpos].to(device)
-                yb = y_all[bpos].to(device)
-
-                h = model.trunk(xb)
-                q = model.query_proj(h)
-                K = model.key_proj(ob)
-                scores = torch.bmm(K, q.unsqueeze(-1)).squeeze(-1) / math.sqrt(model.d_k)
+                xb, mask, ob, yb = collate_dynamic_batch(
+                    batch_at(val_positions, start, batch_size), device,
+                )
+                scores = model.forward_choice(xb, ob, mask)
                 pred = scores.argmax(dim=1)
                 val_correct += int((pred == yb).sum().item())
-                val_total += len(bpos)
+                val_total += len(yb)
 
         val_acc = val_correct / val_total if val_total > 0 else 0.0
 
@@ -504,7 +512,7 @@ def train_dynamic_head(
     model.eval()
 
     # Global temperature calibration (single scalar, not per-question)
-    temperature = _fit_global_temperature(model, x_all, opts_all, y_all, calib_idx_set, device)
+    temperature = _fit_global_temperature(model, samples, calib_idx_set, device)
 
     save_dynamic_head(model, str(model_path), temperature=temperature)
     print(f"  saved to {model_path}  (best val_acc={best_val_acc:.3f}, T={temperature:.3f})")
@@ -513,39 +521,43 @@ def train_dynamic_head(
 
 def _fit_global_temperature(
     model: DynamicDecisionHead,
-    x: torch.Tensor,
-    opts: torch.Tensor,
-    y: torch.Tensor,
+    samples: Sequence[DynamicTrainingSample],
     calib_idx_set: set,
     device: torch.device,
     lr: float = 1e-2,
     max_iter: int = 1000,
+    batch_size: int = 256,
 ) -> float:
-    """Fit a single scalar temperature on the calibration holdout set."""
-    calib_mask = torch.tensor([i in calib_idx_set for i in range(len(x))], dtype=torch.bool)
-    x_calib = x[calib_mask].to(device)
-    opts_calib = opts[calib_mask].to(device)
-    y_calib = y[calib_mask].to(device)
+    """Fit a single scalar temperature on the calibration holdout set.
 
-    if len(x_calib) == 0:
+    Question types mix option counts, so logits are collected per batch
+    (ragged widths) and the closure sums batch-wise weighted CE instead of
+    concatenating into one tensor.
+    """
+    calib_samples = [samples[i] for i in sorted(calib_idx_set) if i < len(samples)]
+    if not calib_samples:
         return 1.0
 
     model.eval()
+    batch_logits: list[tuple[torch.Tensor, torch.Tensor, int]] = []
     with torch.no_grad():
-        h = model.trunk(x_calib)
-        q = model.query_proj(h)
-        K = model.key_proj(opts_calib)
-        logits = torch.bmm(K, q.unsqueeze(-1)).squeeze(-1) / math.sqrt(model.d_k)
+        for start in range(0, len(calib_samples), batch_size):
+            chunk = calib_samples[start : start + batch_size]
+            xb, mask, ob, yb = collate_dynamic_batch(chunk, device)
+            logits = model.forward_choice(xb, ob, mask)
+            batch_logits.append((logits.cpu().detach(), yb.cpu().detach(), len(chunk)))
 
-    logits = logits.detach().to("cpu").clone()
-    labels = y_calib.detach().to("cpu").clone()
     log_t = torch.zeros(1, requires_grad=True)
     optimizer = torch.optim.LBFGS([log_t], lr=lr, max_iter=max_iter)
 
     def closure():
         optimizer.zero_grad()
         t = log_t.exp().clamp_min(1e-3)
-        loss = F.cross_entropy(logits / t, labels)
+        total = sum(n for _, _, n in batch_logits)
+        loss = sum(
+            F.cross_entropy(logits / t, labels, reduction="sum") / total
+            for logits, labels, _ in batch_logits
+        )
         loss.backward()
         return loss
 

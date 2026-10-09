@@ -92,6 +92,11 @@ class DynamicDecideRequest(BaseModel):
     """Request to evaluate a state against fully dynamic question configs."""
     doc_id: Optional[int] = None
     custom_text: Optional[str] = None
+    custom_fields: Optional[list[str]] = None
+    """Optional caller-controlled field chunking of custom_text (v2 head).
+    Used verbatim — the caller owns the chunking, so it must match how the
+    head was trained (heuristic split via states/fields.py is the default
+    when omitted). Ignored for legacy v1 checkpoints (pooled state)."""
     questions: list[dict] = Field(min_length=1)
     """Each dict: {"type": "choice", "options": [...], "question": "..."}
        or {"type": "score", "levels": [...], "question": "..."}
@@ -222,9 +227,19 @@ async def decide_dynamic(req: DynamicDecideRequest):
 
     _validate_dynamic_questions(req.questions)
 
+    if req.custom_fields and not req.custom_text:
+        raise HTTPException(
+            status_code=400,
+            detail="custom_fields requires custom_text (it chunks the custom text)",
+        )
     s = _resolve_state_dynamic(req)
+    if req.custom_fields and not dynamic_agent._head.state_set:
+        raise HTTPException(
+            status_code=400,
+            detail="custom_fields requires a v2 (state_set) checkpoint — retrain the dynamic head",
+        )
     try:
-        answers, latency_ms = dynamic_agent.decide_dynamic(s, req.questions)
+        answers, latency_ms = dynamic_agent.decide_dynamic(s, req.questions, fields=req.custom_fields)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"dynamic decision failed: {exc}") from exc
 

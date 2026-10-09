@@ -4,6 +4,7 @@ and latency for each agent on each test set."""
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -27,6 +28,7 @@ from decision_lab.head.dynamic_model import (
     make_score_question,
     question_option_texts,
 )
+from decision_lab.backbone.features import load_field_features
 from decision_lab.states.dataset import load_dataset
 
 # Latency is measured on a subsample; accuracy is measured on every state.
@@ -107,7 +109,7 @@ def benchmark_head(
 
 def benchmark_dynamic_head(
     states,
-    features: np.ndarray,
+    field_sets: Sequence[np.ndarray],
     head: DynamicDecisionHead,
     question_spec: dict,
     option_emb_cache: dict[str, torch.Tensor],
@@ -118,6 +120,8 @@ def benchmark_dynamic_head(
     """Run the dynamic head agent on all states using the fixed question bank.
 
     Args:
+        field_sets: per-state (M_i, input_dim) field-set embeddings (v2) —
+            a v1 head reads field 0, which is the full-text embedding.
         option_emb_cache: {option_text: (input_dim,) tensor on device} —
             pre-embedded option texts from the backbone.
     """
@@ -126,7 +130,7 @@ def benchmark_dynamic_head(
     results = []
 
     for i, s in enumerate(states):
-        feat = torch.tensor(features[i], dtype=torch.float32, device=device).unsqueeze(0)
+        feat = torch.from_numpy(np.asarray(field_sets[i], dtype=np.float32)).unsqueeze(0).to(device)
 
         # Warmup + timed runs
         latencies = []
@@ -366,6 +370,8 @@ def run_benchmark(
         states = load_dataset(test_path)
         feature_path = data_dir / f"features_{test_name}.npz"
         features = np.load(feature_path)["features"] if feature_path.exists() else None
+        field_path = data_dir / f"features_{test_name}_fields.npz"
+        field_sets = load_field_features(field_path)[0] if field_path.exists() else None
         if bc.max_test_states > 0 and len(states) > bc.max_test_states:
             rng = np.random.RandomState(cfg.generator.seed)
             idx = rng.choice(len(states), size=bc.max_test_states, replace=False)
@@ -374,6 +380,8 @@ def run_benchmark(
             states = [states[i] for i in idx]
             if features is not None:
                 features = features[idx]   # feature rows follow dataset file order
+            if field_sets is not None:
+                field_sets = [field_sets[i] for i in idx]
 
         all_metrics[test_name] = {}
 
@@ -401,9 +409,14 @@ def run_benchmark(
         }
 
         dynamic_head, dynamic_temp = _load_dynamic_for_benchmark(cfg, models_dir, device)
+        if field_sets is None and dynamic_head.state_set:
+            raise RuntimeError(
+                f"missing {field_path} for the v2 dynamic head — run `python -m decision_lab extract`"
+            )
+        dynamic_features = field_sets if dynamic_head.state_set else features
         print(f"  [{test_name}] benchmarking head_dynamic...")
         rows = benchmark_dynamic_head(
-            states, features, dynamic_head, question_spec,
+            states, dynamic_features, dynamic_head, question_spec,
             option_emb_cache, dynamic_temp, "head_dynamic", device,
         )
         all_metrics[test_name]["head_dynamic"] = compute_metrics(rows, question_spec)
@@ -438,11 +451,13 @@ def _benchmark_dynamic_breakout(
 
     test_path = data_dir / "test_breakout.jsonl"
     feature_path = data_dir / "features_test_breakout.npz"
+    field_path = data_dir / "features_test_breakout_fields.npz"
     if not test_path.exists() or not feature_path.exists():
         return None
 
     states = load_dataset(test_path)
     features = np.load(feature_path)["features"]
+    field_sets = load_field_features(field_path)[0] if field_path.exists() else None
     if bc.max_test_states > 0 and len(states) > bc.max_test_states:
         rng = np.random.RandomState(cfg.generator.seed)
         idx = rng.choice(len(states), size=bc.max_test_states, replace=False)
@@ -450,6 +465,8 @@ def _benchmark_dynamic_breakout(
         print(f"  [test_breakout] subsampling {len(idx)}/{len(states)} states")
         states = [states[i] for i in idx]
         features = features[idx]
+        if field_sets is not None:
+            field_sets = [field_sets[i] for i in idx]
 
     device = get_device()
     breakout_spec = breakout_question_spec()
@@ -459,9 +476,14 @@ def _benchmark_dynamic_breakout(
     }
 
     dynamic_head, dynamic_temp = _load_dynamic_for_benchmark(cfg, models_dir, device)
+    if field_sets is None and dynamic_head.state_set:
+        raise RuntimeError(
+            f"missing {field_path} for the v2 dynamic head — run `python -m decision_lab extract`"
+        )
+    dynamic_features = field_sets if dynamic_head.state_set else features
     print("  [test_breakout] benchmarking head_dynamic...")
     rows = benchmark_dynamic_head(
-        states, features, dynamic_head, breakout_spec,
+        states, dynamic_features, dynamic_head, breakout_spec,
         option_emb_cache, dynamic_temp, "head_dynamic", device,
     )
     return {"head_dynamic": compute_metrics(rows, breakout_spec)}
@@ -512,6 +534,7 @@ def _load_dynamic_for_benchmark(
             hidden_dim=cfg.dynamic_head.hidden_dim,
             d_k=cfg.dynamic_head.d_k,
             dropout=cfg.dynamic_head.dropout,
+            state_set=True,
         ).to(device)
         temperature = 1.0
     except (ValueError, RuntimeError) as exc:

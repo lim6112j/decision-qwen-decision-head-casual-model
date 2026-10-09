@@ -46,6 +46,15 @@ request — no retraining or server restart for new question types.
 
 - `custom_text` (string) — raw text to evaluate. Wins over `doc_id` when both
   are given.
+- `custom_fields` (list of strings, optional) — caller-controlled field
+  chunking of `custom_text` for the v2 field-set head. **Chunking must match
+  training**: omit it and the server applies the same heuristic splitter
+  (`src/decision_lab/states/fields.py:split_state_fields`) used at feature
+  extraction — JSON objects split per leaf (`"ball.x: 369"`), newline
+  blocks per line, log lines per `KEY=VALUE` token, prose per sentence
+  (capped at 16 fields, merged when exceeded). Pass it only if you chunk
+  yourself and can keep that chunking stable. Requires the v2 checkpoint;
+  a legacy (v1, pooled-state) checkpoint rejects it with a 400.
 - `doc_id` (int) — alternatively pick one of the pre-generated states served by
   `GET /api/states`.
 - `questions` (list, ≥1) — one of:
@@ -165,8 +174,11 @@ def decide(state_text: str, questions: list[dict]) -> list[dict]:
 - Embeddings require the **same backbone** the head was trained on: the
   Qwen3.5-0.8B Q4_K_XL GGUF with last-token pooling (dim 1024). Swapping the
   GGUF or pooling mode degrades accuracy silently.
-- Known issue: boolean (`noul`) questions served through this endpoint are
-  scored via attention over the embeddings of the strings `"false"`/`"true"`,
-  while training used the dedicated `noul_head` linear path
-  (`src/decision_lab/head/dynamic_train.py`). If boolean answers look weak,
-  switch `decide_dynamic` to `forward_noul` and re-benchmark.
+- v2 field-set head: the state is a **set of field embeddings** (sentences /
+  key:value leaves), and each option cross-attends over that set. One
+  out-of-distribution token contaminates only the field it appears in, not
+  the whole state. The full-text embedding is always prepended as field 0
+  (summary field) to keep global context.
+- Boolean (`noul`) questions are scored via attention over the embeddings of
+  the strings `"false"`/`"true"` — the same path they are trained on
+  (`forward_choice`), so training and serving agree by construction.

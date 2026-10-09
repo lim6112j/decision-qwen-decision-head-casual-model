@@ -16,6 +16,7 @@ from random import Random
 
 from decision_lab.config import Config
 from decision_lab.states.dataset import TextState, save_dataset
+from decision_lab.states.fields import _flatten_json, split_sentences
 
 BREAKOUT_STATE_TYPE = "breakout"
 PADDLE_QID = "paddle_direction"
@@ -80,12 +81,13 @@ def make_breakout_state(doc_id: int, rng: Random) -> TextState:
     """Sample latents, render one Breakout state, return TextState with gold."""
     latents = _sample_latents(rng)
     render = _RENDERERS[latents.template]
-    text = render(rng, latents)
+    text, fields = render(rng, latents)
     return TextState(
         doc_id=doc_id,
         state_type=f"{BREAKOUT_STATE_TYPE}_{latents.template}",
         text=text,
         labels=latents.labels(),
+        fields=fields,
     )
 
 
@@ -215,13 +217,16 @@ def _motion_echo(vy: int, side: str) -> str:
     return "Rising away from the paddle" if vy < 0 else "Falling toward the paddle"
 
 
-def _render_prose(rng: Random, lat: BreakoutLatents) -> str:
+def _render_prose(rng: Random, lat: BreakoutLatents) -> tuple[str, list[str]]:
     """User-style prose with randomized sentence composition.
 
     Covers the shapes real game clients send: geometry first with status
     last (the common layout), status first with geometry last, and
     geometry-only texts with no status sentence at all. Randomization here
     is what keeps the head from keying on sentence position.
+
+    Returns (text, fields) — fields are the rendered sentences in text
+    appearance order; text is byte-identical to the pre-field renderer.
     """
     if lat.side == "center":
         geometry = (
@@ -236,39 +241,61 @@ def _render_prose(rng: Random, lat: BreakoutLatents) -> str:
     echo = f" {_motion_echo(lat.ball_vy, lat.side)}." if rng.random() < 0.5 else ""
     status = _distractor_prose(rng, lat)
 
+    geometry_field = geometry
+    echo_field = echo.strip() if echo else None
+    # Status may contain multiple sentences; emit them separately so the
+    # field set matches split_state_fields(text) exactly — training and
+    # inference must chunk identically.
+    status_fields = split_sentences(status)
+
     if rng.random() < 0.5:
         # Geometry first; status sometimes omitted entirely
+        fields = [geometry_field]
+        if echo_field:
+            fields.append(echo_field)
         if rng.random() < 0.2:
-            return f"{geometry}{echo}"
-        return f"{geometry}{echo} {status}"
-    return f"{status} {geometry}{echo}"
+            return f"{geometry}{echo}", fields
+        fields.extend(status_fields)
+        return f"{geometry}{echo} {status}", fields
+    fields = [*status_fields, geometry_field]
+    if echo_field:
+        fields.append(echo_field)
+    return f"{status} {geometry}{echo}", fields
 
 
-def _render_prose_short(rng: Random, lat: BreakoutLatents) -> str:
+def _render_prose_short(rng: Random, lat: BreakoutLatents) -> tuple[str, list[str]]:
     """Short prose with side words but no px number."""
     if lat.side == "center":
         geom = f"Ball hovering just above the paddle, {_short_motion(lat.ball_vx, lat.ball_vy)}"
     else:
         word = "left" if lat.side == "left" else "right"
         geom = f"Ball well {word} of the paddle, {_short_motion(lat.ball_vx, lat.ball_vy)}"
-    return f"{geom}. {lat.bricks} bricks left, score {lat.score}, {lat.lives} lives."
+    status = f"{lat.bricks} bricks left, score {lat.score}, {lat.lives} lives."
+    return f"{geom}. {status}", [f"{geom}.", status]
 
 
-def _render_prose_vague(rng: Random, lat: BreakoutLatents) -> str:
+def _render_prose_vague(rng: Random, lat: BreakoutLatents) -> tuple[str, list[str]]:
     """Vague side words, no measurements at all."""
     if lat.side == "center":
         geom = "The ball hovers just above the paddle."
     else:
         word = "left" if lat.side == "left" else "right"
         geom = f"The ball sits well off to the {word} side of the paddle."
+    motion = f"It is {_short_motion(lat.ball_vx, lat.ball_vy)}."
+    status = f"Bricks: {lat.bricks}. Score: {lat.score}. Lives: {lat.lives}."
     return (
-        f"{geom} It is {_short_motion(lat.ball_vx, lat.ball_vy)}. "
-        f"Bricks: {lat.bricks}. Score: {lat.score}. Lives: {lat.lives}."
+        f"{geom} {motion} {status}",
+        [geom, motion, *split_sentences(status)],
     )
 
 
-def _render_structured(rng: Random, lat: BreakoutLatents) -> str:
-    """JSON state — gold comes only from x-coordinates, no direction words."""
+def _render_structured(rng: Random, lat: BreakoutLatents) -> tuple[str, list[str]]:
+    """JSON state — gold comes only from x-coordinates, no direction words.
+
+    Fields are per-leaf "path: value" strings (same format as the generic
+    JSON splitter in states/fields.py), isolating each coordinate from
+    syntax tokens.
+    """
     paddle_x = rng.randint(*PADDLE_X_RANGE)
     sign = 1 if lat.side == "right" else -1 if lat.side == "left" else rng.choice((-1, 1))
     ball_x = paddle_x + sign * lat.gap_px
@@ -280,17 +307,22 @@ def _render_structured(rng: Random, lat: BreakoutLatents) -> str:
         "score": lat.score,
         "lives": lat.lives,
     }
-    return json.dumps(doc)
+    return json.dumps(doc), _flatten_json(doc)
 
 
-def _render_log(rng: Random, lat: BreakoutLatents) -> str:
+def _render_log(rng: Random, lat: BreakoutLatents) -> tuple[str, list[str]]:
     """Signed-number log line — gold only from the signed gap."""
     sign = 1 if lat.side == "right" else -1 if lat.side == "left" else rng.choice((-1, 1))
     gap_signed = sign * lat.gap_px
-    return (
-        f"GAP={gap_signed:+d} VX={lat.ball_vx:+d} VY={lat.ball_vy:+d} "
-        f"BRICKS={lat.bricks} SCORE={lat.score} LIVES={lat.lives}"
-    )
+    fields = [
+        f"GAP={gap_signed:+d}",
+        f"VX={lat.ball_vx:+d}",
+        f"VY={lat.ball_vy:+d}",
+        f"BRICKS={lat.bricks}",
+        f"SCORE={lat.score}",
+        f"LIVES={lat.lives}",
+    ]
+    return " ".join(fields), fields
 
 
 _RENDERERS = {

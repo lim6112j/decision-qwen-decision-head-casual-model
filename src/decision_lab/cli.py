@@ -23,12 +23,17 @@ def cmd_generate(args):
 
 
 def cmd_extract(args):
-    """Extract features from datasets using llama-server."""
-    from decision_lab.backbone.features import extract_features
+    """Extract features from datasets using llama-server.
+
+    Produces both cache formats per split: features_{split}.npz (pooled,
+    v1) and features_{split}_fields.npz (ragged field sets, v2).
+    """
+    from decision_lab.backbone.features import extract_features, extract_field_features
     from decision_lab.backbone.llama_server import LlamaServer
 
     cfg = load_config(args.config)
     gguf = Path(cfg.model.gguf_path).expanduser().resolve()
+    include_summary = cfg.dynamic_head.include_summary_field
 
     with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
         for split in ["train", "test_indist", "test_heldout", "train_breakout", "test_breakout"]:
@@ -40,6 +45,14 @@ def cmd_extract(args):
             print(f"Extracting features: {split} → {cache_path}")
             feats = extract_features(data_path, cache_path, server)
             print(f"  shape={feats.shape}")
+
+            field_cache = args.data_dir / f"features_{split}_fields.npz"
+            print(f"Extracting field features: {split} → {field_cache}")
+            feats, counts = extract_field_features(
+                data_path, field_cache, server, include_summary_field=include_summary,
+            )
+            print(f"  field counts: min={counts.min()} max={counts.max()} "
+                  f"(limit {cfg.dynamic_head.max_fields})")
 
 
 def cmd_train(args):
@@ -66,7 +79,8 @@ def cmd_train(args):
 
 
 def cmd_train_dynamic(args):
-    """Train dynamic decision head (attention-based) on extracted features."""
+    """Train dynamic decision head (v2 field-set attention) on extracted features."""
+    from decision_lab.backbone.features import load_field_features
     from decision_lab.backbone.llama_server import LlamaServer
     from decision_lab.head.model import build_question_spec
     from decision_lab.head.dynamic_train import generate_dynamic_training_data, train_dynamic_head
@@ -80,7 +94,16 @@ def cmd_train_dynamic(args):
         print(f"No training data at {train_path}")
         sys.exit(1)
 
-    features = np.load(args.data_dir / "features_train.npz")["features"]
+    def field_cache(split: str) -> list[np.ndarray]:
+        path = args.data_dir / f"features_{split}_fields.npz"
+        if not path.exists():
+            print(f"Missing field feature cache: {path}\n"
+                  f"Run: python -m decision_lab extract   (requires llama-server)")
+            sys.exit(1)
+        field_sets, counts = load_field_features(path)
+        return field_sets
+
+    field_sets = field_cache("train")
     states = load_dataset(train_path)
     question_spec = build_question_spec(cfg.questions)
 
@@ -90,24 +113,25 @@ def cmd_train_dynamic(args):
     if brk_path.exists():
         from decision_lab.states.breakout import breakout_question_spec
         brk_states = load_dataset(brk_path)
-        brk_feats = np.load(args.data_dir / "features_train_breakout.npz")["features"]
-        assert len(brk_feats) == len(brk_states), \
-            f"{len(brk_feats)} != {len(brk_states)}"
+        brk_field_sets = field_cache("train_breakout")
+        assert len(brk_field_sets) == len(brk_states), \
+            f"{len(brk_field_sets)} != {len(brk_states)}"
         w = cfg.dynamic_head.breakout_weight
         states = states + brk_states * w
-        features = np.concatenate([features] + [brk_feats] * w)
+        field_sets = field_sets + brk_field_sets * w
         question_spec = {**question_spec, **breakout_question_spec()}
         print(f"  mixed in {len(brk_states)} breakout states × weight {w}")
 
-    assert len(features) == len(states), f"{len(features)} != {len(states)}"
+    assert len(field_sets) == len(states), f"{len(field_sets)} != {len(states)}"
 
     dcfg = cfg.dynamic_head
-    print(f"Training dynamic head: {dcfg.hidden_dim} hidden, d_k={dcfg.d_k}, "
-          f"anchor_epochs={dcfg.anchor_epochs}, variants={dcfg.variants_per_question}")
+    print(f"Training dynamic head (v2 field-set): {dcfg.hidden_dim} hidden, d_k={dcfg.d_k}, "
+          f"anchor_epochs={dcfg.anchor_epochs}, variants={dcfg.variants_per_question}, "
+          f"summary_field={dcfg.include_summary_field}")
 
     with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
         samples = generate_dynamic_training_data(
-            states, features, question_spec, server,
+            states, field_sets, question_spec, server,
             num_variants_per_question=dcfg.variants_per_question,
         )
         train_dynamic_head(

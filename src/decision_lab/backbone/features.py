@@ -1,6 +1,17 @@
-"""Feature extraction from llama-server embeddings, cached to .npz."""
+"""Feature extraction from llama-server embeddings, cached to .npz.
+
+Two cache formats:
+- features_*.npz: one pooled (input_dim,) vector per state (v1; typed head
+  and legacy dynamic head).
+- features_*_fields.npz: ragged field-set cache — ``features``
+  (ΣM_i, input_dim) stacked + ``field_counts`` (N,) so state i owns rows
+  [offset_i : offset_i + M_i]. Field splitting goes through
+  states/fields.state_fields, the single source of truth shared with
+  inference.
+"""
 
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -40,6 +51,100 @@ def extract_features(
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(cache_path, features=features)
     return features
+
+
+def extract_field_features(
+    data_path: Path,
+    cache_path: Path,
+    server,
+    batch_size: int = 32,
+    include_summary_field: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract field-set embeddings for all states, cache to ragged .npz.
+
+    Field splitting goes through ``state_field_set`` — the same function
+    inference uses, so training-time chunking always matches run-time
+    chunking.
+
+    Returns:
+        (features, field_counts): features is (ΣM_i, input_dim) stacked
+        row-major; field_counts is (N,) with state i owning rows
+        [offset_i : offset_i + M_i].
+    """
+    from decision_lab.states.dataset import load_dataset
+    from decision_lab.states.fields import state_field_set
+
+    if cache_path.exists():
+        data = np.load(cache_path)
+        return data["features"], data["field_counts"]
+
+    states = load_dataset(data_path)
+
+    # Gather each state's fields, dedupe texts across the whole split
+    field_sets = [
+        state_field_set(state, include_summary_field) for state in states
+    ]
+    unique_texts: dict[str, int] = {}
+    for fields in field_sets:
+        for text in fields:
+            if text not in unique_texts:
+                unique_texts[text] = len(unique_texts)
+
+    # Embed unique texts in batches
+    text_list = list(unique_texts)
+    emb_by_text: dict[str, np.ndarray] = {}
+    for i in range(0, len(text_list), batch_size):
+        batch = text_list[i : i + batch_size]
+        embeds = server.embed(batch)
+        for text, emb in zip(batch, embeds):
+            emb_by_text[text] = np.asarray(emb, dtype=np.float32)
+
+    # Stack ragged: state i's rows are contiguous
+    chunks = []
+    field_counts = np.zeros(len(states), dtype=np.int64)
+    for i, fields in enumerate(field_sets):
+        emb = np.stack([emb_by_text[t] for t in fields])
+        chunks.append(emb)
+        field_counts[i] = len(fields)
+
+    features = np.concatenate(chunks, axis=0)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache_path, features=features, field_counts=field_counts)
+    print(f"  {len(states)} states, {int(field_counts.sum())} fields "
+          f"({len(unique_texts)} unique texts)")
+    return features, field_counts
+
+
+def load_field_features(cache_path: Path) -> tuple[list[np.ndarray], np.ndarray]:
+    """Load a ragged field cache → (per-state (M_i, input_dim) arrays, field_counts)."""
+    data = np.load(cache_path)
+    features = data["features"]
+    field_counts = data["field_counts"]
+    field_sets = []
+    offset = 0
+    for count in field_counts:
+        field_sets.append(features[offset : offset + int(count)])
+        offset += int(count)
+    return field_sets, field_counts
+
+
+def collate_field_batch(
+    field_sets: Sequence[np.ndarray],
+    device,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Pad a list of (M_i, input_dim) arrays → (B, M_max, D) + (B, M_max) mask."""
+    import torch
+
+    batch = len(field_sets)
+    max_m = max(int(fs.shape[0]) for fs in field_sets)
+    dim = field_sets[0].shape[-1]
+    xb = torch.zeros(batch, max_m, dim, dtype=torch.float32)
+    mask = torch.zeros(batch, max_m, dtype=torch.bool)
+    for i, fs in enumerate(field_sets):
+        m = int(fs.shape[0])
+        xb[i, :m] = torch.from_numpy(np.asarray(fs, dtype=np.float32))
+        mask[i, :m] = True
+    return xb.to(device), mask.to(device)
 
 
 def embed_options(server, option_texts: list[str], batch_size: int = 64) -> dict[str, np.ndarray]:

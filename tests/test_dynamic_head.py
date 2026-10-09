@@ -283,6 +283,8 @@ class TestPredictDynamic:
             "c": torch.randn(64),
             "Low": torch.randn(64),
             "High": torch.randn(64),
+            "false": torch.randn(64),
+            "true": torch.randn(64),
         }
         head.eval()
         results = predict_dynamic(state_emb, questions, cache, head)
@@ -290,6 +292,153 @@ class TestPredictDynamic:
         assert isinstance(results[0]["predicted"], str)
         assert isinstance(results[1]["predicted"], int)
         assert isinstance(results[2]["predicted"], bool)
+
+    def test_noul_goes_through_attention_path(self, head, state_emb):
+        """noul must be scored via forward_choice with ['false','true'] —
+        the deprecated forward_noul path was never trained."""
+        questions = [make_noul_question("done?")]
+        cache = {"false": torch.randn(64), "true": torch.randn(64)}
+        head.eval()
+        results = predict_dynamic(state_emb, questions, cache, head)
+        assert set(results[0]["distribution"]) == {"false", "true"}
+
+
+# ---------------------------------------------------------------------------
+# v2 field-set attention
+# ---------------------------------------------------------------------------
+
+
+class TestFieldSetForward:
+    """v2 state_set=True head: options cross-attend over the field set."""
+
+    @pytest.fixture
+    def set_head(self):
+        return DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
+
+    def test_v1_modules_absent_in_v2(self, set_head):
+        assert not hasattr(set_head, "trunk")
+        assert hasattr(set_head, "field_enc")
+        assert hasattr(set_head, "field_key")
+        assert hasattr(set_head, "opt_query")
+        assert hasattr(set_head, "score_head")
+
+    def test_1d_state_promotes_to_single_field(self, set_head):
+        """(D,) → treated as one field → (1, n_opts)."""
+        opt_embs = torch.randn(3, 64)
+        scores = set_head.forward_choice(torch.randn(64), opt_embs)
+        assert scores.shape == (1, 3)
+
+    def test_2d_state_is_field_set(self, set_head):
+        """(M, D) unbatched → (1, n_opts) logits."""
+        scores = set_head.forward_choice(torch.randn(5, 64), torch.randn(3, 64))
+        assert scores.shape == (1, 3)
+
+    def test_3d_batched_field_set(self, set_head):
+        scores = set_head.forward_choice(torch.randn(4, 5, 64), torch.randn(3, 64))
+        assert scores.shape == (4, 3)
+
+    def test_masked_fields_are_ignored(self, set_head):
+        """Zero-padded (masked) fields must not change scores."""
+        set_head.eval()
+        torch.manual_seed(0)
+        fields = torch.randn(3, 64)
+        opt_embs = torch.randn(2, 64)
+        with torch.no_grad():
+            clean = set_head.forward_choice(fields, opt_embs)
+
+            padded = torch.zeros(5, 64)
+            padded[:3] = fields
+            mask = torch.tensor([True, True, True, False, False])
+            with_mask = set_head.forward_choice(padded, opt_embs, state_mask=mask)
+        assert torch.allclose(clean, with_mask, atol=1e-5)
+
+    def test_unmasked_padding_changes_scores(self, set_head):
+        """Without a mask, zero rows DO contribute — the mask is load-bearing."""
+        set_head.eval()
+        torch.manual_seed(0)
+        fields = torch.randn(3, 64)
+        opt_embs = torch.randn(2, 64)
+        with torch.no_grad():
+            clean = set_head.forward_choice(fields, opt_embs)
+            padded = torch.zeros(5, 64)
+            padded[:3] = fields
+            no_mask = set_head.forward_choice(padded, opt_embs)
+        assert not torch.allclose(clean, no_mask, atol=1e-5)
+
+    def test_field_permutation_equivariance(self, set_head):
+        """Attention over a SET: permuting fields permutes nothing — each
+        option's score must be unchanged (no positional encoding)."""
+        set_head.eval()
+        torch.manual_seed(0)
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            scores_a = set_head.forward_choice(fields, opt_embs)
+            scores_b = set_head.forward_choice(fields.flip(0), opt_embs)
+        assert torch.allclose(scores_a, scores_b, atol=1e-5)
+
+    def test_single_field_matches_mean_semantics(self, set_head):
+        """One field: softmax degenerates to weight 1 — score is purely
+        score_head(field_enc(field)) for every option query direction
+        (queries only affect the weighting, which is trivial here)."""
+        set_head.eval()
+        field = torch.randn(1, 64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            scores = set_head.forward_choice(field, opt_embs)
+        assert scores.shape == (1, 3)
+
+    def test_v2_noul_direct_raises(self, set_head):
+        with pytest.raises(NotImplementedError):
+            set_head.forward_noul(torch.randn(64))
+
+
+class TestFieldSetCheckpoint:
+    def test_v2_roundtrip(self):
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
+        head.eval()
+        state = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            orig = head.forward_choice(state, opt_embs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "v2.pt"
+            save_dynamic_head(head, path, temperature=0.7)
+            loaded = load_dynamic_head(path)
+            loaded.eval()
+            assert loaded.state_set is True
+            assert loaded.temperature == 0.7
+            with torch.no_grad():
+                assert torch.allclose(orig, loaded.forward_choice(state, opt_embs), atol=1e-6)
+
+    def test_v1_checkpoint_loads_via_default_flag(self):
+        """A v1 checkpoint (no state_set key) loads with state_set=False."""
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0)
+        head.eval()
+        state = torch.randn(64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            orig = head.forward_choice(state, opt_embs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "v1.pt"
+            save_dynamic_head(head, path)
+            loaded = load_dynamic_head(path)
+            loaded.eval()
+            assert loaded.state_set is False
+            with torch.no_grad():
+                assert torch.allclose(orig, loaded.forward_choice(state, opt_embs), atol=1e-6)
+
+    def test_v2_predict_dynamic_with_field_set(self):
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
+        head.eval()
+        questions = [make_choice_question(["a", "b"]), make_noul_question("ok?")]
+        cache = {t: torch.randn(64) for t in ["a", "b", "false", "true"]}
+        results = predict_dynamic(torch.randn(3, 64), questions, cache, head)
+        assert len(results) == 2
+        assert results[0]["predicted"] in ("a", "b")
+        assert isinstance(results[1]["predicted"], bool)
 
 
 # ---------------------------------------------------------------------------

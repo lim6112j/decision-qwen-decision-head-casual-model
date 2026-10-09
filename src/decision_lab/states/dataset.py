@@ -17,6 +17,9 @@ class TextState:
     state_type: str
     text: str
     labels: dict
+    # Optional renderer-emitted field set (field-level head input).
+    # None → generic heuristic split (states/fields.py) applies.
+    fields: list[str] | None = None
 
     def render(self) -> str:
         return self.text
@@ -25,15 +28,17 @@ class TextState:
 def save_dataset(states: list[TextState], path: Path) -> None:
     """Save states to JSONL (one row per state)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = [
-        {
+    rows = []
+    for s in states:
+        row = {
             "doc_id": s.doc_id,
             "state_type": s.state_type,
             "text": s.text,
             "labels": s.labels,
         }
-        for s in states
-    ]
+        if s.fields is not None:
+            row["fields"] = s.fields
+        rows.append(row)
     path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows))
 
 
@@ -49,5 +54,6 @@ def load_dataset(path: Path) -> list[TextState]:
             state_type=d["state_type"],
             text=d["text"],
             labels=d["labels"],
+            fields=d.get("fields"),
         ))
     return states

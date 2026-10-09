@@ -4,12 +4,26 @@ Instead of baking option counts into architecture (nn.Linear(h, n_opts)),
 this head treats options as inputs — embedding them and using scaled
 dot-product attention to score each option against the state representation.
 
-State embedding → trunk → query (d_k)
-Option embeddings → key projection → keys (n_opts × d_k)
-Logits = q · K^T / √d_k
-
 This means a single trained head handles any number of options at inference
 without retraining.
+
+Two input modes, selected by the checkpoint arch flag ``state_set``:
+
+v1 (state_set=False) — pooled-state attention (legacy, load-compatible):
+    State embedding → trunk → query (d_k)
+    Option embeddings → key projection → keys (n_opts × d_k)
+    Logits = q · K^T / √d_k
+
+v2 (state_set=True) — field-set cross-attention:
+    The state is a SET of field embeddings (sentences, key:value leaves).
+    Each option queries the field set, so a OOD token contaminates only the
+    field it appears in, and the head can match "the ball is to the right"
+    directly against the "right" option.
+    Field embeddings → field_enc (shared) → field keys (M × d_k)
+    Option embeddings → opt_query (per option, d_k)
+    α_ij = softmax_fields(q_j · k_i / √d_k)
+    z_j = Σ_i α_ij · field_repr_i → (B, N, hidden)
+    Logits = score_head(z_j)  (Linear(hidden → 1), shared over options)
 """
 
 import math
@@ -95,15 +109,17 @@ def question_num_classes(question: dict) -> int:
 class DynamicDecisionHead(nn.Module):
     """Attention-based decision head: options are inputs, not architecture.
 
-    Architecture:
-        trunk:     input_dim → hidden_dim  (shared state processor)
-        query_proj: hidden_dim → d_k        (state → query)
-        key_proj:  input_dim → d_k          (option embedding → key)
-        noul_head: hidden_dim → 2           (dedicated binary head)
+    forward_choice(state, option_embs, state_mask=None) → (batch, n_opts) logits
+    forward_score(state, level_embs, state_mask=None)   → (batch, n_levels) logits
+    forward_noul(state)                                 → (batch, 2) logits (v1 only)
 
-    forward_choice(state_emb, option_embs) → (batch, n_opts) logits
-    forward_score(state_emb, level_embs)   → (batch, n_levels) logits
-    forward_noul(state_emb)                → (batch, 2) logits
+    state shapes (v2): (input_dim,) → 1 state, 1 field; (M, input_dim) →
+    1 state with M fields; (B, M, input_dim) → batch of field sets.
+    state_mask: (B, M) bool, True = valid field (v2 only; ignored in v1).
+
+    v1 modules (trunk/query_proj/key_proj/noul_head) and v2 modules
+    (field_enc/field_key/opt_query/score_head) are mutually exclusive:
+    only the ones matching ``state_set`` exist.
     """
 
     def __init__(
@@ -112,36 +128,105 @@ class DynamicDecisionHead(nn.Module):
         hidden_dim: int = 256,
         d_k: int = D_K,
         dropout: float = 0.1,
+        state_set: bool = False,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.d_k = d_k
+        self.state_set = state_set
 
-        self.trunk = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-        self.query_proj = nn.Linear(hidden_dim, d_k)
-        self.key_proj = nn.Linear(input_dim, d_k)
-        self.noul_head = nn.Linear(hidden_dim, 2)
+        if state_set:
+            # v2: field-set cross-attention
+            self.field_enc = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+            self.field_key = nn.Linear(hidden_dim, d_k)
+            self.opt_query = nn.Linear(input_dim, d_k)
+            self.score_head = nn.Linear(hidden_dim, 1)
+            # Learnable attention scale, init √d_k. Cosine attention (q, k
+            # normalized) with this scale starts with O(1) logit spread —
+            # with raw q·k/√d_k the initial logits are ~1e-3 (product of two
+            # small random projections), softmax is uniform, every option
+            # reads the same mean field, and training stalls at ln(n_max).
+            self.attn_scale = nn.Parameter(torch.tensor(float(d_k) ** 0.5))
+        else:
+            # v1: pooled-state attention (legacy, kept for checkpoint compat)
+            self.trunk = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+            self.query_proj = nn.Linear(hidden_dim, d_k)
+            self.key_proj = nn.Linear(input_dim, d_k)
+            # Deprecated: never trained; kept so v1 state_dicts load.
+            # noul is scored via the attention path with ["false", "true"].
+            self.noul_head = nn.Linear(hidden_dim, 2)
+
+    @staticmethod
+    def _normalize_state_set(
+        state_embedding: torch.Tensor,
+    ) -> tuple[torch.Tensor, int]:
+        """Normalize a v2 state input → (B, M, D) and batch size."""
+        if state_embedding.dim() == 1:
+            return state_embedding.unsqueeze(0).unsqueeze(0), 1   # (D,)
+        if state_embedding.dim() == 2:
+            return state_embedding.unsqueeze(0), 1                # (M, D) unbatched
+        return state_embedding, state_embedding.shape[0]
+
+    def _forward_attention_set(
+        self,
+        state_embedding: torch.Tensor,
+        option_embeddings: torch.Tensor,
+        state_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """v2 core: each option queries the state field set → (B, N) logits.
+
+        Cosine attention: q and k are L2-normalized before the dot product
+        and scaled by the learnable ``attn_scale`` (init √d_k) — see the
+        __init__ note for why raw q·k/√d_k stalls training.
+        """
+        state, batch_size = self._normalize_state_set(state_embedding)
+        if option_embeddings.dim() == 2:
+            option_embeddings = option_embeddings.unsqueeze(0)    # (1, N, D)
+        if option_embeddings.shape[0] == 1 and batch_size > 1:
+            option_embeddings = option_embeddings.expand(batch_size, -1, -1)
+
+        field_repr = self.field_enc(state)                        # (B, M, H)
+        K = F.normalize(self.field_key(field_repr), dim=-1)       # (B, M, d_k)
+        Q = F.normalize(self.opt_query(option_embeddings), dim=-1)  # (B, N, d_k)
+
+        # (B, N, d_k) × (B, d_k, M) → (B, N, M)
+        attn = torch.bmm(Q, K.transpose(1, 2)) * self.attn_scale
+        if state_mask is not None:
+            if state_mask.dim() == 1:
+                state_mask = state_mask.unsqueeze(0)              # (M,) → (1, M)
+            attn = attn.masked_fill(~state_mask.unsqueeze(1), float("-inf"))
+        alpha = torch.softmax(attn, dim=-1)                       # over fields
+        z = torch.bmm(alpha, field_repr)                          # (B, N, H)
+        return self.score_head(z).squeeze(-1)                     # (B, N)
 
     def _forward_attention(
         self,
         state_embedding: torch.Tensor,
         option_embeddings: torch.Tensor,
     ) -> torch.Tensor:
-        """Core attention: score each option against the state.
+        """v1 core: score each option against the pooled state.
 
         Args:
-            state_embedding: (batch, input_dim) or (input_dim,) — state vector.
+            state_embedding: (input_dim,), (batch, input_dim), or (B, M, input_dim)
+                with M == 1 (uniform pipeline — reads field 0).
             option_embeddings: (n_opts, input_dim) or (batch, n_opts, input_dim) —
                 pre-embedded option texts.
 
         Returns:
             (batch, n_opts) logits (pre-softmax scores).
         """
+        # Uniform pipeline passes field sets; legacy head reads the summary field.
+        if state_embedding.dim() == 3:
+            state_embedding = state_embedding[:, 0, :]
         # Normalize shapes: state → (B, D), options → (B, N, D)
         if state_embedding.dim() == 1:
             state_embedding = state_embedding.unsqueeze(0)          # (1, D)
@@ -167,20 +252,42 @@ class DynamicDecisionHead(nn.Module):
         self,
         state_embedding: torch.Tensor,
         option_embeddings: torch.Tensor,
+        state_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Score state against choice options → (batch, n_opts) logits."""
+        if self.state_set:
+            return self._forward_attention_set(
+                state_embedding, option_embeddings, state_mask,
+            )
         return self._forward_attention(state_embedding, option_embeddings)
 
     def forward_score(
         self,
         state_embedding: torch.Tensor,
         level_embeddings: torch.Tensor,
+        state_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Score state against rubric levels → (batch, n_levels) logits."""
+        if self.state_set:
+            return self._forward_attention_set(
+                state_embedding, level_embeddings, state_mask,
+            )
         return self._forward_attention(state_embedding, level_embeddings)
 
     def forward_noul(self, state_embedding: torch.Tensor) -> torch.Tensor:
-        """Binary classification: is this true/false? → (batch, 2) logits."""
+        """Binary classification: is this true/false? → (batch, 2) logits.
+
+        Deprecated v1 path — never trained. In v2 (and in the training/
+        serving pipeline) noul is scored via forward_choice with
+        ["false", "true"] option embeddings.
+        """
+        if self.state_set:
+            raise NotImplementedError(
+                "v2 head scores noul via forward_choice with ['false', 'true'] "
+                "option embeddings — see predict_dynamic"
+            )
+        if state_embedding.dim() == 3:
+            state_embedding = state_embedding[:, 0, :]
         if state_embedding.dim() == 1:
             state_embedding = state_embedding.unsqueeze(0)
         h = self.trunk(state_embedding)
@@ -270,10 +377,12 @@ def predict_dynamic(
     """Run the head on one state against a list of dynamic questions.
 
     Args:
-        state_embedding: (input_dim,) single state vector.
+        state_embedding: (input_dim,) single state vector (v1) or
+            (M, input_dim) field set (v2).
         questions: list of dynamic question configs.
         option_embeddings_cache: {option_text: (input_dim,) embedding} —
-            pre-computed embeddings for all option texts referenced by questions.
+            pre-computed embeddings for all option texts referenced by
+            questions, including "false" and "true" for noul.
         head: trained DynamicDecisionHead in eval mode.
 
     Returns:
@@ -284,17 +393,11 @@ def predict_dynamic(
     with torch.no_grad():
         for i, q in enumerate(questions):
             kind = q["type"]
-            if kind == "noul":
-                scores = head.forward_noul(state_embedding)
-            else:
-                texts = question_option_texts(q)
-                opt_embs = torch.stack(
-                    [option_embeddings_cache[t] for t in texts]
-                )  # (n_opts, D)
-                if kind == "choice":
-                    scores = head.forward_choice(state_embedding, opt_embs)
-                else:
-                    scores = head.forward_score(state_embedding, opt_embs)
+            texts = question_option_texts(q)
+            opt_embs = torch.stack(
+                [option_embeddings_cache[t] for t in texts]
+            )  # (n_opts, D)
+            scores = head.forward_choice(state_embedding, opt_embs)
             results[i] = decode_dynamic_answer(q, scores, temperature)
     return results
 
@@ -339,6 +442,8 @@ def save_dynamic_head(
             "model_state": {k: v.cpu() for k, v in model.state_dict().items()},
             "arch": {
                 "type": "dynamic",
+                "state_set": model.state_set,
+                "arch_version": 2,
                 "input_dim": model.input_dim,
                 "hidden_dim": model.hidden_dim,
                 "d_k": model.d_k,
@@ -353,7 +458,7 @@ def load_dynamic_head(
     path: str | Path,
     device: torch.device | None = None,
 ) -> DynamicDecisionHead:
-    """Load a DynamicDecisionHead from checkpoint."""
+    """Load a DynamicDecisionHead from checkpoint (v1 or v2 arch)."""
     checkpoint = torch.load(str(path), map_location="cpu")
     arch = checkpoint["arch"]
     if arch.get("type") != "dynamic":
@@ -365,6 +470,7 @@ def load_dynamic_head(
         input_dim=arch.get("input_dim", 1024),
         hidden_dim=arch.get("hidden_dim", 256),
         d_k=arch.get("d_k", D_K),
+        state_set=arch.get("state_set", False),
     )
     model.load_state_dict(checkpoint["model_state"])
     if device is not None:

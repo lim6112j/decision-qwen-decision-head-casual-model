@@ -63,6 +63,10 @@ dynamic_head:
   anchor_epochs: 30
   variants_per_question: 3
   breakout_weight: 3   # oversample factor for breakout states (see generator note)
+  # v2 field-set attention: full-text summary embedding prepended as field 0.
+  # Must stay in sync between feature extraction and inference (same config).
+  include_summary_field: true
+  max_fields: 16
 
 # Post-training temperature calibration (per question)
 calibration:

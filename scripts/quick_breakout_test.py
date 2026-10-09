@@ -27,6 +27,7 @@ from decision_lab.head.dynamic_model import (
     load_dynamic_head,
     predict_dynamic,
 )
+from decision_lab.states.fields import state_field_set
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
@@ -39,13 +40,28 @@ USER_STATE_TEXT = (
 USER_QUESTION = "which direction the paddle move?"
 
 
-def _embed_state(server, text: str, device) -> torch.Tensor:
-    [emb] = server.embed([text])
-    return torch.tensor(emb, dtype=torch.float32, device=device)
+def _embed_state(server, head, text: str, device, include_summary: bool) -> torch.Tensor:
+    """Embed a state as a field set → (1, M, D) (v2) or (1, D) (v1).
+
+    Chunking goes through split_state_fields/state_field_set — the same
+    path as feature extraction — so inference chunks exactly like training.
+    """
+    from decision_lab.states.fields import split_state_fields
+
+    if head.state_set:
+        from decision_lab.states.dataset import TextState
+
+        pseudo_state = TextState(doc_id=-1, state_type="custom", text=text, labels={})
+        field_texts = state_field_set(pseudo_state, include_summary)
+    else:
+        field_texts = [text]
+    embs = server.embed(field_texts)
+    return torch.tensor(embs, dtype=torch.float32, device=device).unsqueeze(0)
 
 
-def _predict(server, head, temperature, text: str, options: list[str], device) -> dict:
-    state_emb = _embed_state(server, text, device)
+def _predict(server, head, temperature, text: str, options: list[str], device,
+             include_summary: bool) -> dict:
+    state_emb = _embed_state(server, head, text, device, include_summary)
     cache = {}
     embs = server.embed(options)
     for opt, emb in zip(options, embs):
@@ -62,6 +78,7 @@ def main():
 
     head = load_dynamic_head(str(MODELS_DIR / "head_dynamic.pt"), device=device).eval()
     temperature = getattr(head, "temperature", 1.0)
+    include_summary = cfg.dynamic_head.include_summary_field
 
     gguf = Path(cfg.model.gguf_path).expanduser().resolve()
     with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
@@ -70,7 +87,7 @@ def main():
         print("Exact user state (expect 'left'):")
         print(f"  {USER_STATE_TEXT}")
         answer = _predict(server, head, temperature, USER_STATE_TEXT,
-                          ["left", "right", "stay"], device)
+                          ["left", "right", "stay"], device, include_summary)
         dist = ", ".join(f"{k}={v:.3f}" for k, v in answer["distribution"].items())
         print(f"  → predicted: {answer['predicted']}  (confidence {answer['confidence']:.3f})")
         print(f"    distribution: {dist}")
@@ -78,7 +95,7 @@ def main():
 
         # 2. Same question, shuffled option order
         answer_shuffled = _predict(server, head, temperature, USER_STATE_TEXT,
-                                   ["stay", "right", "left"], device)
+                                   ["stay", "right", "left"], device, include_summary)
         print(f"  → shuffled option order: {answer_shuffled['predicted']}")
         ok_shuffled = answer_shuffled["predicted"] == "left"
 
@@ -95,7 +112,7 @@ def main():
         for row in rows:
             gold = row["labels"]["paddle_direction"]
             answer = _predict(server, head, temperature, row["text"],
-                              ["left", "right", "stay"], device)
+                              ["left", "right", "stay"], device, include_summary)
             predicted_labels.add(answer["predicted"])
             mark = "✓" if answer["predicted"] == gold else "✗"
             print(f"  [{mark}] gold={gold:5s} pred={answer['predicted']:5s}"

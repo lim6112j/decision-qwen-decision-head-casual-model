@@ -24,6 +24,7 @@ from decision_lab.head.model import (
     predict_all,
 )
 from decision_lab.prompt_lm.agent import PromptAgent, PromptMode
+from decision_lab.states.fields import state_field_set
 
 
 @dataclass
@@ -126,6 +127,7 @@ class DynamicHeadAgent:
         agent_id: str,
         question_spec: dict | None = None,
         temperature: float = 1.0,
+        include_summary_field: bool = True,
     ):
         self._head = head
         self._server = server
@@ -136,8 +138,13 @@ class DynamicHeadAgent:
         self._head.to(self._device)
         # Fallback: use fixed question bank for backward compatibility
         self._question_spec = question_spec or {}
+        # Must match feature extraction (same config key) so training-time
+        # chunking equals inference-time chunking.
+        self._include_summary_field = include_summary_field
         # Option embedding cache: {option_text: tensor}
         self._option_cache: dict[str, torch.Tensor] = {}
+        # Field embedding cache: {field_text: tensor} — fields repeat heavily
+        self._field_cache: dict[str, torch.Tensor] = {}
 
     def _ensure_options_embedded(self, option_texts: list[str]) -> dict[str, torch.Tensor]:
         """Embed option texts via backbone, cache on this agent instance."""
@@ -150,23 +157,54 @@ class DynamicHeadAgent:
                 )
         return {t: self._option_cache[t] for t in option_texts}
 
+    def _state_tensor(self, state, fields: list[str] | None = None) -> torch.Tensor:
+        """Embed the state as a field set → (1, M, D) (v2) or (1, D) (v1).
+
+        Chunking goes through the same state_field_set path used by
+        feature extraction, so training and inference split identically.
+        Caller-supplied ``fields`` (HTTP custom_fields) take precedence —
+        the contract is that the caller's chunking is used verbatim.
+        """
+        if fields is not None:
+            field_texts = list(fields)
+        elif self._head.state_set:
+            field_texts = state_field_set(state, self._include_summary_field)
+        else:
+            field_texts = [state.render()]   # legacy v1 head: pooled vector
+
+        missing = [t for t in field_texts if t not in self._field_cache]
+        if missing:
+            embs = self._server.embed(missing)
+            for text, emb in zip(missing, embs):
+                self._field_cache[text] = torch.tensor(
+                    emb, dtype=torch.float32, device=self._device
+                )
+        field_embs = torch.stack([self._field_cache[t] for t in field_texts])
+        if not self._head.state_set:
+            return field_embs[0].unsqueeze(0)          # (1, D) — summary/whole text
+        return field_embs.unsqueeze(0)                 # (1, M, D)
+
+    def _score(self, state_tensor, option_texts: list[str]) -> torch.Tensor:
+        """Embed options (cached) and score them → (1, n_opts) logits."""
+        cache = self._ensure_options_embedded(option_texts)
+        opt_embs = torch.stack([cache[t] for t in option_texts])
+        with torch.no_grad():
+            return self._head.forward_choice(state_tensor, opt_embs)
+
     def decide(self, state) -> tuple[dict, str, float]:
         """Return ({qid: decoded answer dict}, raw_output, latency_ms).
 
         Uses the fixed question bank from config as the default question set.
         """
         t0 = time.perf_counter()
-        [state_emb] = self._server.embed([state.render()])
-        state_tensor = torch.tensor([state_emb], dtype=torch.float32, device=self._device)
+        state_tensor = self._state_tensor(state)
 
         results = {}
         with torch.no_grad():
             for qid, spec in self._question_spec.items():
                 kind = spec["type"]
                 if kind == "noul":
-                    cache = self._ensure_options_embedded(["false", "true"])
-                    opt_embs = torch.stack([cache["false"], cache["true"]])
-                    scores = self._head.forward_choice(state_tensor, opt_embs)
+                    scores = self._score(state_tensor, ["false", "true"])
                     results[qid] = decode_dynamic_answer(
                         make_noul_question(spec.get("question", qid)),
                         scores,
@@ -174,9 +212,7 @@ class DynamicHeadAgent:
                     )
                 elif kind == "choice":
                     option_texts = spec["options"]
-                    cache = self._ensure_options_embedded(option_texts)
-                    opt_embs = torch.stack([cache[t] for t in option_texts])
-                    scores = self._head.forward_choice(state_tensor, opt_embs)
+                    scores = self._score(state_tensor, option_texts)
                     results[qid] = decode_dynamic_answer(
                         make_choice_question(option_texts, qid),
                         scores,
@@ -184,9 +220,7 @@ class DynamicHeadAgent:
                     )
                 elif kind == "score":
                     level_texts = spec["levels"]
-                    cache = self._ensure_options_embedded(level_texts)
-                    opt_embs = torch.stack([cache[t] for t in level_texts])
-                    scores = self._head.forward_score(state_tensor, opt_embs)
+                    scores = self._score(state_tensor, level_texts)
                     results[qid] = decode_dynamic_answer(
                         make_score_question(level_texts, qid),
                         scores,
@@ -200,38 +234,28 @@ class DynamicHeadAgent:
         self,
         state,
         questions: list[dict],
+        fields: list[str] | None = None,
     ) -> tuple[list[dict], float]:
         """Decide with fully dynamic questions (no fixed bank).
 
         Args:
             state: TextState to evaluate.
             questions: list of dynamic question configs from make_*_question().
+            fields: optional caller-supplied field chunking (HTTP
+                custom_fields) — used verbatim instead of state_field_set.
 
         Returns:
             (list of decoded answer dicts, latency_ms).
         """
         t0 = time.perf_counter()
-        [state_emb] = self._server.embed([state.render()])
-        state_tensor = torch.tensor([state_emb], dtype=torch.float32, device=self._device)
+        state_tensor = self._state_tensor(state, fields)
 
         results = []
         with torch.no_grad():
             for q in questions:
-                kind = q["type"]
-                if kind == "noul":
-                    cache = self._ensure_options_embedded(["false", "true"])
-                    opt_embs = torch.stack([cache["false"], cache["true"]])
-                    scores = self._head.forward_choice(state_tensor, opt_embs)
-                    results.append(decode_dynamic_answer(q, scores, self._temperature))
-                else:
-                    option_texts = question_option_texts(q)
-                    cache = self._ensure_options_embedded(option_texts)
-                    opt_embs = torch.stack([cache[t] for t in option_texts])
-                    if kind == "choice":
-                        scores = self._head.forward_choice(state_tensor, opt_embs)
-                    else:
-                        scores = self._head.forward_score(state_tensor, opt_embs)
-                    results.append(decode_dynamic_answer(q, scores, self._temperature))
+                option_texts = question_option_texts(q)
+                scores = self._score(state_tensor, option_texts)
+                results.append(decode_dynamic_answer(q, scores, self._temperature))
 
         latency_ms = (time.perf_counter() - t0) * 1000
         return results, latency_ms
@@ -296,6 +320,7 @@ def _load_dynamic_agent(
             hidden_dim=cfg.dynamic_head.hidden_dim,
             d_k=cfg.dynamic_head.d_k,
             dropout=cfg.dynamic_head.dropout,
+            state_set=True,
         )
         temperature = 1.0
 
@@ -303,4 +328,5 @@ def _load_dynamic_agent(
         head, server, "head_dynamic",
         question_spec=question_spec_copy,
         temperature=temperature,
+        include_summary_field=cfg.dynamic_head.include_summary_field,
     )

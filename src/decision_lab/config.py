@@ -68,6 +68,11 @@ class DynamicHeadConfig:
     variants_per_question: int = 3
     # Integer oversample factor for breakout states in dynamic training
     breakout_weight: int = 3
+    # v2 field-set attention: prepend the full-text summary embedding as
+    # field 0 (guarantees M >= 1, adds global context). Must stay in sync
+    # between feature extraction and inference — enforced via config.
+    include_summary_field: bool = True
+    max_fields: int = 16
 
 
 @dataclass

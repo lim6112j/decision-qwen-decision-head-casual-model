@@ -68,7 +68,7 @@ Output to `results/`:
 - `report.md` — human-readable comparison with tables
 - `metrics.json` — raw numbers for further analysis
 
-## Latest Benchmark Run (2026-10-08, text classification)
+## Latest Benchmark Run (2026-10-09, text classification, v2 field-set head)
 
 Full pipeline (extract → train → eval → report) on Apple Silicon (MPS), llama.cpp server, Qwen3.5-0.8B UD-Q4_K_XL GGUF. Datasets: 10,000 train / 1,000 in-dist test / 1,000 held-out test (text states with typed question labels).
 
@@ -76,7 +76,7 @@ Full pipeline (extract → train → eval → report) on Apple Silicon (MPS), ll
 **Held-out:** 2 unseen templates (report, config_file) — test for format generalization
 
 > **Held-out formats are not inherently hard.** They are hand-coded Python renderer
-> functions in `states/generator.py` — just like the in-dist ones. The 44pp drop
+> functions in `states/generator.py` — just like the in-dist ones. The drop
 > happens because the head has literally never seen embeddings from these formats
 > during training. Moving `report` and `config_file` into in-dist and retraining
 > would bring them up to ~90% accuracy like the others. The hold-out exists only
@@ -87,18 +87,20 @@ Full pipeline (extract → train → eval → report) on Apple Silicon (MPS), ll
 
 | Agent | In-dist acc | Held-out acc | Mean latency | Parse failures |
 |---|---|---|---|---|
-| `head_trained` | 92.5% | 48.7% | 0.2 ms | 0 |
-| `head_dynamic` | 82.2% | 39.1% | 8.5 ms | 0 |
-| `head_random` | 41.6% | 39.2% | 0.2 ms | 0 |
-| `prompt_lm_zero_shot` | 60.5% | 64.5% | ~360 ms | 0 |
+| `head_trained` | 93.3% | 48.8% | 0.2 ms | 0 |
+| `head_dynamic` (v2) | **84.6%** | **73.9%** | 11.0 ms | 0 |
+| `head_random` | 40.2% | 39.3% | 0.2 ms | 0 |
+| `prompt_lm_zero_shot` | 60.5% | 64.5% | ~368 ms | 0 |
+
+Previous run (v1 pooled-state head, 2026-10-08): head_dynamic 82.2% in-dist / **39.1% held-out**; typed head and prompt LM numbers unchanged by the restructure (their pipeline still uses the pooled caches). Comparison caveat: v2 changes both the head and the state input pipeline (field splitting), so the held-out gain (+34.8pp) reflects the structural change as a whole — which is exactly what it was designed to do (see "v2 head" below).
 
 Key findings:
 
-- **Typed head dominates in-dist** (92.5%) at ~1,800× lower latency than prompt LM — but drops 44pp on held-out formats (48.7%). The head overfits to surface text patterns in the training templates.
+- **Typed head dominates in-dist** (93.3%) at ~1,800× lower latency than prompt LM — but drops 44pp on held-out formats (48.8%). The head overfits to surface text patterns in the training templates.
 - **Prompt LM inverts**: does *better* on held-out (64.5% vs 60.5%) because it reads text directly rather than relying on format-dependent embeddings.
-- **Dynamic head** (82.2% in-dist, 39.1% held-out) supports any number of options at inference without retraining — trade ~10pp in-dist for full flexibility.
-- **Qwen backbone is never modified.** Training only touches the head MLP (~400K params for typed, ~100K for dynamic). The GGUF model file (`models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf`) is served read-only by llama-server for embedding extraction and chat completion. The backbone never sees gradients — all training happens on pre-extracted frozen embeddings.
-- **LoRA adapter on frozen embeddings does not help** held-out generalization. A post-hoc low-rank transformation (rank=64) trained on in-dist embeddings can only re-weight existing dimensions — it cannot bridge the fundamental gap between embeddings of different text formats. Held-out actually regressed (48.7% → 43.5% with adapter). The bottleneck is the frozen Qwen3.5-0.8B backbone, which produces format-specific embeddings that no amount of post-hoc linear transformation can align.
+- **Dynamic head v2** (84.6% in-dist, 73.9% held-out) supports any number of options at inference without retraining — and field-set attention recovers most of the held-out gap the v1 pooled head suffered (39.1% → 73.9%), now beating the prompt LM held-out (64.5%) too.
+- **Qwen backbone is never modified.** Training only touches the head MLP (~400K params for typed, ~430K for the v2 dynamic head). The GGUF model file (`models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf`) is served read-only by llama-server for embedding extraction and chat completion. The backbone never sees gradients — all training happens on pre-extracted frozen embeddings.
+- **LoRA adapter on frozen embeddings does not help** held-out generalization (v1 experiment). A post-hoc low-rank transformation (rank=64) trained on in-dist embeddings can only re-weight existing dimensions — it cannot bridge the fundamental gap between embeddings of different text formats. Held-out actually regressed (48.7% → 43.5% with adapter). The bottleneck is the frozen Qwen3.5-0.8B backbone's format-specific embedding geometry — the v2 field-level input attacks the same problem from the input side instead.
 
 ### Generalization: dynamic head on novel option sets (zero retraining)
 
@@ -164,14 +166,20 @@ meaningless before retraining.
 
 #### Results
 
-| Split | Mean acc | left | stay | right |
-|---|---|---|---|---|
-| `test_breakout` (head_dynamic) | 95.5% | 95.5% | 95.7% | 95.4% |
+v2 field-set head (2026-10-09):
 
-The confusion matrix shows no single-label collapse, and the exact state
-above now returns `left` at 0.999 confidence (stable under shuffled option
-order). Original document-question accuracy is preserved (in-dist 81.8% vs
-82.0% before mixing; sentiment 100%, urgency 92.5%).
+| Split | Mean acc | left | stay | right | ECE |
+|---|---|---|---|---|---|
+| `test_breakout` (head_dynamic v2) | **98.0%** | 100% | 95.7% | 98.5% | 0.011 |
+
+(v1 pooled head was 95.5% mean / 95.5 / 95.7 / 95.4 — the field-level input
+removed the last 2.5pp.) No single-label collapse; the exact state above
+returns `left` in both option orders. One honest observation: that exact
+state (gap 124 px, motion pointing the other way) comes out as a near-uniform
+distribution with `left` winning argmax only marginally — the head signals
+low confidence where motion words contradict geometry, rather than
+confidently collapsing. Document-question accuracy is preserved (in-dist
+84.6% vs 82.2% on v1; sentiment 100%, urgency 92.5%).
 
 #### Gotchas found during this work
 
@@ -203,6 +211,52 @@ Note: option sets from domains outside office documents and Breakout (e.g.
 ratings, metaphors) remain unlearned — see the novel-option table above.
 
 Sanity check: `python scripts/quick_breakout_test.py`.
+
+### v2 head: field-set cross-attention (2026-10-09)
+
+The pooled-vector input was the structural ceiling: the state text was
+collapsed into **one** embedding, so one out-of-distribution token polluted
+the whole state representation and the head matched options against a single
+point in embedding space (a learned decision boundary around a handful of
+format islands — any format drift re-collapses the head).
+
+v2 (checkpoint arch `state_set: true`) feeds the state as a **set of
+field/sentence embeddings** and options cross-attend over that set:
+
+```
+fields (B, M, 1024) → shared field_enc → field keys (B, M, d_k)
+options (N, 1024)   → opt_query        → queries (B, N, d_k)
+α_ij = softmax over fields(q_j·k_i/√d_k), masked padding excluded
+z_j = Σ α_ij·field_i → shared score_head → logits (B, N)
+```
+
+- Contamination is **localized**: an OOD token corrupts only the field it
+  appears in. Structured formats split per leaf (`"ball.x: 369"`), log lines
+  per `KEY=VALUE` token, prose per sentence — syntax tokens no longer dilute
+  the geometry.
+- The head can match *"the ball is to the right"* ↔ the `right` option at
+  field granularity.
+- The full-text embedding is always prepended as **field 0** (summary field,
+  `dynamic_head.include_summary_field`) — global context + a guaranteed
+  non-empty set.
+- **Chunking consistency invariant**: training and inference must split the
+  state identically. One source of truth — `states/fields.py` (`state_fields`
+  / `split_state_fields`) — is used by feature extraction, the training
+  pipeline, the serving agent, and the HTTP default for `custom_text`.
+  Renderer-emitted fields (breakout jsonl `fields` key) are asserted equal to
+  the heuristic split in `tests/test_fields.py`, so callers who omit
+  `custom_fields` still get training-matched chunking.
+- New ragged cache `data/features_{split}_fields.npz` (`features (ΣM_i, 1024)`
+  + `field_counts`); the pooled `features_*.npz` caches remain untouched and
+  still feed the typed head.
+- v1 checkpoints load unchanged (arch flag fallback; v1 backup kept at
+  `models/head_dynamic_v1.pt`). The dead untrained `noul_head` path is gone
+  from the pipeline — noul is scored via the same attention path it trains on.
+
+Results of the restructure: `test_breakout` 95.5% → **98.0%**, in-dist
+82.2% → **84.6%**, held-out 39.1% → **73.9%** (+34.8pp — the largest gain is
+exactly where the pooled-vector input was weakest), at 11 ms latency and
+ECE ≤ 0.05 everywhere.
 
 > Deeper notes on how the decision heads train (frozen-backbone design,
 > last-token pooling pitfalls, data decorrelation, split hygiene):
