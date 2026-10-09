@@ -13,6 +13,10 @@ class GeneratorConfig:
     num_test_heldout: int = 1000
     seed: int = 42
     heldout_templates: tuple[str, ...] = ("report", "log_entry", "config_file")
+    # Breakout paddle-control states (gold from geometry), mixed into
+    # dynamic-head training only — never into typed-head training.
+    num_breakout_train: int = 4000
+    num_breakout_test: int = 500
 
 
 @dataclass
@@ -62,6 +66,8 @@ class DynamicHeadConfig:
     anchor_epochs: int = 30
     # How many option-set variants per question
     variants_per_question: int = 3
+    # Integer oversample factor for breakout states in dynamic training
+    breakout_weight: int = 3
 
 
 @dataclass

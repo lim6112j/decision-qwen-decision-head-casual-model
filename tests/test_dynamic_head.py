@@ -431,3 +431,39 @@ class TestPermutationInvariance:
 
 def test_get_device_returns_valid():
     assert isinstance(get_device(), torch.device)
+
+
+# ---------------------------------------------------------------------------
+# Breakout paddle_direction variants
+# ---------------------------------------------------------------------------
+
+
+class TestPaddleDirectionVariants:
+    """The paddle_direction synonym map yields shuffled left/right/stay variants."""
+
+    def test_variants_generated(self):
+        from decision_lab.head.dynamic_train import _generate_choice_variants
+        from random import Random
+
+        variants = _generate_choice_variants(
+            ["left", "right", "stay"], "paddle_direction", Random(0), 3,
+        )
+        assert len(variants) == 3
+        for v in variants:
+            assert len(v["options"]) == 3
+            assert set(v["gold_map"]) == {"left", "right", "stay"}
+            # gold_map values are exactly the variant's (shuffled) option set
+            assert set(v["gold_map"].values()) == set(v["options"])
+            # variants use synonym labels, not the base option strings
+            assert v["options"] != ["left", "right", "stay"]
+
+    def test_gold_map_permutes_consistently(self):
+        from decision_lab.head.dynamic_train import _generate_choice_variants
+        from random import Random
+
+        variants = _generate_choice_variants(
+            ["left", "right", "stay"], "paddle_direction", Random(1), 3,
+        )
+        for v in variants:
+            # gold_map values must be a permutation of the option set
+            assert sorted(v["gold_map"].values()) == sorted(v["options"])

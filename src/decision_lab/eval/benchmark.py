@@ -59,6 +59,10 @@ class AgentMetrics:
     num_parse_failures: int = 0             # (row, question) pairs with no answer
     avg_tokens: float = 0.0
     raw_outputs: list[str] = field(default_factory=list)
+    # Per-gold-label accuracy {qid: {label: acc}} — exposes label collapse
+    # (e.g. always predicting "right" → per_label_accuracy["left"] ≈ 0).
+    per_label_accuracy: dict = field(default_factory=dict)
+    confusion: dict = field(default_factory=dict)   # {qid: {gold: {pred: count}}}
 
 
 def benchmark_head(
@@ -262,22 +266,37 @@ def compute_metrics(rows: list[EvalRow], question_spec: dict) -> AgentMetrics:
 
     per_q_acc: dict[str, float] = {}
     per_q_ece: dict[str, float] = {}
+    per_label_acc: dict[str, dict] = {}
+    confusion: dict[str, dict] = {}
     all_confs, all_corrects = [], []
     parse_failures = 0
 
     for qid, spec_entry in question_spec.items():
         corrects = []
         confs = []
+        label_hits: dict[str, list] = {}
+        gold_pred_counts: dict[str, dict] = {}
         for r in rows:
-            ok = is_correct(spec_entry, r.predictions.get(qid), r.gold_labels.get(qid))
+            pred = r.predictions.get(qid)
+            gold = r.gold_labels.get(qid)
+            ok = is_correct(spec_entry, pred, gold)
             corrects.append(ok)
             if qid not in r.predictions:
                 parse_failures += 1
             conf = r.confidence.get(qid)
             if conf is not None:
                 confs.append((conf, ok))
+            if gold is not None:
+                gk, pk = str(gold), str(pred)
+                gold_pred_counts.setdefault(gk, {})
+                gold_pred_counts[gk][pk] = gold_pred_counts[gk].get(pk, 0) + 1
+                label_hits.setdefault(gk, []).append(ok)
         corrects_arr = np.array(corrects, dtype=float)
         per_q_acc[qid] = float(corrects_arr.mean())
+        per_label_acc[qid] = {
+            g: float(np.mean(hits)) for g, hits in label_hits.items()
+        }
+        confusion[qid] = gold_pred_counts
         if confs:
             conf_arr = np.array([c for c, _ in confs])
             ok_arr = np.array([ok for _, ok in confs], dtype=float)
@@ -310,6 +329,8 @@ def compute_metrics(rows: list[EvalRow], question_spec: dict) -> AgentMetrics:
         num_parse_failures=parse_failures,
         avg_tokens=float(np.mean(tokens)),
         raw_outputs=[r.raw_output for r in rows if r.raw_output][:5],
+        per_label_accuracy=per_label_acc,
+        confusion=confusion,
     )
 
 
@@ -394,7 +415,56 @@ def run_benchmark(
                                 bc.warmup_runs, bc.timed_runs, bc.latency_sample_size)
         all_metrics[test_name]["prompt_lm_zero_shot"] = compute_metrics(rows, question_spec)
 
+    breakout_metrics = _benchmark_dynamic_breakout(data_dir, cfg, server, models_dir, bc)
+    if breakout_metrics is not None:
+        all_metrics["test_breakout"] = breakout_metrics
+
     return all_metrics
+
+
+def _benchmark_dynamic_breakout(
+    data_dir: Path,
+    cfg: Config,
+    server,
+    models_dir: Path,
+    bc,
+) -> dict[str, AgentMetrics] | None:
+    """Benchmark the dynamic head on Breakout paddle-direction states.
+
+    Only head_dynamic runs here: the typed head and PromptAgent have no
+    paddle_direction question in their fixed banks.
+    """
+    from decision_lab.states.breakout import breakout_question_spec
+
+    test_path = data_dir / "test_breakout.jsonl"
+    feature_path = data_dir / "features_test_breakout.npz"
+    if not test_path.exists() or not feature_path.exists():
+        return None
+
+    states = load_dataset(test_path)
+    features = np.load(feature_path)["features"]
+    if bc.max_test_states > 0 and len(states) > bc.max_test_states:
+        rng = np.random.RandomState(cfg.generator.seed)
+        idx = rng.choice(len(states), size=bc.max_test_states, replace=False)
+        idx.sort()
+        print(f"  [test_breakout] subsampling {len(idx)}/{len(states)} states")
+        states = [states[i] for i in idx]
+        features = features[idx]
+
+    device = get_device()
+    breakout_spec = breakout_question_spec()
+    option_emb_cache = {
+        t: torch.tensor(emb, dtype=torch.float32, device=device)
+        for t, emb in _embed_options_batch(server, _collect_option_texts(breakout_spec)).items()
+    }
+
+    dynamic_head, dynamic_temp = _load_dynamic_for_benchmark(cfg, models_dir, device)
+    print("  [test_breakout] benchmarking head_dynamic...")
+    rows = benchmark_dynamic_head(
+        states, features, dynamic_head, breakout_spec,
+        option_emb_cache, dynamic_temp, "head_dynamic", device,
+    )
+    return {"head_dynamic": compute_metrics(rows, breakout_spec)}
 
 
 def _collect_option_texts(question_spec: dict) -> list[str]:

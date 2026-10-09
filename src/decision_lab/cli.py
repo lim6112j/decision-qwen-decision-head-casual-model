@@ -31,7 +31,7 @@ def cmd_extract(args):
     gguf = Path(cfg.model.gguf_path).expanduser().resolve()
 
     with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
-        for split in ["train", "test_indist", "test_heldout"]:
+        for split in ["train", "test_indist", "test_heldout", "train_breakout", "test_breakout"]:
             data_path = args.data_dir / f"{split}.jsonl"
             if not data_path.exists():
                 print(f"  skip {split}: not found")
@@ -83,6 +83,21 @@ def cmd_train_dynamic(args):
     features = np.load(args.data_dir / "features_train.npz")["features"]
     states = load_dataset(train_path)
     question_spec = build_question_spec(cfg.questions)
+
+    # Breakout states train the dynamic head only — never the typed head
+    # (encode_labels would KeyError on document states for paddle_direction).
+    brk_path = args.data_dir / "train_breakout.jsonl"
+    if brk_path.exists():
+        from decision_lab.states.breakout import breakout_question_spec
+        brk_states = load_dataset(brk_path)
+        brk_feats = np.load(args.data_dir / "features_train_breakout.npz")["features"]
+        assert len(brk_feats) == len(brk_states), \
+            f"{len(brk_feats)} != {len(brk_states)}"
+        w = cfg.dynamic_head.breakout_weight
+        states = states + brk_states * w
+        features = np.concatenate([features] + [brk_feats] * w)
+        question_spec = {**question_spec, **breakout_question_spec()}
+        print(f"  mixed in {len(brk_states)} breakout states × weight {w}")
 
     assert len(features) == len(states), f"{len(features)} != {len(states)}"
 

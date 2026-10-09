@@ -69,6 +69,12 @@ def generate_dataset(cfg: Config, data_dir: Path) -> None:
         save_dataset(states, path)
         print(f"  {name}: {len(states)} states → {path}")
 
+    # Breakout states use a fresh RNG so document output above stays
+    # byte-identical for the same seed (doc feature caches remain valid).
+    if cfg.generator.num_breakout_train > 0:
+        from decision_lab.states.breakout import generate_breakout_dataset
+        generate_breakout_dataset(cfg, data_dir, Random(cfg.generator.seed + 1))
+
 
 def _make_state(doc_id: int, rng: Random, templates: tuple[str, ...]) -> TextState:
     """Sample latents, render one document, return TextState with gold labels."""

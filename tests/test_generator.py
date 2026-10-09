@@ -20,7 +20,8 @@ def _small_cfg():
     cfg = load_config("configs/default.yaml")
     return replace(cfg,
                    generator=replace(cfg.generator,
-                                     num_train=40, num_test_indist=12, num_test_heldout=12))
+                                     num_train=40, num_test_indist=12, num_test_heldout=12,
+                                     num_breakout_train=24, num_breakout_test=12))
 
 
 class TestGenerator:

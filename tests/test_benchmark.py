@@ -81,6 +81,27 @@ class TestComputeMetrics:
         m = compute_metrics([], QUESTION_SPEC)
         assert m.mean_accuracy == 0.0
         assert m.ece == 0.0
+        assert m.per_label_accuracy == {}
+        assert m.confusion == {}
+
+    def test_confusion_and_per_label_accuracy_expose_bias(self):
+        """Majority-prediction collapse shows up as zero per-label accuracy."""
+        spec = {
+            "dir": {"type": "choice", "options": ["left", "right", "stay"]},
+        }
+        rows = [
+            _row({"dir": "right"}, {"dir": "left"}),
+            _row({"dir": "right"}, {"dir": "right"}),
+            _row({"dir": "right"}, {"dir": "stay"}),
+            _row({"dir": "right"}, {"dir": "left"}),
+        ]
+        m = compute_metrics(rows, spec)
+        pla = m.per_label_accuracy["dir"]
+        assert pla["left"] == 0.0          # always predicted "right" when gold=left
+        assert pla["right"] == 1.0
+        assert m.confusion["dir"]["left"] == {"right": 2}
+        assert m.confusion["dir"]["right"] == {"right": 1}
+        assert m.confusion["dir"]["stay"] == {"right": 1}
 
 
 class TestECE:

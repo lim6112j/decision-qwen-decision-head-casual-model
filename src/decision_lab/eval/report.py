@@ -91,6 +91,7 @@ def _build_markdown(all_metrics: dict[str, dict[str, AgentMetrics]]) -> list[str
 
     lines += _comparison_dimensions(all_metrics)
     lines += _generalization(all_metrics)
+    lines += _breakout_section(all_metrics)
     lines += _sample_outputs(all_metrics)
     return lines
 
@@ -170,6 +171,46 @@ def _generalization(all_metrics) -> list[str]:
             f"| {AGENT_LABELS[agent_id]} | {_fmt_pct(mi.mean_accuracy)} | "
             f"{_fmt_pct(mh.mean_accuracy)} | {drop:+.1f}pp |"
         )
+    lines.append("")
+    return lines
+
+
+def _breakout_section(all_metrics) -> list[str]:
+    """Per-label accuracy + confusion matrix for the Breakout paddle question.
+
+    Exposes label collapse: a head that answers "right" to everything shows
+    per-label accuracy ~0 for left/stay and ~1 for right.
+    """
+    m = all_metrics.get("test_breakout", {}).get("head_dynamic")
+    if m is None:
+        return []
+
+    lines = [
+        "## Breakout paddle-direction (test_breakout, head_dynamic)",
+        "",
+        f"Mean accuracy: {_fmt_pct(m.mean_accuracy)}",
+        "",
+        "### Per-label accuracy (gold label →)",
+        "",
+        "| Gold label | Accuracy |",
+        "|------------|----------|",
+    ]
+    for label, acc in sorted(m.per_label_accuracy.get("paddle_direction", {}).items()):
+        lines.append(f"| {label} | {_fmt_pct(acc)} |")
+
+    conf = m.confusion.get("paddle_direction", {})
+    if conf:
+        pred_labels = sorted({p for row in conf.values() for p in row})
+        lines += [
+            "",
+            "### Confusion matrix (rows = gold, columns = predicted)",
+            "",
+            "| gold \\ pred | " + " | ".join(pred_labels) + " |",
+            "|---" + "|---" * len(pred_labels) + "|",
+        ]
+        for gold in sorted(conf):
+            cells = " | ".join(str(conf[gold].get(p, 0)) for p in pred_labels)
+            lines.append(f"| {gold} | {cells} |")
     lines.append("")
     return lines
 

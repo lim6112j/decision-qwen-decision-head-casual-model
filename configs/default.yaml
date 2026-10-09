@@ -5,6 +5,11 @@ generator:
   num_test_heldout: 1000
   seed: 42
   heldout_templates: ["report", "config_file"]
+  # Breakout paddle-control states (gold from geometry). Used by dynamic-head
+  # training only. Mixing math: 4000 states × 4 samples × breakout_weight 3
+  # ≈ 48k breakout samples vs 150k document samples (~24% share).
+  num_breakout_train: 4000
+  num_breakout_test: 500
 
 # Fixed question bank (single forward pass evaluates all questions per state)
 questions:
@@ -57,6 +62,7 @@ dynamic_head:
   patience: 10
   anchor_epochs: 30
   variants_per_question: 3
+  breakout_weight: 3   # oversample factor for breakout states (see generator note)
 
 # Post-training temperature calibration (per question)
 calibration:

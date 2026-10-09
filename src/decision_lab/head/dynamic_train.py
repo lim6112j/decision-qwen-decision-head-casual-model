@@ -74,6 +74,11 @@ CHOICE_SYNONYM_MAPS: dict[str, dict[str, list[str]]] = {
         "high": ["elevated", "important", "significant"],
         "critical": ["severe", "urgent", "immediate"],
     },
+    "paddle_direction": {
+        "left": ["move_left", "go left", "LEFT"],
+        "right": ["move_right", "go right", "RIGHT"],
+        "stay": ["stay_put", "hold", "STAY"],
+    },
 }
 
 SCORE_SYNONYM_MAPS: dict[str, list[list[str]]] = {
@@ -359,7 +364,7 @@ def train_dynamic_head(
     variant_samples = [s for s in samples if "variant" in s.question_text]
     print(f"  anchor samples: {len(base_samples)}, variant samples: {len(variant_samples)}")
 
-    # Pack into tensors
+    # Pack into tensors (once; phases index into these instead of packing copies)
     def pack_samples(s_list: list[DynamicTrainingSample]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (state_embs, option_embs_stack, gold_idxs, n_opts_per_sample)."""
         states = torch.tensor(np.stack([s.state_emb for s in s_list]), dtype=torch.float32)
@@ -376,10 +381,13 @@ def train_dynamic_head(
             n_opts[i] = n
         return states, opt_padded, golds, n_opts
 
-    x_base, opts_base, y_base, n_base = pack_samples(base_samples)
-    x_var, opts_var, y_var, n_var = pack_samples(variant_samples) if variant_samples else (
-        torch.zeros(0, 1024), torch.zeros(0, 1, 1024), torch.zeros(0, dtype=torch.long), torch.zeros(0, dtype=torch.long)
+    x_all, opts_all, y_all, n_all = pack_samples(list(samples))
+
+    # Curriculum pools: base vs variant samples (by question text)
+    is_variant = torch.tensor(
+        ["variant" in s.question_text for s in samples], dtype=torch.bool,
     )
+    base_positions = torch.nonzero(~is_variant).squeeze(-1)
 
     # 3-way split for calibration holdout
     n = len(samples)
@@ -390,23 +398,20 @@ def train_dynamic_head(
     # Train/val split on remaining samples
     rest_idx = idx[calib_n:]
     split = int(len(rest_idx) * 0.8)
-    train_idx_set = set(rest_idx[:split].tolist())
-    val_idx_set = set(rest_idx[split:].tolist())
+    train_positions = torch.tensor(rest_idx[:split], dtype=torch.long)
+    val_positions = torch.tensor(rest_idx[split:], dtype=torch.long)
 
-    # Build tensors for all samples together
-    x_all, opts_all, y_all, n_all = pack_samples(list(samples))
+    # Anchor pool: base-question samples restricted to the train split
+    variant_arr = np.array([v.item() for v in is_variant], dtype=bool)
+    in_train = np.zeros(n, dtype=bool)
+    in_train[rest_idx[:split]] = True
+    anchor_pool = torch.tensor(
+        np.where(~variant_arr & in_train)[0], dtype=torch.long,
+    )
 
-    # Mask functions
-    def mask_by_set(idx_set):
-        return torch.tensor([i in idx_set for i in range(len(samples))], dtype=torch.bool)
-
-    train_mask = mask_by_set(train_idx_set)
-    val_mask = mask_by_set(val_idx_set)
-
-    x_train, opts_train, y_train, n_train = x_all[train_mask], opts_all[train_mask], y_all[train_mask], n_all[train_mask]
-    x_val, opts_val, y_val, n_val = x_all[val_mask], opts_all[val_mask], y_all[val_mask], n_all[val_mask]
-
-    print(f"  train: {len(x_train)}, val: {len(x_val)}, calibration holdout: {calib_n}")
+    print(f"  train: {len(train_positions)}, val: {len(val_positions)}, "
+          f"calibration holdout: {calib_n} "
+          f"(anchor pool: {len(anchor_pool)})")
 
     # Model
     model = DynamicDecisionHead(
@@ -424,32 +429,27 @@ def train_dynamic_head(
     best_state = None
     patience_counter = 0
 
+    batch_size = hc.batch_size
     for epoch in range(1, hc.max_epochs + 1):
-        # Curriculum: first anchor_epochs use base samples only
-        if epoch <= anchor_epochs and len(base_samples) > 0:
-            epoch_samples = base_samples
-            x_ep, opts_ep, y_ep, n_ep = x_base, opts_base, y_base, n_base
+        # Curriculum: first anchor_epochs use base samples only. Both phases
+        # train on the train split only — never on val/calibration samples.
+        if epoch <= anchor_epochs and len(anchor_pool) > 0:
+            pool = anchor_pool
             phase = "anchor"
         else:
-            epoch_samples = list(samples)
-            x_ep, opts_ep, y_ep, n_ep = x_all, y_all.new_tensor([]), y_all, n_all
+            pool = train_positions
             phase = "generalize"
 
         model.train()
         train_loss = 0.0
         # Shuffle for this epoch
-        perm = torch.randperm(len(x_ep)) if phase == "anchor" else torch.randperm(len(x_all))
-        if phase == "anchor":
-            x_shuf, opts_shuf, y_shuf = x_ep[perm], opts_ep[perm], y_ep[perm]
-        else:
-            x_shuf, opts_shuf, y_shuf = x_all[perm], opts_all[perm], y_all[perm]
+        order = pool[torch.randperm(len(pool))]
 
-        batch_size = hc.batch_size
-        for start in range(0, len(x_shuf), batch_size):
-            end = min(start + batch_size, len(x_shuf))
-            xb = x_shuf[start:end].to(device)
-            ob = opts_shuf[start:end].to(device)
-            yb = y_shuf[start:end].to(device)
+        for start in range(0, len(order), batch_size):
+            bpos = order[start : start + batch_size]
+            xb = x_all[bpos].to(device)
+            ob = opts_all[bpos].to(device)
+            yb = y_all[bpos].to(device)
 
             optimizer.zero_grad()
             # Forward pass: attention over options
@@ -461,20 +461,20 @@ def train_dynamic_head(
             loss = F.cross_entropy(scores, yb)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item() * (end - start)
+            train_loss += loss.item() * len(bpos)
 
-        train_loss /= len(x_shuf)
+        train_loss /= len(order)
 
         # Validation
         model.eval()
         val_correct = 0
         val_total = 0
         with torch.no_grad():
-            for start in range(0, len(x_val), batch_size):
-                end = min(start + batch_size, len(x_val))
-                xb = x_val[start:end].to(device)
-                ob = opts_val[start:end].to(device)
-                yb = y_val[start:end].to(device)
+            for start in range(0, len(val_positions), batch_size):
+                bpos = val_positions[start : start + batch_size]
+                xb = x_all[bpos].to(device)
+                ob = opts_all[bpos].to(device)
+                yb = y_all[bpos].to(device)
 
                 h = model.trunk(xb)
                 q = model.query_proj(h)
@@ -482,7 +482,7 @@ def train_dynamic_head(
                 scores = torch.bmm(K, q.unsqueeze(-1)).squeeze(-1) / math.sqrt(model.d_k)
                 pred = scores.argmax(dim=1)
                 val_correct += int((pred == yb).sum().item())
-                val_total += end - start
+                val_total += len(bpos)
 
         val_acc = val_correct / val_total if val_total > 0 else 0.0
 
