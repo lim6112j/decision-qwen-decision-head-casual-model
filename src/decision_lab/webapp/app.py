@@ -220,6 +220,8 @@ async def decide_dynamic(req: DynamicDecideRequest):
             detail="dynamic head agent not available; train with `python -m decision_lab train-dynamic`",
         )
 
+    _validate_dynamic_questions(req.questions)
+
     s = _resolve_state_dynamic(req)
     try:
         answers, latency_ms = dynamic_agent.decide_dynamic(s, req.questions)
@@ -243,6 +245,34 @@ def _resolve_state_dynamic(req: DynamicDecideRequest) -> "TextState":
         if s.doc_id == req.doc_id:
             return s
     raise HTTPException(status_code=404, detail=f"doc_id {req.doc_id} not found")
+
+
+def _validate_dynamic_questions(questions: list[dict]) -> None:
+    """Fail fast with clear 400s on malformed question configs.
+
+    Without this, a missing options/levels key surfaces as a 500 KeyError
+    from deep inside the head — useless to the caller.
+    """
+    for i, q in enumerate(questions):
+        where = f"questions[{i}]"
+        if not isinstance(q, dict):
+            raise HTTPException(status_code=400, detail=f"{where} must be an object")
+        kind = q.get("type")
+        if kind not in ("choice", "score", "noul"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{where}.type must be 'choice' | 'score' | 'noul', got {kind!r}",
+            )
+        if kind == "choice" and not q.get("options"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{where} is type=choice but has no non-empty 'options' list",
+            )
+        if kind == "score" and not q.get("levels"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{where} is type=score but has no non-empty 'levels' list",
+            )
 
 
 @app.get("/")

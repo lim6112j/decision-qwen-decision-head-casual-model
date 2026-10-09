@@ -134,8 +134,9 @@ geometry (side, gap) in `custom_text`, not in `question`.
 | Status | Meaning |
 |---|---|
 | 503 | server still loading (check `/api/status`) |
-| 400 | dynamic head not trained (`models/head_dynamic.pt` missing) or malformed request |
+| 400 | dynamic head not trained (`models/head_dynamic.pt` missing); malformed request — missing `custom_text`/`doc_id`, or a question entry with unknown `type` or a missing/empty `options`/`levels` list |
 | 404 | unknown `doc_id` |
+| 422 | body does not match the request schema (e.g. no `questions` list) — the response `detail` names the offending field |
 | 500 | decision failed (see `detail`) |
 
 ## Minimal client (Python)
