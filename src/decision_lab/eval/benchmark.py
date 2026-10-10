@@ -166,8 +166,8 @@ def _run_dynamic_forward(
 ) -> dict:
     """Run dynamic head on one state against the fixed question bank.
 
-    v3: each question's text conditions the option queries — the cache must
-    contain the question strings as well as option texts (see
+    v4: each question's text provides the field-selection query — the cache
+    must contain the question strings as well as option texts (see
     _collect_option_texts).
 
     Returns {qid: decoded answer dict} — same format as predict_all for TypedDecisionHead.

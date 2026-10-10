@@ -192,7 +192,7 @@ class DynamicHeadAgent:
     ) -> torch.Tensor:
         """Embed options + question (cached) and score them → (1, n_opts).
 
-        question_text conditions the option queries (v3 FiLM fusion);
+        question_text provides the question-field attention query (v4);
         empty string → zero-vector modulation (learned null question).
         """
         texts = list(option_texts)

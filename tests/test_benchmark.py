@@ -160,12 +160,14 @@ class TestLoadDynamicForBenchmark:
             _load_dynamic_for_benchmark(cfg, tmp_path, torch.device("cpu"))
 
     def test_valid_checkpoint_loads(self, cfg, tmp_path):
-        head = DynamicDecisionHead()
+        head = DynamicDecisionHead(state_set=True)   # v4 is state_set
         torch.save(
             {
                 "model_state": head.state_dict(),
                 "arch": {
                     "type": "dynamic",
+                    "state_set": True,
+                    "arch_version": 4,
                     "input_dim": head.input_dim,
                     "hidden_dim": head.hidden_dim,
                     "d_k": head.d_k,
