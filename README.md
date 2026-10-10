@@ -306,10 +306,11 @@ Q     = normalize((1 + gate) · Q_opt + shift)
 Results of the v3 retrain: `test_breakout` **paddle_direction 98.0%** (v2
 parity) **and ball_motion 99.5%** (new capability — same state, same option
 texts, different gold), in-dist 82.2% → **95.7%**, held-out 73.9% → **71.5%**
-(v2 parity within run variance). Known remaining weak spot: the original
-contradictory-evidence state (geometry says LEFT, motion says "moving
-right") produces a uniform 0.333 distribution — v2 had the same tie; the
-argmax tie-break decides, so that specific state is a coin flip.
+(v2 parity within run variance). The v2-era tie on the contradictory-evidence
+state (geometry says LEFT, motion says "moving right") is gone in the v3
+head — verified live (2026-10-10): that state answers paddle_direction
+`left` @ 0.9999 and ball_motion `right` @ 0.996, each question reading its
+own cue instead of averaging the two.
 
 > Deeper notes on how the decision heads train (frozen-backbone design,
 > last-token pooling pitfalls, data decorrelation, split hygiene):

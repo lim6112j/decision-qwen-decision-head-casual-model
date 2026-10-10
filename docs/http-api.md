@@ -38,8 +38,8 @@ request — no retraining or server restart for new question types.
   "custom_text": "URGENT: prod server is down, need someone now",
   "questions": [
     {"type": "noul",   "question": "Is this actionable?"},
-    {"type": "choice", "options": ["low", "medium", "high"], "question": "urgency"},
-    {"type": "score",  "levels": ["Poor", "Fair", "Good", "Excellent"], "question": "quality"}
+    {"type": "choice", "options": ["low", "medium", "high"], "question": "How urgent is this item?"},
+    {"type": "score",  "levels": ["Poor", "Fair", "Good", "Excellent"], "question": "What is the quality of this text?"}
   ]
 }
 ```
@@ -68,6 +68,13 @@ answers. It may be omitted (learned null-question behavior). Legacy
 pre-v3 checkpoints ignore it. Option/level label strings are embedded via
 the backbone, cached server-side per label — sending identical option
 strings across calls is cheap.
+
+**Use natural-language phrasings** ("How urgent is this item?") — the head
+was trained on natural questions, not bare identifiers. A raw qid like
+`"urgency"` as the question is off-distribution and silently degrades
+predictions (no error is raised; verified 2026-10-10: breakout
+`ball_motion` flipped from 8/8 correct to 3/8 with `"ball_motion"` as the
+question string).
 
 ### Supported question domains
 
