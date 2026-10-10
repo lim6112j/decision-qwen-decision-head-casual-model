@@ -68,22 +68,29 @@ Running v3 after v4 lands — no retraining needed, the checkpoint is a file:
 ```bash
 git worktree add ../decision-v3 v3-head          # v3-era code
 cp models/head_dynamic.pt ../decision-v3/models/ # models/ is gitignored
+ln -s "$PWD/data" ../decision-v3/data            # data/ is gitignored too — and reusable
 cd ../decision-v3 && python -m decision_lab ui   # separate port / venv
 ```
 
 Verified 2026-10-11: the code at tag `v3-head` loads
-`models/head_dynamic.pt` and runs a forward pass unchanged.
+`models/head_dynamic.pt` and runs a forward pass unchanged, and the v4 code
+refuses that same checkpoint (`arch_version 3 ... this build only loads v4`)
+— the two versions cannot be confused for one another.
 
 Two more things worth knowing:
 
 - **One dynamic head per process.** `build_agents` registers a single
   `head_dynamic`; switching versions means switching the config (or running
   two checkouts on different ports), not selecting per request.
-- **Evaluation needs the feature caches** (`data/features_*_fields.npz`).
-  They are gitignored too; a fresh checkout can regenerate them with
-  `python -m decision_lab extract`, which costs llama-server embedding time
-  (see `docs/v4-open-issues.md` for the `http_proxy` trap that makes this
-  much slower than it should be).
+- **The feature caches are shared, not per-version.** Both architectures
+  read the same `data/features_*_fields.npz` (the field splitter and
+  `include_summary_field` are identical in v3 and v4, so the cache
+  fingerprint — dataset bytes + `include_summary_field` + `SPLITTER_VERSION`
+  — matches), which is why the recipe above can symlink `data/` instead of
+  regenerating it. Regeneration is only needed if you want an independent
+  copy, and costs llama-server embedding time (see
+  `docs/v4-open-issues.md` for the `http_proxy` trap that makes that much
+  slower than it should be).
 
 ## Configuration
 
