@@ -218,10 +218,18 @@ class DynamicDecisionHead(nn.Module):
             # bias homogenizes every option onto one field (identical logits
             # for all options, the symmetric plateau), and the learned scale
             # settles at roughly half attn_scale, i.e. between the two.
-            # Zero-init (weight AND bias) → shift 0 → identity at init.
+            # Zero-init (weight AND bias) → gate 0, shift 0 → identity at init.
+            # The (1 + gate) form is load-bearing for the same reason it was in
+            # v3: a bare gate * opt_query would be normalize(0) at init → NaN.
+            # The multiplicative gate is what a purely additive shift lacks —
+            # it reshapes each option's query per dimension (amplify/suppress),
+            # not just translates it, which is the expressiveness v3's FiLM had
+            # for the breakout position-vs-motion discrimination.
+            self.q_query_gate = nn.Linear(hidden_dim, d_k)
             self.q_query_shift = nn.Linear(hidden_dim, d_k)
-            nn.init.zeros_(self.q_query_shift.weight)
-            nn.init.zeros_(self.q_query_shift.bias)
+            for lin in (self.q_query_gate, self.q_query_shift):
+                nn.init.zeros_(lin.weight)
+                nn.init.zeros_(lin.bias)
             # Zero-init residual read-out: at init, output == v2 forward for
             # ANY question (stall-recurrence guard). LoRA-style bootstrap —
             # first Linear default-init, GELU, LAST Linear zero-init:
@@ -317,12 +325,14 @@ class DynamicDecisionHead(nn.Module):
         alpha_q = torch.softmax(attn_q, dim=-1)                   # over fields
         z_q = torch.bmm(alpha_q.unsqueeze(1), field_repr).squeeze(1)  # (B, H)
 
-        # Option queries, steered by the question's attended context
-        # (zero-init shift → identity at init). This is what lets the same
-        # option text match a different field under a different question.
+        # Option queries, steered AND reshaped by the question's attended
+        # context (zero-init gate+shift → identity at init). This is what lets
+        # the same option text match a different field under a different
+        # question.
+        gate = self.q_query_gate(z_q).unsqueeze(1)                # (B, 1, d_k)
         shift = self.q_query_shift(z_q).unsqueeze(1)              # (B, 1, d_k)
         Q = F.normalize(
-            self.opt_query(option_embeddings) + shift, dim=-1,
+            (1.0 + gate) * self.opt_query(option_embeddings) + shift, dim=-1,
         )                                                         # (B, N, d_k)
         # (B, N, d_k) × (B, d_k, M) → (B, N, M)
         attn = torch.bmm(Q, K.transpose(1, 2)) * self.attn_scale

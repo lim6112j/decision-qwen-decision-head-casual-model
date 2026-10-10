@@ -461,11 +461,12 @@ class TestQuestionAttention:
         assert torch.count_nonzero(set_head.qz_readout[2].weight) == 0
         assert torch.count_nonzero(set_head.qz_readout[2].bias) == 0
 
-    def test_q_query_shift_zero_init(self, set_head):
-        """The question→query shift is zero at init → identity on the option
-        queries (same guard as the read-out)."""
-        assert torch.count_nonzero(set_head.q_query_shift.weight) == 0
-        assert torch.count_nonzero(set_head.q_query_shift.bias) == 0
+    def test_q_query_gate_shift_zero_init(self, set_head):
+        """The question→query gate and shift are zero at init → identity on
+        the option queries (same guard as the read-out)."""
+        for lin in (set_head.q_query_gate, set_head.q_query_shift):
+            assert torch.count_nonzero(lin.weight) == 0
+            assert torch.count_nonzero(lin.bias) == 0
 
     def test_q_query_shift_steers_option_queries(self, set_head):
         """Once the shift is live the question changes what each option
@@ -473,6 +474,7 @@ class TestQuestionAttention:
         set_head.eval()
         torch.manual_seed(5)
         with torch.no_grad():
+            set_head.q_query_gate.weight.normal_(0, 0.5)
             set_head.q_query_shift.weight.normal_(0, 0.5)
         fields = torch.randn(6, 64)
         opt_embs = torch.randn(3, 64)
@@ -518,7 +520,7 @@ class TestQuestionAttention:
             s_b = head.forward_choice(fields, opt_embs, question_emb=q_b)
         assert int(s_a.argmax()) == 0
         assert int(s_b.argmax()) == 1
-        assert torch.count_nonzero(head.q_query_shift.weight) > 0
+        assert torch.count_nonzero(head.q_query_gate.weight) > 0
 
     def test_attn_scale_q_init(self, set_head):
         """Separate scale, init √d_k — the O(1) cosine logit-spread property
