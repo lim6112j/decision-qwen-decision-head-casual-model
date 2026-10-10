@@ -450,7 +450,7 @@ class TestQuestionAttention:
         assert hasattr(set_head, "q_question")
         assert hasattr(set_head, "attn_scale_q")
         assert hasattr(set_head, "qz_readout")
-        assert hasattr(set_head, "q_field")
+        assert hasattr(set_head, "q_query_shift")
         # v3 FiLM modules are gone
         for gone in ("q_mod_scale", "q_mod_bias", "z_mod_scale", "z_mod_bias"):
             assert not hasattr(set_head, gone)
@@ -461,71 +461,64 @@ class TestQuestionAttention:
         assert torch.count_nonzero(set_head.qz_readout[2].weight) == 0
         assert torch.count_nonzero(set_head.qz_readout[2].bias) == 0
 
-    def test_q_field_zero_init(self, set_head):
-        """The question→field bias is zero at init → identity on the option
-        attention (same guard as the read-out): its scale starts at 0."""
-        assert set_head.q_field_scale.item() == 0.0
-        assert hasattr(set_head, "q_field")
+    def test_q_query_shift_zero_init(self, set_head):
+        """The question→query shift is zero at init → identity on the option
+        queries (same guard as the read-out)."""
+        assert torch.count_nonzero(set_head.q_query_shift.weight) == 0
+        assert torch.count_nonzero(set_head.q_query_shift.bias) == 0
 
-    def test_q_field_steers_option_attention(self, set_head):
-        """Once q_field is non-zero the question changes WHICH fields the
-        options read (attention weights depend on the question) — the
-        anti-lexical-pull path."""
+    def test_q_query_shift_steers_option_queries(self, set_head):
+        """Once the shift is live the question changes what each option
+        reads, and the mask invariant still holds."""
         set_head.eval()
         torch.manual_seed(5)
         with torch.no_grad():
-            set_head.q_field.weight.normal_(0, 0.5)
-            set_head.q_field_scale.fill_(1.0)
-        fields = torch.randn(4, 64)
-        opt_embs = torch.randn(2, 64)
+            set_head.q_query_shift.weight.normal_(0, 0.5)
+        fields = torch.randn(6, 64)
+        opt_embs = torch.randn(3, 64)
         q_a, q_b = torch.randn(64), torch.randn(64)
         with torch.no_grad():
             out_a = set_head.forward_choice(fields, opt_embs, question_emb=q_a)
             out_b = set_head.forward_choice(fields, opt_embs, question_emb=q_b)
-        assert not torch.allclose(out_a, out_b, atol=1e-5)
-        # and a genuinely different question re-weights fields (not a
-        # uniform shift): masked-field handling still holds
-        with torch.no_grad():
-            padded = torch.zeros(6, 64)
-            padded[:4] = fields
-            mask = torch.tensor([True, True, True, True, False, False])
-            clean = set_head.forward_choice(fields, opt_embs, question_emb=q_a)
+            padded = torch.zeros(8, 64)
+            padded[:6] = fields
+            mask = torch.tensor([True] * 6 + [False] * 2)
             masked = set_head.forward_choice(
                 padded, opt_embs, state_mask=mask, question_emb=q_a,
             )
-        assert torch.allclose(clean, masked, atol=1e-5)
+        assert not torch.allclose(out_a, out_b, atol=1e-5)
+        assert torch.allclose(out_a, masked, atol=1e-5)
 
-    def test_q_field_lexical_pull_resolution(self):
-        """The term q_field adds: the question re-weights which fields every
-        option reads, so two different questions over the SAME state and
-        options produce materially different scores. This is the anti-
-        lexical-pull path — without it the option attention is question-
-        agnostic and a dominant distractor field wins regardless of question.
-        Uses a realistic field count; at 2 fields the shared bias collapses
-        option discrimination into the symmetric plateau."""
-        torch.manual_seed(4)   # head init too — deterministic vs suite order
-        set_head = DynamicDecisionHead(
-            input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True,
-        )
-        set_head.eval()
-        # Local generator: isolated from whatever global RNG state other
-        # tests left behind (this test depends on exact draw magnitudes).
+    def test_query_shift_repoints_option_matching(self):
+        """THE property a shared per-field bias cannot provide: the same
+        option must be able to match a DIFFERENT field under a different
+        question. Two options, two fields; with the shift trained, question A
+        routes option 0 to field 0 and question B routes it to field 1."""
+        torch.manual_seed(4)
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16,
+                                   dropout=0.0, state_set=True)
         g = torch.Generator().manual_seed(4)
-        fields = torch.randn(6, 64, generator=g)    # (M=6)
-        opt_embs = torch.randn(3, 64, generator=g)  # (N=3)
+        fields = torch.randn(2, 64, generator=g)
+        opt_embs = torch.randn(2, 64, generator=g)
         q_a = torch.randn(64, generator=g)
         q_b = torch.randn(64, generator=g) + 2.0
+
+        opt = torch.optim.Adam(head.parameters(), lr=5e-3)
+        for _ in range(900):
+            for q_emb, gold in ((q_a, 0), (q_b, 1)):
+                scores = head.forward_choice(fields, opt_embs, question_emb=q_emb)
+                loss = torch.nn.functional.cross_entropy(scores, torch.tensor([gold]))
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+        head.eval()
         with torch.no_grad():
-            set_head.q_field.weight.normal_(0, 0.5, generator=g)
-            set_head.q_field_scale.fill_(10.0)
-            s_a = set_head.forward_choice(fields, opt_embs, question_emb=q_a)
-            s_b = set_head.forward_choice(fields, opt_embs, question_emb=q_b)
-            s_none = set_head.forward_choice(fields, opt_embs, question_emb=None)
-        # material difference, not float noise (the cosine-bounded bias is
-        # deliberately gentle — the scale, not the direction, sets magnitude)
-        assert float((s_a - s_b).abs().max()) > 0.05
-        # and the question is what drives it: the zero question differs too
-        assert not torch.allclose(s_a, s_none, atol=1e-4)
+            s_a = head.forward_choice(fields, opt_embs, question_emb=q_a)
+            s_b = head.forward_choice(fields, opt_embs, question_emb=q_b)
+        assert int(s_a.argmax()) == 0
+        assert int(s_b.argmax()) == 1
+        assert torch.count_nonzero(head.q_query_shift.weight) > 0
 
     def test_attn_scale_q_init(self, set_head):
         """Separate scale, init √d_k — the O(1) cosine logit-spread property

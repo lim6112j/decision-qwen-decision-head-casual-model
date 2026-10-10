@@ -49,16 +49,18 @@ v4 (state_set=True, arch_version 4) — question-field attention:
     form is load-bearing: a plain additive z + g·W·z_q is constant across
     options and cancels in the softmax over options, while the concat MLP
     sees per-option z_j and can re-interpret attended content.
-    A per-field relevance bias from the question (q_field) is also added to
-    the option attention logits, so the question steers WHICH fields every
-    option reads. This is load-bearing, not decorative: without it an
-    adversarial lexical pull wins — the breakout state "ball on the LEFT …
-    moving right" flips paddle_direction to the motion word (measured on the
-    v4 head before this term: 89.6% when motion agreed with position, 48.9%
-    when it disagreed; v3's query-side FiLM carried the same steering power).
-    The option↔field matching path (opt_query → field_key attention) is
-    otherwise question-agnostic and shared, so an OOD question cannot
-    corrupt it beyond re-weighting fields by similarity.
+    The question's attended context z_q also SHIFTS each option's query
+    before it reads the field set (q_query_shift, zero-init). This is
+    load-bearing, not decorative: the same option text must match a
+    different field under a different question (breakout "left" matches the
+    ball's POSITION field for paddle_direction but with a question-agnostic
+    query is pulled by the "moving right" MOTION field). Measured on the
+    v4 head without it: paddle_direction 0.680 vs v3's 0.980, and 48.9%
+    when the motion word disagreed with the position side. A per-field bias
+    SHARED across options cannot substitute — small leaves the distractor
+    winning, large homogenizes every option onto one field (identical
+    logits, the symmetric plateau). Steering the queries is per-option, so
+    it re-points the match without collapsing option discrimination.
     qz_readout is ZERO-initialized (weight AND bias): at init, output ==
     v2 forward for ANY question, preserving the O(1) cosine-attention logit
     spread (see __init__ note). Gradients still reach qz_readout at W=0
@@ -163,8 +165,8 @@ class DynamicDecisionHead(nn.Module):
     state_mask: (B, M) bool, True = valid field (v2 only; ignored in v1).
 
     v1 modules (trunk/query_proj/key_proj/noul_head) and v2+ modules
-    (field_enc/field_key/opt_query/score_head/q_field/q_question/
-    attn_scale_q/qz_readout) are mutually exclusive: only the ones matching
+    (field_enc/field_key/opt_query/score_head/q_question/attn_scale_q/
+    q_query_shift/qz_readout) are mutually exclusive: only the ones matching
     ``state_set`` exist.
     """
 
@@ -204,23 +206,22 @@ class DynamicDecisionHead(nn.Module):
             # heads' softmax temperature).
             self.q_question = nn.Linear(input_dim, d_k)
             self.attn_scale_q = nn.Parameter(torch.tensor(float(d_k) ** 0.5))
-            # v4 question→field relevance bias: the question re-weights which
-            # fields EVERY option reads (a per-field, not per-option, additive
-            # term on the option attention logits). Load-bearing, not optional:
-            # with a question-agnostic option path alone, an adversarial
-            # lexical pull wins — the ball "on the LEFT ... moving right"
-            # state flips paddle_direction answers to the motion word
-            # (measured: 89.6% when motion agrees with position, 48.9% when it
-            # disagrees). The question steers attention to the position field.
-            # Bounded by construction: the bias is (learnable scale) × cosine
-            # (K, q_dir) ∈ [-scale, scale], NOT a raw dot product of an
-            # unbounded projection — an unbounded bias lets the question
-            # saturate the option attention and collapse every option onto the
-            # same field distribution (measured: identical logits for all
-            # options, the symmetric plateau). A separate scale parameter,
-            # init 0, keeps the term exactly identity at init.
-            self.q_field = nn.Linear(input_dim, d_k)
-            self.q_field_scale = nn.Parameter(torch.zeros(1))
+            # v4 question-conditioned option queries: the question's attended
+            # field context (z_q) shifts every option's query before it reads
+            # the field set. This is the per-option steering the task needs:
+            # the SAME option text must match a different field under a
+            # different question (breakout "left" matches the ball's POSITION
+            # field for paddle_direction but must not be pulled by the
+            # "moving right" MOTION field). A per-field bias shared across
+            # options cannot do that — measured: small bias leaves the
+            # distractor winning (paddle_direction 0.68 vs v3's 0.98), large
+            # bias homogenizes every option onto one field (identical logits
+            # for all options, the symmetric plateau), and the learned scale
+            # settles at roughly half attn_scale, i.e. between the two.
+            # Zero-init (weight AND bias) → shift 0 → identity at init.
+            self.q_query_shift = nn.Linear(hidden_dim, d_k)
+            nn.init.zeros_(self.q_query_shift.weight)
+            nn.init.zeros_(self.q_query_shift.bias)
             # Zero-init residual read-out: at init, output == v2 forward for
             # ANY question (stall-recurrence guard). LoRA-style bootstrap —
             # first Linear default-init, GELU, LAST Linear zero-init:
@@ -303,31 +304,32 @@ class DynamicDecisionHead(nn.Module):
         field_repr = self.field_enc(state)                        # (B, M, H)
         K = F.normalize(self.field_key(field_repr), dim=-1)       # (B, M, d_k)
 
-        # Option path — shared across all questions
-        Q = F.normalize(self.opt_query(option_embeddings), dim=-1)  # (B, N, d_k)
-        # (B, N, d_k) × (B, d_k, M) → (B, N, M)
-        attn = torch.bmm(Q, K.transpose(1, 2)) * self.attn_scale
-        # v4 question→field relevance bias (per-field, shared across options;
-        # zero at init → identity). Bounded: scale × cosine(K, q_dir), so the
-        # question can re-weight fields without saturating the option attention.
-        q_dir = F.normalize(self.q_field(question_emb), dim=-1)   # (B, d_k)
-        rel = torch.bmm(K, q_dir.unsqueeze(-1)).squeeze(-1)       # (B, M) ∈ [-1,1]
-        attn = attn + self.q_field_scale * rel.unsqueeze(1)       # (B, N, M)
+        mask = None
         if state_mask is not None:
-            if state_mask.dim() == 1:
-                state_mask = state_mask.unsqueeze(0)              # (M,) → (1, M)
-            attn = attn.masked_fill(~state_mask.unsqueeze(1), float("-inf"))
-        alpha = torch.softmax(attn, dim=-1)                       # over fields
-        z = torch.bmm(alpha, field_repr)                          # (B, N, H)
+            mask = state_mask.unsqueeze(0) if state_mask.dim() == 1 else state_mask
 
-        # v4 question context — the question queries the SAME field keys
+        # v4 question context — the question queries the SAME field keys.
+        # Computed FIRST: its attended content steers the option queries.
         Qq = F.normalize(self.q_question(question_emb), dim=-1)   # (B, d_k)
-        # (B, M, d_k) × (B, d_k, 1) → (B, M, 1) → (B, M)
         attn_q = torch.bmm(K, Qq.unsqueeze(-1)).squeeze(-1) * self.attn_scale_q
-        if state_mask is not None:
-            attn_q = attn_q.masked_fill(~state_mask, float("-inf"))
+        if mask is not None:
+            attn_q = attn_q.masked_fill(~mask, float("-inf"))
         alpha_q = torch.softmax(attn_q, dim=-1)                   # over fields
         z_q = torch.bmm(alpha_q.unsqueeze(1), field_repr).squeeze(1)  # (B, H)
+
+        # Option queries, steered by the question's attended context
+        # (zero-init shift → identity at init). This is what lets the same
+        # option text match a different field under a different question.
+        shift = self.q_query_shift(z_q).unsqueeze(1)              # (B, 1, d_k)
+        Q = F.normalize(
+            self.opt_query(option_embeddings) + shift, dim=-1,
+        )                                                         # (B, N, d_k)
+        # (B, N, d_k) × (B, d_k, M) → (B, N, M)
+        attn = torch.bmm(Q, K.transpose(1, 2)) * self.attn_scale
+        if mask is not None:
+            attn = attn.masked_fill(~mask.unsqueeze(1), float("-inf"))
+        alpha = torch.softmax(attn, dim=-1)                       # over fields
+        z = torch.bmm(alpha, field_repr)                          # (B, N, H)
 
         # Zero-init residual read-out (identity at init — see __init__ note).
         # Concat form is load-bearing: a plain additive z + g·W·z_q would be
