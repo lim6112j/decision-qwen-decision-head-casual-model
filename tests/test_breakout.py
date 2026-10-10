@@ -177,7 +177,11 @@ class TestDatasetIO:
             states = load_dataset(Path(tmp) / "a" / "train_breakout.jsonl")
             assert len(states) == 30
             assert all(s.state_type.startswith("breakout_") for s in states)
-            assert all(set(s.labels) == {PADDLE_QID, MOTION_QID} for s in states)
+            assert all(
+                set(s.labels) == {PADDLE_QID, MOTION_QID,
+                                  "is_ball_left", "ball_moving", "ball_rising"}
+                for s in states
+            )
 
     def test_jsonl_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
