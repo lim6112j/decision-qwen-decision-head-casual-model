@@ -88,9 +88,16 @@ Full pipeline (extract → train → eval → report) on Apple Silicon (MPS), ll
 | Agent | In-dist acc | Held-out acc | Mean latency | Parse failures |
 |---|---|---|---|---|
 | `head_trained` | 93.3% | 48.8% | 0.2 ms | 0 |
-| `head_dynamic` (v2) | **84.6%** | **73.9%** | 11.0 ms | 0 |
+| `head_dynamic` (v4) | **94.3%** | **75.7%** | ~11 ms | 0 |
 | `head_random` | 40.2% | 39.3% | 0.2 ms | 0 |
 | `prompt_lm_zero_shot` | 60.5% | 64.5% | ~368 ms | 0 |
+
+`head_dynamic` re-measured on the v4 checkpoint (2026-10-11, same 200-state
+subsample, fixed 6-question bank); the other rows are unchanged by the v4
+work (typed head and prompt LM share none of the changed code paths) and
+carry their v2-run numbers. Latency is not re-measured — the v4 forward adds
+one attention row and two small linears per option (well under a millisecond)
+to a path dominated by field embedding.
 
 Previous run (v1 pooled-state head, 2026-10-08): head_dynamic 82.2% in-dist / **39.1% held-out**; typed head and prompt LM numbers unchanged by the restructure (their pipeline still uses the pooled caches). Comparison caveat: v2 changes both the head and the state input pipeline (field splitting), so the held-out gain (+34.8pp) reflects the structural change as a whole — which is exactly what it was designed to do (see "v2 head" below).
 
@@ -98,7 +105,7 @@ Key findings:
 
 - **Typed head dominates in-dist** (93.3%) at ~1,800× lower latency than prompt LM — but drops 44pp on held-out formats (48.8%). The head overfits to surface text patterns in the training templates.
 - **Prompt LM inverts**: does *better* on held-out (64.5% vs 60.5%) because it reads text directly rather than relying on format-dependent embeddings.
-- **Dynamic head v2** (84.6% in-dist, 73.9% held-out) supports any number of options at inference without retraining — and field-set attention recovers most of the held-out gap the v1 pooled head suffered (39.1% → 73.9%), now beating the prompt LM held-out (64.5%) too.
+- **Dynamic head v4** (94.3% in-dist, 75.7% held-out) supports any number of options at inference without retraining — and field-set attention recovers most of the held-out gap the v1 pooled head suffered (39.1% → 75.7%), now beating the prompt LM held-out (64.5%) too. v4 additionally answers question targets it was never trained on (see "v4 head" below).
 - **Qwen backbone is never modified.** Training only touches the head MLP (~400K params for typed, ~430K for the v2 dynamic head). The GGUF model file (`models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf`) is served read-only by llama-server for embedding extraction and chat completion. The backbone never sees gradients — all training happens on pre-extracted frozen embeddings.
 - **LoRA adapter on frozen embeddings does not help** held-out generalization (v1 experiment). A post-hoc low-rank transformation (rank=64) trained on in-dist embeddings can only re-weight existing dimensions — it cannot bridge the fundamental gap between embeddings of different text formats. Held-out actually regressed (48.7% → 43.5% with adapter). The bottleneck is the frozen Qwen3.5-0.8B backbone's format-specific embedding geometry — the v2 field-level input attacks the same problem from the input side instead.
 
@@ -321,3 +328,85 @@ Quick sanity check without the full pipeline (one question per test set, all thr
 ```bash
 python scripts/quick_one_state_test.py 1
 ```
+### v4 head: question-field attention (2026-10-11)
+
+v3's question conditioning was a dense map of the question embedding
+(`gate, shift = Linear(question_emb)`) trained on ~25 fixed question texts
+(5 qids × 3-4 handwritten phrasings). A `Linear(1024 → d_k)` is only
+regulated on the points it was trained on; in every direction orthogonal to
+those 25 it is free. Any question target outside the bank therefore received
+a near-random modulation. Measured: v3 answers the polarity *inversions* of
+its own questions at chance or worse — `not_urgent` 3.0%, `no_pii` 4.0%,
+`not_negative` 48.5% (it answers the base question).
+
+v4 gives the question an actual computation path:
+
+```
+field_repr = field_enc(state)                     # (B, M, H)
+K          = normalize(field_key(field_repr))     # (B, M, d_k)
+
+Qq    = normalize(q_question(question_emb))       # question's own query
+alpha = softmax(K · Qq · attn_scale_q)            # question reads the fields
+z_q   = alpha @ field_repr                        # (B, H) attended context
+
+Q_j   = normalize((1 + gate(z_q)) · opt_query(opt_j) + shift(z_q))
+z_j   = attention(Q_j, K) @ field_repr
+z_j'  = z_j + qz_readout([z_j ; z_q])             # zero-init residual
+logit = score_head(z_j')
+```
+
+- **Why attention fixes the generalization.** The question's query is
+  matched against field keys by cosine similarity, so an unseen question
+  lands near a trained one in backbone space and reads the same fields —
+  semantic similarity flows through a real computation path instead of
+  being memorized. `gate`/`shift` (from `z_q`) are zero-init: at init v4 is
+  exactly the v2 forward for any question, preserving the cosine-attention
+  O(1) logit spread, and `(1 + gate)` avoids the `normalize(0)` NaN.
+- **Why the gate is load-bearing.** An additive shift alone
+  (`Q_j + shift(z_q)`) only *translates* every option query; it cannot
+  re-point matching. A per-field attention bias shared across options fails
+  the other way: small enough to be safe, the distractor field wins; large
+  enough to steer, every option reads the same field and the logits
+  collapse to a tie. The multiplicative gate reshapes each option's query
+  per dimension — that is what lets the same option text ("left") match the
+  ball's *position* field under `paddle_direction` and the *motion* field
+  under `ball_motion`.
+
+**Compositional question bank** (`head/question_bank.py`): 17 qids across
+two domains — base predicates, polarity inversions, derived predicates, and
+new question types over existing latents — each with ~40-50 phrasings
+(hand-written cores × prefix modifiers; prefix-only, because the backbone
+pools the last token). Golds come from `state.labels` or pure derivations,
+never hand-labeled. Training draws ONE sample per (state, qid) pair, so the
+sample count stays ~344k instead of the ~20M full cross-product.
+
+**Results** (2026-10-11, v4 checkpoint, 200-state subsample):
+
+| Split / question | v3 | v4 |
+|---|---|---|
+| `test_indist` (fixed 6-qid bank) | 95.7% | **94.3%** |
+| `test_heldout` (fixed 6-qid bank) | 71.5% | **75.7%** |
+| `test_breakout` `paddle_direction` | 98.0% | **94.0%** |
+| `test_breakout` `ball_motion` | 99.5% | 99.5% |
+| held-out phrasings, doc bank (`test_phrasings`) | — | **96.4%** |
+| held-out phrasings, breakout (`test_phrasings`) | — | **97.3%** |
+
+New-question targets, which v3 cannot answer at all:
+
+| qid | v3 | v4 |
+|---|---|---|
+| `not_urgent` | 3.0% | **97.4%** |
+| `no_pii` | 4.0% | **99.8%** |
+| `not_actionable` | 47.5% | **96.5%** |
+| `not_negative` | 48.5% | **99.9%** |
+| `pii_presence` (new choice type) | 61.0% | **100%** |
+| `contact_mentioned` (same gold, new text) | 70.5% | **100%** |
+
+The adversarial-slice diagnostic (breakout states where the ball's motion
+word disagrees with its position side — the "moving right, ball on the
+LEFT" case) went from 48.9% (first v4 attempt) to **89.5%** across the
+three question-conditioning designs.
+
+Trade-off: v4 gives up ~4pp of v3's breakout `paddle_direction` (v3
+overfit that domain with 2 questions and 3-4 phrasings). Remaining ideas
+are tracked in `docs/v4-open-issues.md`.
