@@ -50,18 +50,18 @@ head:
   max_epochs: 100
   patience: 10
 
-# Dynamic Decision Head (attention-based slot filling)
+# Dynamic Decision Head (v4: question-field attention)
 dynamic_head:
   hidden_dim: 256
   d_k: 128
   dropout: 0.1
   learning_rate: 0.001
   weight_decay: 0.00001
-  batch_size: 64
+  batch_size: 128
   max_epochs: 100
-  # The anchor phase plateaus (its val set already contains variant samples
+  # The anchor phase plateaus (its val set already contains stage-2 samples
   # the anchor-only model can't answer), so patience must outlast it —
-  # patience 10 occasionally stopped mid-anchor before the generalize jump.
+  # patience 10 occasionally stopped mid-anchor before the stage-2 jump.
   patience: 20
   anchor_epochs: 30
   variants_per_question: 3
@@ -74,6 +74,11 @@ dynamic_head:
   # marker-stripped, same gold) so the head survives caller-side re-shaping
   # (browsers joining {subject, body} values into one line, etc.).
   shape_augmentation: true
+  # v4: separate checkpoint filename — the preserved v3 head_dynamic.pt is
+  # never overwritten by a v4 retrain (this branch only).
+  checkpoint_filename: "head_dynamic_v4.pt"
+  question_logit_bias: false
+  question_resample_per_epoch: false
 
 # Post-training temperature calibration (per question)
 calibration:

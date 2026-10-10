@@ -295,6 +295,22 @@ def _doc_labels(state: TextState) -> dict:
     return state.labels
 
 
+def _gold_is_ball_left(state: TextState) -> bool:
+    """Own label if present; else derive from the paddle gold
+    (GOLD_BY_SIDE is 1:1: paddle "left" ⇔ ball on the left)."""
+    if "is_ball_left" in state.labels:
+        return bool(state.labels["is_ball_left"])
+    return state.labels[PADDLE_QID] == "left"
+
+
+def _gold_ball_moving(state: TextState) -> bool:
+    """Own label if present; else derive from the ball gold
+    (ball_motion "stay" ⇔ vx == 0)."""
+    if "ball_moving" in state.labels:
+        return bool(state.labels["ball_moving"])
+    return state.labels[MOTION_QID] != "stay"
+
+
 def build_question_bank() -> tuple[QuestionBankEntry, ...]:
     """Build the full compositional bank (deterministic, no randomness)."""
     entries: list[QuestionBankEntry] = []
@@ -333,21 +349,32 @@ def build_question_bank() -> tuple[QuestionBankEntry, ...]:
         ))
 
     # Breakout-domain entries. paddle/ball golds read state.labels; derived
-    # predicates come from the extended BreakoutLatents.labels().
+    # predicates read their own label when present (extended
+    # BreakoutLatents.labels) and fall back to deriving from the base
+    # paddle/ball golds (older datasets predate the extended labels —
+    # is_ball_left ⇔ paddle gold "left"; ball_moving ⇔ ball gold ≠ "stay").
+    # ball_rising has no base-gold derivation (vy isn't recoverable), so its
+    # applicability requires the label key.
     breakout_specs: list[tuple[str, str, tuple[str, ...] | None, "callable"]] = [
         (PADDLE_QID, "choice", BREAKOUT_OPTIONS, lambda s: s.labels[PADDLE_QID]),
         (MOTION_QID, "choice", BREAKOUT_OPTIONS, lambda s: s.labels[MOTION_QID]),
-        ("is_ball_left", "noul", None, lambda s: bool(s.labels["is_ball_left"])),
-        ("ball_moving", "noul", None, lambda s: bool(s.labels["ball_moving"])),
+        ("is_ball_left", "noul", None, _gold_is_ball_left),
+        ("ball_moving", "noul", None, _gold_ball_moving),
         ("ball_rising", "noul", None, lambda s: bool(s.labels["ball_rising"])),
     ]
     for qid, kind, options, gold in breakout_specs:
+        # ball_rising derives from vy, which is NOT recoverable from the
+        # base golds — applicability requires the label key (older datasets
+        # that predate the extended BreakoutLatents.labels skip it).
+        needs_key = qid == "ball_rising"
+        def applicable(s, _needs=needs_key):
+            return _is_breakout(s) and (not _needs or "ball_rising" in s.labels)
         entries.append(QuestionBankEntry(
             qid=qid,
             kind=kind,
             options=options if kind != "noul" else _noul_options(),
             phrasings=_compose_phrasings(BREAKOUT_CORES[qid], PREFIXES),
-            applicable=_is_breakout,
+            applicable=applicable,
             gold=gold,
         ))
 

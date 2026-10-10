@@ -1,0 +1,62 @@
+# v4 smoke training: tiny dataset + short schedule, verifies the pipeline
+# end-to-end (bank generation, two-stage curriculum, checkpoint v4 save).
+# NOT used for real training — see default.yaml.
+generator:
+  num_train: 200
+  num_test_indist: 50
+  num_test_heldout: 50
+  seed: 42
+  heldout_templates: ["report", "config_file"]
+  num_breakout_train: 100
+  num_breakout_test: 20
+
+questions:
+  choice:
+    sentiment:
+      options:
+        positive: "Positive sentiment"
+        negative: "Negative sentiment"
+        neutral: "Neutral sentiment"
+    urgency:
+      options:
+        low: "Low priority"
+        medium: "Medium priority"
+        high: "High priority"
+        critical: "Requires immediate attention"
+  score:
+    quality:
+      levels: ["Poor", "Fair", "Good", "Excellent"]
+  noul:
+    is_actionable: "Does this state require a response or action?"
+    contains_pii: "Does this state contain personally identifiable information?"
+    is_urgent: "Is this state time-sensitive?"
+
+model:
+  gguf_path: "models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf"
+  context_length: 2048
+  server_port: 8080
+  pooling: "last"
+
+dynamic_head:
+  hidden_dim: 256
+  d_k: 128
+  dropout: 0.1
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  batch_size: 64
+  max_epochs: 8
+  patience: 8
+  anchor_epochs: 3
+  variants_per_question: 3
+  breakout_weight: 3
+  include_summary_field: true
+  max_fields: 16
+  shape_augmentation: true
+  checkpoint_filename: "head_dynamic_v4.pt"
+  question_logit_bias: false
+  question_resample_per_epoch: false
+
+calibration:
+  holdout_fraction: 0.1
+  lr: 0.01
+  max_iter: 100

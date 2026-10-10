@@ -875,12 +875,12 @@ class TestPaddleDirectionVariants:
     """The paddle_direction synonym map yields shuffled left/right/stay variants."""
 
     def test_variants_generated(self):
-        from decision_lab.head.dynamic_train import _generate_choice_variants
+        from decision_lab.head.dynamic_train import _variants_for_bank_entry
+        from decision_lab.head.question_bank import build_question_bank
         from random import Random
 
-        variants = _generate_choice_variants(
-            ["left", "right", "stay"], "paddle_direction", Random(0), 3,
-        )
+        entry = next(e for e in build_question_bank() if e.qid == "paddle_direction")
+        variants = _variants_for_bank_entry(entry, 3, Random(0))
         assert len(variants) == 3
         for v in variants:
             assert len(v["options"]) == 3
@@ -891,12 +891,12 @@ class TestPaddleDirectionVariants:
             assert v["options"] != ["left", "right", "stay"]
 
     def test_gold_map_permutes_consistently(self):
-        from decision_lab.head.dynamic_train import _generate_choice_variants
+        from decision_lab.head.dynamic_train import _variants_for_bank_entry
+        from decision_lab.head.question_bank import build_question_bank
         from random import Random
 
-        variants = _generate_choice_variants(
-            ["left", "right", "stay"], "paddle_direction", Random(1), 3,
-        )
+        entry = next(e for e in build_question_bank() if e.qid == "paddle_direction")
+        variants = _variants_for_bank_entry(entry, 3, Random(1))
         for v in variants:
             # gold_map values must be a permutation of the option set
             assert sorted(v["gold_map"].values()) == sorted(v["options"])
