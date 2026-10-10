@@ -326,7 +326,7 @@ def _load_dynamic_agent(
     """Load a DynamicHeadAgent (trained or fallback to random init)."""
     from decision_lab import MODELS_DIR
 
-    path = MODELS_DIR / "head_dynamic.pt"
+    path = MODELS_DIR / cfg.dynamic_head.checkpoint_filename
     question_spec_copy = dict(question_spec)
 
     try:

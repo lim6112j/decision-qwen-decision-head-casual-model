@@ -446,7 +446,129 @@ def run_benchmark(
     if breakout_metrics is not None:
         all_metrics["test_breakout"] = breakout_metrics
 
+    # v4 held-out phrasing eval: the fixed-bank rows above only test the
+    # canonical phrasing; the compositional bank's non-canonical phrasings
+    # (and its new qids) measure unseen-question-target generalization.
+    phrasing_metrics = _benchmark_dynamic_phrasings(
+        data_dir, cfg, server, models_dir, bc, question_spec,
+    )
+    if phrasing_metrics is not None:
+        all_metrics["test_phrasings"] = phrasing_metrics
+
     return all_metrics
+
+
+def _benchmark_dynamic_phrasings(
+    data_dir: Path,
+    cfg: Config,
+    server,
+    models_dir: Path,
+    bc,
+    question_spec: dict,
+) -> dict[str, AgentMetrics] | None:
+    """Benchmark the v4 head on NON-canonical bank phrasings + new qids.
+
+    For each test split (indist, breakout): every bank entry applicable to
+    the split's states is evaluated under its held-out phrasings (entries
+    1..n) plus — for qids outside the fixed config bank (inversions, new
+    types, breakout derived predicates) — also its canonical phrasing,
+    which no other benchmark row covers. Golds come from the bank's
+    programmatic gold functions (exact by construction).
+    """
+    from decision_lab.head.question_bank import build_question_bank
+
+    dynamic_head, dynamic_temp = _load_dynamic_for_benchmark(cfg, models_dir, device=get_device())
+    if not dynamic_head.state_set:
+        return None
+
+    device = get_device()
+    bank = build_question_bank()
+    all_metrics: dict[str, AgentMetrics] = {}
+
+    splits = [
+        ("test_indist", data_dir / "test_indist.jsonl",
+         data_dir / "features_test_indist_fields.npz"),
+        ("test_breakout", data_dir / "test_breakout.jsonl",
+         data_dir / "features_test_breakout_fields.npz"),
+    ]
+
+    for split_name, test_path, field_path in splits:
+        if not test_path.exists() or not field_path.exists():
+            continue
+        states = load_dataset(test_path)
+        field_sets = load_field_features(field_path)[0]
+        if bc.max_test_states > 0 and len(states) > bc.max_test_states:
+            rng = np.random.RandomState(cfg.generator.seed)
+            idx = rng.choice(len(states), size=bc.max_test_states, replace=False)
+            idx.sort()
+            states = [states[i] for i in idx]
+            field_sets = [field_sets[i] for i in idx]
+
+        # All phrasings + option texts the bank will need on this split
+        spec_by_qid = {}
+        for entry in bank:
+            if any(entry.applicable(s) for s in states):
+                for phrasing in entry.phrasings:
+                    spec_by_qid.setdefault(entry.qid, entry.config(phrasing))
+        option_emb_cache = {
+            t: torch.tensor(emb, dtype=torch.float32, device=device)
+            for t, emb in _embed_options_batch(
+                server, sorted(_collect_all_bank_texts(bank, spec_by_qid)),
+            ).items()
+        }
+
+        # Evaluate phrasing i >= 1 for every qid; qids absent from the fixed
+        # config bank are also evaluated at phrasing 0.
+        fixed_qids = set(question_spec)
+        per_q_correct: dict[str, int] = {}
+        per_q_total: dict[str, int] = {}
+        for i, state in enumerate(states):
+            state_tensor = torch.tensor(field_sets[i], dtype=torch.float32, device=device)
+            state_tensor = state_tensor.unsqueeze(0)  # (1, M, D)
+            for entry in bank:
+                if not entry.applicable(state):
+                    continue
+                for phrasing_idx, phrasing in enumerate(entry.phrasings):
+                    if phrasing_idx == 0 and entry.qid in fixed_qids:
+                        continue   # canonical already covered by fixed-bank rows
+                    q = entry.config(phrasing)
+                    texts = question_option_texts(q)
+                    opt_embs = torch.stack([option_emb_cache[t] for t in texts])
+                    q_emb = option_emb_cache[phrasing]
+                    with torch.no_grad():
+                        scores = dynamic_head.forward_choice(
+                            state_tensor, opt_embs, question_emb=q_emb,
+                        )
+                    decoded = decode_dynamic_answer(q, scores, dynamic_temp)
+                    gold = entry.gold(state)
+                    correct = is_correct_dynamic(q, decoded["predicted"], gold)
+                    per_q_correct.setdefault(entry.qid, 0)
+                    per_q_total.setdefault(entry.qid, 0)
+                    per_q_correct[entry.qid] += int(correct)
+                    per_q_total[entry.qid] += 1
+
+        if not per_q_total:
+            continue
+        per_q_acc = {
+            qid: per_q_correct[qid] / per_q_total[qid] for qid in per_q_total
+        }
+        all_metrics[f"{split_name}"] = AgentMetrics(
+            mean_accuracy=float(np.mean(list(per_q_acc.values()))),
+            per_question_accuracy=per_q_acc,
+            mean_confidence=0.0, ece=0.0, ece_per_question={},
+            mean_latency_ms=0.0, median_latency_ms=0.0, p99_latency_ms=0.0,
+        )
+    return all_metrics or None
+
+
+def _collect_all_bank_texts(bank, spec_by_qid: dict) -> list[str]:
+    """Every option/level text AND phrasing the paraphrase eval will embed."""
+    texts: set[str] = {"false", "true"}
+    for entry in bank:
+        if entry.qid in spec_by_qid:
+            texts.update(entry.options or ())
+            texts.update(entry.phrasings)
+    return texts
 
 
 def _benchmark_dynamic_breakout(
@@ -547,7 +669,7 @@ def _load_dynamic_for_benchmark(
     (stale/corrupt artifact) and is raised rather than silently degrading
     to random weights.
     """
-    path = models_dir / "head_dynamic.pt"
+    path = models_dir / cfg.dynamic_head.checkpoint_filename
     try:
         head = load_dynamic_head(str(path), device=device)
     except FileNotFoundError:

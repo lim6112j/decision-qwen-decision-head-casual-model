@@ -105,12 +105,17 @@ Breakout example:
 → `{"predicted": "left", ...}` — the ball's side decides the direction even
 when its motion points the other way ("moving right … away from the paddle").
 
-Since v3, the `question` string is functional: it is embedded with the same
-backbone and FiLM-modulates each option's query before it reads the state
-field set. One head answers different questions over the same `custom_text`
-(e.g. Breakout `paddle_direction` vs `ball_motion` share the options
-`left/right/stay` but have independent golds). Pre-v3 checkpoints ignore
-the question string — retrain and restart the server to enable it.
+Since v4, the `question` string is functional: it is embedded with the same
+backbone and its embedding queries the state field set directly (question-
+field attention — the question attends to the fields that answer it, and a
+zero-init residual read-out re-interprets each option's attended summary).
+One head answers different questions over the same `custom_text` (e.g.
+Breakout `paddle_direction` vs `ball_motion` share the options
+`left/right/stay` but have independent golds). The head was trained on a
+compositional question bank (~17 qids, ~40 phrasings per qid), so
+paraphrases and NOT-form questions generalize; questions far outside the
+bank's phrasing distribution can still degrade — keep `question` close to
+a natural-language question about the state's fields.
 
 ### Response
 
