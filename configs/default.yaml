@@ -70,6 +70,10 @@ dynamic_head:
   # Must stay in sync between feature extraction and inference (same config).
   include_summary_field: true
   max_fields: 16
+  # Shape augmentation: variant duplicates of document states (flattened /
+  # marker-stripped, same gold) so the head survives caller-side re-shaping
+  # (browsers joining {subject, body} values into one line, etc.).
+  shape_augmentation: true
 
 # Post-training temperature calibration (per question)
 calibration:

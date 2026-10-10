@@ -73,6 +73,13 @@ class DynamicHeadConfig:
     # between feature extraction and inference — enforced via config.
     include_summary_field: bool = True
     max_fields: int = 16
+    # Add shape-variant duplicates of document states (flattened /
+    # marker-stripped, same gold — states/shapes.py) to dynamic-head
+    # training. The field-set head collapses to near-uniform logits on
+    # untrained shapes (bare joined values, stripped markers), which real
+    # callers send; augmentation teaches shape invariance. Breakout states
+    # are excluded — they are trained bare by design.
+    shape_augmentation: bool = False
 
 
 @dataclass

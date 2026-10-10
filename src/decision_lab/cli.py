@@ -127,12 +127,15 @@ def cmd_train_dynamic(args):
     dcfg = cfg.dynamic_head
     print(f"Training dynamic head (v2 field-set): {dcfg.hidden_dim} hidden, d_k={dcfg.d_k}, "
           f"anchor_epochs={dcfg.anchor_epochs}, variants={dcfg.variants_per_question}, "
-          f"summary_field={dcfg.include_summary_field}")
+          f"summary_field={dcfg.include_summary_field}, "
+          f"shape_augmentation={dcfg.shape_augmentation}")
 
     with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
         samples = generate_dynamic_training_data(
             states, field_sets, question_spec, server,
             num_variants_per_question=dcfg.variants_per_question,
+            shape_augmentation=dcfg.shape_augmentation,
+            include_summary_field=dcfg.include_summary_field,
         )
         train_dynamic_head(
             samples, cfg, args.models_dir / "head_dynamic.pt",

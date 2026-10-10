@@ -311,6 +311,8 @@ def generate_dynamic_training_data(
     server,
     rng: Random | None = None,
     num_variants_per_question: int = 3,
+    shape_augmentation: bool = False,
+    include_summary_field: bool = True,
 ) -> list[DynamicTrainingSample]:
     """Generate (state, options, gold) training samples.
 
@@ -325,6 +327,14 @@ def generate_dynamic_training_data(
         server: LlamaServer (must be running) for embedding option texts.
         rng: random state for shuffling.
         num_variants_per_question: how many option-set variants to generate.
+        shape_augmentation: add shape-variant duplicates of document states
+            (flattened / marker-stripped re-renderings with identical gold —
+            see states/shapes.py). Breakout states are skipped: they are
+            trained bare, and shape invariance there points the wrong way
+            (key prefixes flip breakout answers).
+        include_summary_field: must match feature extraction (same config key
+            as dynamic_head.include_summary_field) so variant field sets
+            chunk identically with cached ones.
 
     Returns:
         list of DynamicTrainingSample.
@@ -388,9 +398,48 @@ def generate_dynamic_training_data(
             for text, emb in zip(batch, embs):
                 text_to_emb[text] = np.array(emb, dtype=np.float32)
 
+    # Shape-variant duplicates of document states: same latents → same gold,
+    # different surface shape. Their field sets don't exist in the precomputed
+    # feature caches (those hold original-shape texts only), so embed them here
+    # — the server is already up for option/question embeddings. Breakout
+    # states are skipped; see states/shapes.py for why.
+    extra: list[tuple[np.ndarray, int]] = []   # (field_set_emb, state_index)
+    if shape_augmentation:
+        from decision_lab.states.dataset import TextState
+        from decision_lab.states.fields import state_field_set
+        from decision_lab.states.shapes import shape_variants
+
+        texts: list[str] = []
+        pending: list[tuple[int, list[str]]] = []   # (state_index, field_texts)
+        for i, state in enumerate(states):
+            if state.state_type.startswith("breakout"):
+                continue
+            for variant in shape_variants(state.text):
+                vstate = TextState(doc_id=-1, state_type="custom", text=variant, labels={})
+                field_texts = state_field_set(vstate, include_summary_field)
+                pending.append((i, field_texts))
+                texts.extend(field_texts)
+        unique = list(dict.fromkeys(texts))
+        print(f"  shape augmentation: embedding {len(unique)} unique variant field texts...")
+        emb_by_text: dict[str, np.ndarray] = {}
+        batch_size = 32
+        for i in range(0, len(unique), batch_size):
+            batch = unique[i : i + batch_size]
+            embs = server.embed(batch)
+            for text, emb in zip(batch, embs):
+                emb_by_text[text] = np.array(emb, dtype=np.float32)
+        for state_index, field_texts in pending:
+            extra.append((
+                np.stack([emb_by_text[t] for t in field_texts]),
+                state_index,
+            ))
+        print(f"  shape augmentation: {len(extra)} variant states added")
+
     samples = []
-    for i, state in enumerate(states):
-        state_fields_emb = field_features[i]
+
+    def emit(i: int, state_fields_emb: np.ndarray) -> None:
+        """Emit one sample per question config for one state embedding."""
+        state = states[i]
         for qc in all_question_configs:
             q = qc["question"]
             qid = qc["qid"]
@@ -444,8 +493,17 @@ def generate_dynamic_training_data(
                 is_variant=bool(qc.get("is_variant", False)),
             ))
 
+    for i in range(len(states)):
+        emit(i, field_features[i])
+    for field_emb, state_index in extra:
+        # Shape variants ride in both curriculum phases (is_variant=False):
+        # shape invariance is part of the anchor task, not a generalization
+        # axis saved for phase 2.
+        emit(state_index, field_emb)
+
     print(f"  generated {len(samples)} training samples "
-          f"({len(base_questions)} base + {len(variants)} variant questions × {len(states)} states)")
+          f"({len(base_questions)} base + {len(variants)} variant questions × "
+          f"{len(states) + len(extra)} states incl. shape variants)")
     return samples
 
 
