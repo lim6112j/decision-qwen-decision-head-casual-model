@@ -115,14 +115,72 @@ class TestStateFieldSet:
 
     def test_no_summary(self):
         state = TextState(doc_id=0, state_type="t", text="whole text", labels={},
-                          fields=["f1"])
-        assert state_field_set(state, include_summary=False) == ["f1"]
+                          fields=["f1", "f2"])
+        assert state_field_set(state, include_summary=False) == ["f1", "f2"]
 
     def test_summary_guarantees_nonempty(self):
         """Even a whitespace-only text yields M >= 1 with a summary field."""
         state = TextState(doc_id=0, state_type="t", text="   ", labels={})
         fields = state_field_set(state, include_summary=True)
         assert len(fields) >= 1 and fields[0] == "   "
+
+
+class TestDegenerateSetGuard:
+    """A field set whose entries are all identical defeats the head:
+
+    identical attention keys → uniform attention → one context vector →
+    exactly equal logits for every option. state_field_set must guarantee
+    >= 2 distinct entries whenever the text can be split at all.
+    """
+
+    def test_single_sentence_with_summary_gets_clause_split(self):
+        text = ("The ball is clearly to the LEFT of the paddle (gap 124 px) "
+                "and moving right and up, away from the paddle.")
+        state = TextState(doc_id=0, state_type="t", text=text, labels={})
+        fields = state_field_set(state, include_summary=True)
+        # summary + the one sentence + 2 comma clauses
+        assert len(fields) == 4
+        assert len(set(fields)) >= 2
+        assert fields[0] == text
+        assert fields[2] == ("The ball is clearly to the LEFT of the paddle "
+                             "(gap 124 px) and moving right and up")
+        assert fields[3] == "away from the paddle."
+
+    def test_no_delimiters_falls_back_to_word_chunks(self):
+        text = "one two three four five six seven eight nine"
+        state = TextState(doc_id=0, state_type="t", text=text, labels={})
+        fields = state_field_set(state, include_summary=True)
+        # summary + text + 2 word chunks (9 words / 6 per chunk)
+        assert len(fields) == 4
+        assert len(set(fields)) >= 2
+
+    def test_two_word_text_yields_two_distinct_fields(self):
+        text = "short state"
+        state = TextState(doc_id=0, state_type="t", text=text, labels={})
+        fields = state_field_set(state, include_summary=True)
+        assert len(fields) >= 3 and len(set(fields)) >= 2
+
+    def test_single_word_stays_degenerate(self):
+        """A one-word text cannot be split — [text, text] is the best any
+        splitter can do."""
+        state = TextState(doc_id=0, state_type="t", text="ready", labels={})
+        assert state_field_set(state, include_summary=True) == ["ready", "ready"]
+
+    def test_multi_field_sets_are_untouched(self):
+        """States that already resolve to >= 2 distinct fields must come
+        back byte-identical — the guard only fires on degenerate sets."""
+        state = TextState(doc_id=0, state_type="t",
+                          text="first sentence. second sentence.", labels={})
+        assert state_field_set(state, include_summary=True) == [
+            "first sentence. second sentence.", "first sentence.", "second sentence.",
+        ]
+
+    def test_guard_applies_without_summary(self):
+        state = TextState(doc_id=0, state_type="t",
+                          text="clause one, clause two.", labels={})
+        assert state_field_set(state, include_summary=False) == [
+            "clause one, clause two.", "clause one", "clause two.",
+        ]
 
 
 class TestBreakoutChunkingConsistency:

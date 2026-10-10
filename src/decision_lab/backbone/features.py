@@ -63,13 +63,18 @@ def _cache_fingerprint(data_path: Path, include_summary_field: bool) -> str:
     A stale cache silently returning embeddings for a DIFFERENT dataset is
     catastrophic (training pairs embeddings of one text set with labels of
     another) and nearly invisible — the counts barely differ. Fingerprint
-    the source file bytes plus every setting that changes the output.
+    the source file bytes plus every setting that changes the output —
+    including the field splitter version, since its chunking decides which
+    texts get embedded.
     """
     import hashlib
+
+    from decision_lab.states.fields import SPLITTER_VERSION
 
     h = hashlib.sha256()
     h.update(data_path.read_bytes())
     h.update(f"|include_summary_field={include_summary_field}".encode())
+    h.update(f"|splitter_version={SPLITTER_VERSION}".encode())
     return h.hexdigest()
 
 

@@ -23,10 +23,39 @@ if TYPE_CHECKING:
 
 MAX_FIELDS = 16
 
+# Bumped whenever splitting behavior changes output for existing texts, so
+# feature-cache fingerprints (backbone/features.py) invalidate: v2 added the
+# degenerate-set guard (_split_single_part) in state_field_set.
+SPLITTER_VERSION = 2
+
 # Sentence boundary: ., !, ? followed by whitespace
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+# Clause boundary inside a sentence: comma, semicolon, colon
+_CLAUSE_RE = re.compile(r"[,;:]\s+")
 # KEY=VALUE log token (no internal whitespace)
 _LOG_TOKEN_RE = re.compile(r"\b[A-Za-z_][A-Za-z_0-9]*=[^\s]+")
+
+
+def _split_single_part(text: str) -> list[str]:
+    """Split a one-part text into ≥2 distinct fields, or return ``[text]``.
+
+    Guard against the degenerate field set: when every field is identical
+    (a single sentence, where the summary field duplicates the only field),
+    the v2 head cannot discriminate options — identical attention keys give
+    uniform attention, so every option reads the same context vector and
+    the logits come out exactly equal. Clause boundaries (most natural
+    break inside a sentence) are tried first, then a half-split into 2 word
+    chunks. A text with a single word cannot be split at all — ``[text]``
+    is returned and the set stays degenerate; nothing finer exists.
+    """
+    clauses = [part.strip() for part in _CLAUSE_RE.split(text) if part.strip()]
+    if len(clauses) >= 2:
+        return _merge_into_chunks(clauses, MAX_FIELDS)
+    words = text.split()
+    if len(words) < 2:
+        return [text]
+    size = -(-len(words) // 2)  # ceil division: exactly 2 chunks
+    return [" ".join(words[:size]), " ".join(words[size:])]
 
 
 def _flatten_json(value, prefix: str = "") -> list[str]:
@@ -127,8 +156,19 @@ def state_field_set(state: "TextState", include_summary: bool) -> list[str]:
 
     The summary guarantees M >= 1, gives the head global context, and
     mitigates distribution shift from heuristic field splitting.
+
+    Degenerate-set guard: a set whose fields are all identical (single
+    sentence + its own summary) gives uniform attention and identical
+    logits for every option — appending a clause/word split restores ≥2
+    distinct fields. Only single-token texts stay degenerate; there is
+    nothing finer to split into.
     """
     fields = state_fields(state)
     if include_summary:
-        return [state.text] + fields
+        fields = [state.text] + fields
+    if len(set(fields)) < 2:
+        existing = set(fields)
+        fields = fields + [
+            part for part in _split_single_part(state.text) if part not in existing
+        ]
     return fields

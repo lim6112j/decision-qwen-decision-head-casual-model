@@ -64,19 +64,22 @@ class TestExtractFieldFeatures:
                 data_path, cache_path, MockServer(),
                 include_summary_field=True,
             )
-            # Each state: 1 summary (whole text) + 1 sentence field.
-            # (The text has a single sentence — "Note i: ..." has no ". " break.)
-            assert counts.tolist() == [2, 2, 2]
-            assert feats.shape == (6, 1024)
+            # Each state: 1 summary (whole text) + 1 sentence field, plus the
+            # degenerate-set guard: the text is a single sentence ("Note i: ..."
+            # has no ". " break"), so summary duplicates the only field — the
+            # guard appends the clause split (3 parts at ", " and ": ") for
+            # 5 fields total.
+            assert counts.tolist() == [5, 5, 5]
+            assert feats.shape == (15, 1024)
             assert cache_path.exists()
 
             field_sets, counts2 = load_field_features(cache_path)
-            assert counts2.tolist() == [2, 2, 2]
+            assert counts2.tolist() == [5, 5, 5]
             assert len(field_sets) == 3
             for fs in field_sets:
-                assert fs.shape == (2, 1024)
+                assert fs.shape == (5, 1024)
             # State i owns rows offset_i : offset_i + M_i (contiguous layout)
-            assert np.array_equal(feats[2:4], field_sets[1])
+            assert np.array_equal(feats[5:10], field_sets[1])
 
     def test_dedupes_shared_texts(self):
         """Identical fields across states are embedded once."""
