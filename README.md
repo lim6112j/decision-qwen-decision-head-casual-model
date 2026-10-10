@@ -46,6 +46,45 @@ bash scripts/run_all.sh
 python -m decision_lab ui         # opens http://127.0.0.1:8000
 ```
 
+## Running a specific dynamic-head version (v3 / v4)
+
+The dynamic head has two shipped architectures. They are **not
+interchangeable** — v4's code refuses `arch_version <= 3` on load by design
+(clean break: the FiLM modules v3 needs were deleted), so each version needs
+its own checkout.
+
+| version | code | checkpoint | question conditioning |
+|---|---|---|---|
+| v3 | tag `v3-head` (`a1abd9a`) | `models/head_dynamic.pt` | FiLM on the option queries |
+| v4 | `main` after the v4 merge | `models/head_dynamic_v4.pt` | question-field attention (answers unseen question targets) |
+
+`configs/default.yaml` → `dynamic_head.checkpoint_filename` selects which
+checkpoint the webapp and the benchmark load. Both checkpoints can live side
+by side in `models/`; **`models/` is gitignored**, so a fresh checkout does
+not bring the `.pt` files with it.
+
+Running v3 after v4 lands — no retraining needed, the checkpoint is a file:
+
+```bash
+git worktree add ../decision-v3 v3-head          # v3-era code
+cp models/head_dynamic.pt ../decision-v3/models/ # models/ is gitignored
+cd ../decision-v3 && python -m decision_lab ui   # separate port / venv
+```
+
+Verified 2026-10-11: the code at tag `v3-head` loads
+`models/head_dynamic.pt` and runs a forward pass unchanged.
+
+Two more things worth knowing:
+
+- **One dynamic head per process.** `build_agents` registers a single
+  `head_dynamic`; switching versions means switching the config (or running
+  two checkouts on different ports), not selecting per request.
+- **Evaluation needs the feature caches** (`data/features_*_fields.npz`).
+  They are gitignored too; a fresh checkout can regenerate them with
+  `python -m decision_lab extract`, which costs llama-server embedding time
+  (see `docs/v4-open-issues.md` for the `http_proxy` trap that makes this
+  much slower than it should be).
+
 ## Configuration
 
 Edit `configs/default.yaml` to adjust gridworld size, model path, head hyperparameters, etc.
