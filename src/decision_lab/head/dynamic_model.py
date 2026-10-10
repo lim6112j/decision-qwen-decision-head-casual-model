@@ -49,9 +49,16 @@ v4 (state_set=True, arch_version 4) — question-field attention:
     form is load-bearing: a plain additive z + g·W·z_q is constant across
     options and cancels in the softmax over options, while the concat MLP
     sees per-option z_j and can re-interpret attended content.
+    A per-field relevance bias from the question (q_field) is also added to
+    the option attention logits, so the question steers WHICH fields every
+    option reads. This is load-bearing, not decorative: without it an
+    adversarial lexical pull wins — the breakout state "ball on the LEFT …
+    moving right" flips paddle_direction to the motion word (measured on the
+    v4 head before this term: 89.6% when motion agreed with position, 48.9%
+    when it disagreed; v3's query-side FiLM carried the same steering power).
     The option↔field matching path (opt_query → field_key attention) is
-    question-agnostic and shared — an OOD question embedding can never
-    corrupt it; all question re-interpretation happens at the read-out.
+    otherwise question-agnostic and shared, so an OOD question cannot
+    corrupt it beyond re-weighting fields by similarity.
     qz_readout is ZERO-initialized (weight AND bias): at init, output ==
     v2 forward for ANY question, preserving the O(1) cosine-attention logit
     spread (see __init__ note). Gradients still reach qz_readout at W=0
@@ -156,8 +163,8 @@ class DynamicDecisionHead(nn.Module):
     state_mask: (B, M) bool, True = valid field (v2 only; ignored in v1).
 
     v1 modules (trunk/query_proj/key_proj/noul_head) and v2+ modules
-    (field_enc/field_key/opt_query/score_head/q_question/attn_scale_q/
-    qz_readout) are mutually exclusive: only the ones matching
+    (field_enc/field_key/opt_query/score_head/q_field/q_question/
+    attn_scale_q/qz_readout) are mutually exclusive: only the ones matching
     ``state_set`` exist.
     """
 
@@ -197,6 +204,23 @@ class DynamicDecisionHead(nn.Module):
             # heads' softmax temperature).
             self.q_question = nn.Linear(input_dim, d_k)
             self.attn_scale_q = nn.Parameter(torch.tensor(float(d_k) ** 0.5))
+            # v4 question→field relevance bias: the question re-weights which
+            # fields EVERY option reads (a per-field, not per-option, additive
+            # term on the option attention logits). Load-bearing, not optional:
+            # with a question-agnostic option path alone, an adversarial
+            # lexical pull wins — the ball "on the LEFT ... moving right"
+            # state flips paddle_direction answers to the motion word
+            # (measured: 89.6% when motion agrees with position, 48.9% when it
+            # disagrees). The question steers attention to the position field.
+            # Bounded by construction: the bias is (learnable scale) × cosine
+            # (K, q_dir) ∈ [-scale, scale], NOT a raw dot product of an
+            # unbounded projection — an unbounded bias lets the question
+            # saturate the option attention and collapse every option onto the
+            # same field distribution (measured: identical logits for all
+            # options, the symmetric plateau). A separate scale parameter,
+            # init 0, keeps the term exactly identity at init.
+            self.q_field = nn.Linear(input_dim, d_k)
+            self.q_field_scale = nn.Parameter(torch.zeros(1))
             # Zero-init residual read-out: at init, output == v2 forward for
             # ANY question (stall-recurrence guard). LoRA-style bootstrap —
             # first Linear default-init, GELU, LAST Linear zero-init:
@@ -279,10 +303,16 @@ class DynamicDecisionHead(nn.Module):
         field_repr = self.field_enc(state)                        # (B, M, H)
         K = F.normalize(self.field_key(field_repr), dim=-1)       # (B, M, d_k)
 
-        # Option path — question-agnostic, shared across all questions
+        # Option path — shared across all questions
         Q = F.normalize(self.opt_query(option_embeddings), dim=-1)  # (B, N, d_k)
         # (B, N, d_k) × (B, d_k, M) → (B, N, M)
         attn = torch.bmm(Q, K.transpose(1, 2)) * self.attn_scale
+        # v4 question→field relevance bias (per-field, shared across options;
+        # zero at init → identity). Bounded: scale × cosine(K, q_dir), so the
+        # question can re-weight fields without saturating the option attention.
+        q_dir = F.normalize(self.q_field(question_emb), dim=-1)   # (B, d_k)
+        rel = torch.bmm(K, q_dir.unsqueeze(-1)).squeeze(-1)       # (B, M) ∈ [-1,1]
+        attn = attn + self.q_field_scale * rel.unsqueeze(1)       # (B, N, M)
         if state_mask is not None:
             if state_mask.dim() == 1:
                 state_mask = state_mask.unsqueeze(0)              # (M,) → (1, M)

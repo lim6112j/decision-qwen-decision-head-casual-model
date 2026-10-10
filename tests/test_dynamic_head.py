@@ -450,6 +450,7 @@ class TestQuestionAttention:
         assert hasattr(set_head, "q_question")
         assert hasattr(set_head, "attn_scale_q")
         assert hasattr(set_head, "qz_readout")
+        assert hasattr(set_head, "q_field")
         # v3 FiLM modules are gone
         for gone in ("q_mod_scale", "q_mod_bias", "z_mod_scale", "z_mod_bias"):
             assert not hasattr(set_head, gone)
@@ -459,6 +460,72 @@ class TestQuestionAttention:
         gradient is alive at init; the first layer follows)."""
         assert torch.count_nonzero(set_head.qz_readout[2].weight) == 0
         assert torch.count_nonzero(set_head.qz_readout[2].bias) == 0
+
+    def test_q_field_zero_init(self, set_head):
+        """The question→field bias is zero at init → identity on the option
+        attention (same guard as the read-out): its scale starts at 0."""
+        assert set_head.q_field_scale.item() == 0.0
+        assert hasattr(set_head, "q_field")
+
+    def test_q_field_steers_option_attention(self, set_head):
+        """Once q_field is non-zero the question changes WHICH fields the
+        options read (attention weights depend on the question) — the
+        anti-lexical-pull path."""
+        set_head.eval()
+        torch.manual_seed(5)
+        with torch.no_grad():
+            set_head.q_field.weight.normal_(0, 0.5)
+            set_head.q_field_scale.fill_(1.0)
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(2, 64)
+        q_a, q_b = torch.randn(64), torch.randn(64)
+        with torch.no_grad():
+            out_a = set_head.forward_choice(fields, opt_embs, question_emb=q_a)
+            out_b = set_head.forward_choice(fields, opt_embs, question_emb=q_b)
+        assert not torch.allclose(out_a, out_b, atol=1e-5)
+        # and a genuinely different question re-weights fields (not a
+        # uniform shift): masked-field handling still holds
+        with torch.no_grad():
+            padded = torch.zeros(6, 64)
+            padded[:4] = fields
+            mask = torch.tensor([True, True, True, True, False, False])
+            clean = set_head.forward_choice(fields, opt_embs, question_emb=q_a)
+            masked = set_head.forward_choice(
+                padded, opt_embs, state_mask=mask, question_emb=q_a,
+            )
+        assert torch.allclose(clean, masked, atol=1e-5)
+
+    def test_q_field_lexical_pull_resolution(self):
+        """The term q_field adds: the question re-weights which fields every
+        option reads, so two different questions over the SAME state and
+        options produce materially different scores. This is the anti-
+        lexical-pull path — without it the option attention is question-
+        agnostic and a dominant distractor field wins regardless of question.
+        Uses a realistic field count; at 2 fields the shared bias collapses
+        option discrimination into the symmetric plateau."""
+        torch.manual_seed(4)   # head init too — deterministic vs suite order
+        set_head = DynamicDecisionHead(
+            input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True,
+        )
+        set_head.eval()
+        # Local generator: isolated from whatever global RNG state other
+        # tests left behind (this test depends on exact draw magnitudes).
+        g = torch.Generator().manual_seed(4)
+        fields = torch.randn(6, 64, generator=g)    # (M=6)
+        opt_embs = torch.randn(3, 64, generator=g)  # (N=3)
+        q_a = torch.randn(64, generator=g)
+        q_b = torch.randn(64, generator=g) + 2.0
+        with torch.no_grad():
+            set_head.q_field.weight.normal_(0, 0.5, generator=g)
+            set_head.q_field_scale.fill_(10.0)
+            s_a = set_head.forward_choice(fields, opt_embs, question_emb=q_a)
+            s_b = set_head.forward_choice(fields, opt_embs, question_emb=q_b)
+            s_none = set_head.forward_choice(fields, opt_embs, question_emb=None)
+        # material difference, not float noise (the cosine-bounded bias is
+        # deliberately gentle — the scale, not the direction, sets magnitude)
+        assert float((s_a - s_b).abs().max()) > 0.05
+        # and the question is what drives it: the zero question differs too
+        assert not torch.allclose(s_a, s_none, atol=1e-4)
 
     def test_attn_scale_q_init(self, set_head):
         """Separate scale, init √d_k — the O(1) cosine logit-spread property

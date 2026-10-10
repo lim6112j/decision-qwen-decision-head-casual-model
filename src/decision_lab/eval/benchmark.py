@@ -22,6 +22,7 @@ from decision_lab.head.dynamic_model import (
     DynamicDecisionHead,
     create_random_dynamic_head,
     decode_dynamic_answer,
+    is_correct_dynamic,
     load_dynamic_head,
     make_choice_question,
     make_noul_question,
