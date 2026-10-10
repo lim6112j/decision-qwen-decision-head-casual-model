@@ -28,6 +28,7 @@ from decision_lab.head.dynamic_model import (
     make_score_question,
     question_option_texts,
 )
+from decision_lab.head.dynamic_train import default_question_text
 from decision_lab.backbone.features import load_field_features
 from decision_lab.states.dataset import load_dataset
 
@@ -165,36 +166,49 @@ def _run_dynamic_forward(
 ) -> dict:
     """Run dynamic head on one state against the fixed question bank.
 
+    v3: each question's text conditions the option queries — the cache must
+    contain the question strings as well as option texts (see
+    _collect_option_texts).
+
     Returns {qid: decoded answer dict} — same format as predict_all for TypedDecisionHead.
     """
     results = {}
     for qid, spec in question_spec.items():
         kind = spec["type"]
         if kind == "noul":
+            question_text = spec.get("question", qid)
             opt_embs = torch.stack([
                 option_emb_cache["false"], option_emb_cache["true"]
             ])  # (2, D)
-            scores = head.forward_choice(state_tensor, opt_embs)
+            scores = head.forward_choice(
+                state_tensor, opt_embs, question_emb=option_emb_cache[question_text],
+            )
             results[qid] = decode_dynamic_answer(
-                make_noul_question(spec.get("question", qid)), scores, temperature,
+                make_noul_question(question_text), scores, temperature,
             )
         elif kind == "choice":
             option_texts = spec["options"]
+            question_text = default_question_text(qid)
             opt_embs = torch.stack(
                 [option_emb_cache[t] for t in option_texts]
             )  # (n_opts, D)
-            scores = head.forward_choice(state_tensor, opt_embs)
+            scores = head.forward_choice(
+                state_tensor, opt_embs, question_emb=option_emb_cache[question_text],
+            )
             results[qid] = decode_dynamic_answer(
-                make_choice_question(option_texts, qid), scores, temperature,
+                make_choice_question(option_texts, question_text), scores, temperature,
             )
         else:  # score
             level_texts = spec["levels"]
+            question_text = default_question_text(qid)
             opt_embs = torch.stack(
                 [option_emb_cache[t] for t in level_texts]
             )  # (n_levels, D)
-            scores = head.forward_score(state_tensor, opt_embs)
+            scores = head.forward_score(
+                state_tensor, opt_embs, question_emb=option_emb_cache[question_text],
+            )
             results[qid] = decode_dynamic_answer(
-                make_score_question(level_texts, qid), scores, temperature,
+                make_score_question(level_texts, question_text), scores, temperature,
             )
     return results
 
@@ -490,16 +504,24 @@ def _benchmark_dynamic_breakout(
 
 
 def _collect_option_texts(question_spec: dict) -> list[str]:
-    """Collect all unique option/level texts from the question spec."""
+    """Collect all unique option/level texts AND question strings.
+
+    v3: question texts are embedded like options and looked up per question
+    at forward time.
+    """
     texts: set[str] = set()
-    for spec in question_spec.values():
+    for qid, spec in question_spec.items():
         kind = spec["type"]
         if kind == "choice":
             texts.update(spec["options"])
+            texts.add(default_question_text(qid))
         elif kind == "score":
             texts.update(spec["levels"])
+            texts.add(default_question_text(qid))
         elif kind == "noul":
             texts.update(["false", "true"])
+            if spec.get("question"):
+                texts.add(spec["question"])
     return sorted(texts)
 
 

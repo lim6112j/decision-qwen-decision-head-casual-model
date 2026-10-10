@@ -23,6 +23,7 @@ from decision_lab.head.model import (
     create_random_head,
     predict_all,
 )
+from decision_lab.head.dynamic_train import default_question_text
 from decision_lab.prompt_lm.agent import PromptAgent, PromptMode
 from decision_lab.states.fields import state_field_set
 
@@ -141,21 +142,20 @@ class DynamicHeadAgent:
         # Must match feature extraction (same config key) so training-time
         # chunking equals inference-time chunking.
         self._include_summary_field = include_summary_field
-        # Option embedding cache: {option_text: tensor}
-        self._option_cache: dict[str, torch.Tensor] = {}
-        # Field embedding cache: {field_text: tensor} — fields repeat heavily
-        self._field_cache: dict[str, torch.Tensor] = {}
+        # Text embedding cache: {text: tensor} — options, field texts and
+        # question strings all share one cache (texts repeat heavily)
+        self._text_cache: dict[str, torch.Tensor] = {}
 
-    def _ensure_options_embedded(self, option_texts: list[str]) -> dict[str, torch.Tensor]:
-        """Embed option texts via backbone, cache on this agent instance."""
-        missing = [t for t in option_texts if t not in self._option_cache]
+    def _ensure_texts_embedded(self, texts: list[str]) -> dict[str, torch.Tensor]:
+        """Embed texts via backbone, cache on this agent instance."""
+        missing = [t for t in texts if t not in self._text_cache]
         if missing:
             embs = self._server.embed(missing)
             for text, emb in zip(missing, embs):
-                self._option_cache[text] = torch.tensor(
+                self._text_cache[text] = torch.tensor(
                     emb, dtype=torch.float32, device=self._device
                 )
-        return {t: self._option_cache[t] for t in option_texts}
+        return {t: self._text_cache[t] for t in texts}
 
     def _state_tensor(self, state, fields: list[str] | None = None) -> torch.Tensor:
         """Embed the state as a field set → (1, M, D) (v2) or (1, D) (v1).
@@ -172,24 +172,39 @@ class DynamicHeadAgent:
         else:
             field_texts = [state.render()]   # legacy v1 head: pooled vector
 
-        missing = [t for t in field_texts if t not in self._field_cache]
+        missing = [t for t in field_texts if t not in self._text_cache]
         if missing:
             embs = self._server.embed(missing)
             for text, emb in zip(missing, embs):
-                self._field_cache[text] = torch.tensor(
+                self._text_cache[text] = torch.tensor(
                     emb, dtype=torch.float32, device=self._device
                 )
-        field_embs = torch.stack([self._field_cache[t] for t in field_texts])
+        field_embs = torch.stack([self._text_cache[t] for t in field_texts])
         if not self._head.state_set:
             return field_embs[0].unsqueeze(0)          # (1, D) — summary/whole text
         return field_embs.unsqueeze(0)                 # (1, M, D)
 
-    def _score(self, state_tensor, option_texts: list[str]) -> torch.Tensor:
-        """Embed options (cached) and score them → (1, n_opts) logits."""
-        cache = self._ensure_options_embedded(option_texts)
+    def _score(
+        self,
+        state_tensor,
+        option_texts: list[str],
+        question_text: str = "",
+    ) -> torch.Tensor:
+        """Embed options + question (cached) and score them → (1, n_opts).
+
+        question_text conditions the option queries (v3 FiLM fusion);
+        empty string → zero-vector modulation (learned null question).
+        """
+        texts = list(option_texts)
+        if question_text:
+            texts.append(question_text)
+        cache = self._ensure_texts_embedded(texts)
         opt_embs = torch.stack([cache[t] for t in option_texts])
+        question_emb = cache[question_text] if question_text else None
         with torch.no_grad():
-            return self._head.forward_choice(state_tensor, opt_embs)
+            return self._head.forward_choice(
+                state_tensor, opt_embs, question_emb=question_emb
+            )
 
     def decide(self, state) -> tuple[dict, str, float]:
         """Return ({qid: decoded answer dict}, raw_output, latency_ms).
@@ -204,25 +219,28 @@ class DynamicHeadAgent:
             for qid, spec in self._question_spec.items():
                 kind = spec["type"]
                 if kind == "noul":
-                    scores = self._score(state_tensor, ["false", "true"])
+                    question_text = spec.get("question", qid)
+                    scores = self._score(state_tensor, ["false", "true"], question_text)
                     results[qid] = decode_dynamic_answer(
-                        make_noul_question(spec.get("question", qid)),
+                        make_noul_question(question_text),
                         scores,
                         self._temperature,
                     )
                 elif kind == "choice":
                     option_texts = spec["options"]
-                    scores = self._score(state_tensor, option_texts)
+                    question_text = default_question_text(qid)
+                    scores = self._score(state_tensor, option_texts, question_text)
                     results[qid] = decode_dynamic_answer(
-                        make_choice_question(option_texts, qid),
+                        make_choice_question(option_texts, question_text),
                         scores,
                         self._temperature,
                     )
                 elif kind == "score":
                     level_texts = spec["levels"]
-                    scores = self._score(state_tensor, level_texts)
+                    question_text = default_question_text(qid)
+                    scores = self._score(state_tensor, level_texts, question_text)
                     results[qid] = decode_dynamic_answer(
-                        make_score_question(level_texts, qid),
+                        make_score_question(level_texts, question_text),
                         scores,
                         self._temperature,
                     )
@@ -254,7 +272,8 @@ class DynamicHeadAgent:
         with torch.no_grad():
             for q in questions:
                 option_texts = question_option_texts(q)
-                scores = self._score(state_tensor, option_texts)
+                question_text = (q.get("question") or "").strip()
+                scores = self._score(state_tensor, option_texts, question_text)
                 results.append(decode_dynamic_answer(q, scores, self._temperature))
 
         latency_ms = (time.perf_counter() - t0) * 1000

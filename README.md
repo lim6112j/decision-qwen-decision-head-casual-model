@@ -138,11 +138,13 @@ expected `left` (move toward the ball) but returned **`right` for almost every s
 1. **The head was never trained on Breakout.** Training data was synthetic
    office documents (sentiment/urgency/quality); the option strings
    `left`/`right`/`stay` never appeared during training.
-2. **The `question` string is metadata only** — `POST /api/decide-dynamic`
-   discards it. The decision reduces to: embed the state text and argmax it
+2. **The `question` string was metadata only (pre-v3)** — `POST /api/decide-dynamic`
+   discarded it. The decision reduced to: embed the state text and argmax it
    against bare embeddings of the option strings. With an out-of-distribution
-   state text and untrained option keys, generic embedding geometry decides —
-   and the frequent, polysemous token "right" wins nearly always.
+   state text and untrained option keys, generic embedding geometry decided —
+   and the frequent, polysemous token "right" won nearly always. (Since v3 the
+   question string conditions the head — see "v3 head: question-conditioned
+   queries" below.)
 
 The `options` *are* used (embedded via the backbone, scored against the state
 via attention — only the `question` text is dropped). They were simply
@@ -197,15 +199,12 @@ confidently collapsing. Document-question accuracy is preserved (in-dist
   trained on val/calibration samples during the generalize phase (inflating
   reported val_acc). Both curriculum phases now train on the train split only.
 
-#### Deferred: feeding the `question` string to the model
+#### Deferred: feeding the `question` string to the model → done in v3
 
-The `question`-is-metadata-only caveat stands. Fixing it means
-question-conditioned state embeddings on **both** sides: training embeds
-states via the pre-extracted `features_*.npz` cache (would require
-re-extracting features per (state × question) pair), while inference embeds
-`custom_text` live. Payoff: one head could answer different questions over
-the same state text. Until then, all question-specific meaning must live in
-the state text — put the geometry in `custom_text`, not in `question`.
+This was implemented as the **v3 head** (question-conditioned queries —
+see "v3 head: question-conditioned queries" below). The approach chosen is
+query-side FiLM fusion on pre-extracted embeddings, not per-(state ×
+question) feature re-extraction, so no new feature caches were needed.
 
 Note: option sets from domains outside office documents and Breakout (e.g.
 ratings, metaphors) remain unlearned — see the novel-option table above.
@@ -257,6 +256,60 @@ Results of the restructure: `test_breakout` 95.5% → **98.0%**, in-dist
 82.2% → **84.6%**, held-out 39.1% → **73.9%** (+34.8pp — the largest gain is
 exactly where the pooled-vector input was weakest), at 11 ms latency and
 ECE ≤ 0.05 everywhere.
+
+### v3 head: question-conditioned queries (2026-10-09)
+
+In v2 the `question` string was still metadata: options were embedded as
+bare texts and the same state+options pair always produced the same answer
+regardless of what was being asked. v3 (checkpoint `arch_version: 3`) makes
+the question functional via **query-side FiLM fusion** — the question text
+is embedded (same frozen backbone as state/option texts) and modulates each
+option's query before it reads the field set:
+
+```
+Q_opt = normalize(opt_query(opt_emb))                    # v2 unchanged
+gate  = q_mod_scale(question_emb)  ─ zero-init Linear(1024 → d_k)
+shift = q_mod_bias(question_emb)   ─ zero-init Linear(1024 → d_k)
+Q     = normalize((1 + gate) · Q_opt + shift)
+```
+
+- **Identity init**: both linears start at zero, so v3's forward is exactly
+  v2's for any question — the cosine-attention O(1) logit spread (the v2
+  anti-stall design) is preserved. The `(1 + gate)` form is load-bearing:
+  a bare `gate · Q_opt` would be `normalize(0)` → NaN at init.
+- **Shortcut-proof data**: breakout now has a second question,
+  `ball_motion` (gold = sign of ball_vx, `stay` when vx = 0), sharing the
+  *identical* option texts `left/right/stay` with `paddle_direction` while
+  vx is decorrelated from side — the same state has different golds under
+  the two questions, so the head cannot fit both without reading the
+  question embedding. The document bank's three noul questions
+  (`is_actionable`/`contains_pii`/`is_urgent`, same `false`/`true` options,
+  independent golds) provide the same forcing for the doc domain.
+  ~5% of training samples carry no question (learned null-question behavior
+  for callers omitting `question`).
+- **Checkpoint compat**: v2 checkpoints load with the fusion keys at
+  identity init (warning printed) — question text is ignored until
+  retrain; `python -m decision_lab ui` must be restarted after retraining
+  as usual. v1 handling unchanged. The HTTP schema is unchanged
+  (`question` was already optional).
+- **Feature caches are fingerprinted**: `extract_features` /
+  `extract_field_features` now store a SHA-256 fingerprint of the source
+  dataset (`+ include_summary_field`) inside the .npz and re-extract
+  automatically on mismatch ("cache stale (source changed)"). Before this,
+  a regenerated dataset with an existing cache silently trained on
+  embeddings of the OLD texts paired with the NEW labels — a nearly
+  invisible corruption that masked the v3 fix for a full debugging day.
+- Breaking the old "metadata only" rule: the same `custom_text` can now be
+  asked different questions (e.g. paddle direction vs ball motion) and get
+  different, correct answers.
+
+Results of the v3 retrain: `test_breakout` **paddle_direction 98.0%** (v2
+parity) **and ball_motion 99.5%** (new capability — same state, same option
+texts, different gold), in-dist 82.2% → **95.7%**, held-out 73.9% → **71.5%**
+(v2 parity within run variance). Known remaining weak spot: the original
+contradictory-evidence state (geometry says LEFT, motion says "moving
+right") produces a uniform 0.333 distribution — v2 had the same tie; the
+argmax tie-break decides, so that specific state is a coin flip.
 
 > Deeper notes on how the decision heads train (frozen-backbone design,
 > last-token pooling pitfalls, data decorrelation, split hygiene):

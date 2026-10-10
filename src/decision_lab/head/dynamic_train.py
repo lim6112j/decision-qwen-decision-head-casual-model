@@ -8,6 +8,11 @@ Training samples are (state_field_set, option_embeddings, gold_idx) tuples.
 State field sets are ragged (M_i, input_dim) arrays — padded + masked per
 batch at collate time, never materialized as one giant padded tensor.
 Option embeddings are pre-computed via the frozen backbone and cached.
+
+v3: each sample also carries a question-text embedding (FiLM-modulates the
+option queries — see dynamic_model.py). question_emb=None marks the empty
+question (~EMPTY_QUESTION_FRACTION of samples), and is_variant replaces the
+old "(variant)" question-text marker for the curriculum split.
 """
 
 from __future__ import annotations
@@ -47,6 +52,10 @@ class DynamicTrainingSample:
     gold_idx:      int — which option is correct
     question_type: "choice" | "score" | "noul"
     question_text: str — for logging
+    question_emb:  (input_dim,) float32 question-text embedding, or None
+        for the empty question. Stored BY REFERENCE from the embed cache —
+        copying would add ~4 KB × ~200k samples (~0.8 GB).
+    is_variant:    True for variant-question samples (curriculum phase 2)
     """
 
     state_fields_emb: np.ndarray
@@ -54,17 +63,21 @@ class DynamicTrainingSample:
     gold_idx: int
     question_type: str
     question_text: str = ""
+    question_emb: np.ndarray | None = None
+    is_variant: bool = False
 
 
 def collate_dynamic_batch(
     samples: Sequence[DynamicTrainingSample],
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pad + stack a batch of samples → (states, state_mask, options, golds).
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad + stack a batch of samples → (states, state_mask, options, questions, golds).
 
     states:     (B, M_max, input_dim) — zero-padded
     state_mask: (B, M_max) bool — True where a real field exists
     options:    (B, N_max, input_dim) — zero-padded
+    questions:  (B, input_dim) float32 — question embeddings, zero rows for
+        the empty question (question_emb is None)
     golds:      (B,) long
     """
     batch = len(samples)
@@ -75,6 +88,7 @@ def collate_dynamic_batch(
     xb = torch.zeros(batch, max_m, dim, dtype=torch.float32)
     mask = torch.zeros(batch, max_m, dtype=torch.bool)
     ob = torch.zeros(batch, max_n, dim, dtype=torch.float32)
+    qb = torch.zeros(batch, dim, dtype=torch.float32)
     yb = torch.tensor([s.gold_idx for s in samples], dtype=torch.long)
 
     for i, s in enumerate(samples):
@@ -83,8 +97,10 @@ def collate_dynamic_batch(
         mask[i, :m] = True
         n = s.option_embs.shape[0]
         ob[i, :n] = torch.from_numpy(np.asarray(s.option_embs, dtype=np.float32))
+        if s.question_emb is not None:
+            qb[i] = torch.from_numpy(np.asarray(s.question_emb, dtype=np.float32))
 
-    return xb.to(device), mask.to(device), ob.to(device), yb.to(device)
+    return xb.to(device), mask.to(device), ob.to(device), qb.to(device), yb.to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +137,50 @@ SCORE_SYNONYM_MAPS: dict[str, list[list[str]]] = {
         ["F", "D", "C", "B", "A"],
     ],
 }
+
+# v3: hand-written natural-language phrasings per qid. The backbone uses
+# "last"-token pooling (order-sensitive), so these are FIXED lists — no
+# generated or permuted phrasings. Entry 0 is the canonical/default question;
+# variants sample from the whole list.
+QUESTION_PHRASINGS: dict[str, list[str]] = {
+    "paddle_direction": [
+        "Which direction should the paddle move?",
+        "which direction the paddle move?",
+        "paddle direction?",
+        "Where should the paddle go next?",
+    ],
+    "ball_motion": [
+        "Which way is the ball moving horizontally?",
+        "ball horizontal motion?",
+        "Is the ball drifting left or right?",
+    ],
+    "sentiment": [
+        "What is the sentiment of this message?",
+        "sentiment of the message?",
+        "How does this message feel tonally?",
+    ],
+    "urgency": [
+        "How urgent is this item?",
+        "urgency level?",
+        "How soon does this need attention?",
+    ],
+    "quality": [
+        "What is the quality of this text?",
+        "quality rating?",
+        "How well written is this?",
+    ],
+}
+
+# Fraction of training samples that carry NO question (question_emb=None).
+# The zero-vector modulation is a learned constant — the head must see it
+# during training so serving with an omitted question stays well-behaved.
+EMPTY_QUESTION_FRACTION = 0.05
+
+
+def default_question_text(qid: str) -> str:
+    """Canonical question text for a qid (entry 0 of QUESTION_PHRASINGS)."""
+    phrasings = QUESTION_PHRASINGS.get(qid)
+    return phrasings[0] if phrasings else qid
 
 
 def _generate_choice_variants(
@@ -215,8 +275,11 @@ def generate_variant_questions(
                 variants.append({
                     "qid": qid,
                     "base_type": "choice",
-                    "question": make_choice_question(v["options"], f"{qid} (variant)"),
+                    "question": make_choice_question(
+                        v["options"], rng.choice(QUESTION_PHRASINGS.get(qid, [qid])),
+                    ),
                     "gold_map": v["gold_map"],
+                    "is_variant": True,
                 })
         elif kind == "score":
             score_variants = _generate_score_variants(
@@ -226,8 +289,11 @@ def generate_variant_questions(
                 variants.append({
                     "qid": qid,
                     "base_type": "score",
-                    "question": make_score_question(v["levels"], f"{qid} (variant)"),
+                    "question": make_score_question(
+                        v["levels"], rng.choice(QUESTION_PHRASINGS.get(qid, [qid])),
+                    ),
                     "gold_map": v["gold_map"],
+                    "is_variant": True,
                 })
 
     return variants
@@ -277,14 +343,14 @@ def generate_dynamic_training_data(
             base_questions.append({
                 "qid": qid,
                 "base_type": "choice",
-                "question": make_choice_question(spec["options"], qid),
+                "question": make_choice_question(spec["options"], default_question_text(qid)),
                 "gold_map": None,  # no mapping needed (1:1)
             })
         elif kind == "score":
             base_questions.append({
                 "qid": qid,
                 "base_type": "score",
-                "question": make_score_question(spec["levels"], qid),
+                "question": make_score_question(spec["levels"], default_question_text(qid)),
                 "gold_map": None,
             })
         elif kind == "noul":
@@ -297,7 +363,7 @@ def generate_dynamic_training_data(
 
     all_question_configs = base_questions + variants
 
-    # Collect all unique option texts and embed them
+    # Collect all unique option texts AND question texts and embed them
     all_option_texts: set[str] = set()
     # Always include false/true for noul binary head (they're implied labels)
     all_option_texts.update(["false", "true"])
@@ -306,10 +372,13 @@ def generate_dynamic_training_data(
         if q["type"] != "noul":
             for t in question_option_texts(q):
                 all_option_texts.add(t)
+        # v3: question strings ride the same embed pass (FiLM-modulate queries)
+        if q.get("question"):
+            all_option_texts.add(q["question"])
 
-    # Embed all option texts in one batch
+    # Embed all option/question texts in one batch
     unique_texts = sorted(all_option_texts)
-    print(f"  embedding {len(unique_texts)} unique option texts...")
+    print(f"  embedding {len(unique_texts)} unique option/question texts...")
     text_to_emb = {}
     if unique_texts:
         batch_size = 32
@@ -353,12 +422,26 @@ def generate_dynamic_training_data(
 
                 opt_embs = np.stack([text_to_emb[t] for t in option_texts])
 
+            # v3: mostly attach the question embedding; a small fraction is
+            # the empty question (None → zero-vector modulation at forward).
+            if rng.random() < EMPTY_QUESTION_FRACTION:
+                question_text = ""
+                question_emb = None
+            else:
+                question_text = q.get("question", "")
+                # noul falls back to qid when the spec has no question text
+                if not question_text:
+                    question_text = default_question_text(qid)
+                question_emb = text_to_emb[question_text]  # by reference
+
             samples.append(DynamicTrainingSample(
                 state_fields_emb=state_fields_emb,
                 option_embs=opt_embs,
                 gold_idx=gold_idx,
                 question_type=kind,
-                question_text=q.get("question", qid),
+                question_text=question_text,
+                question_emb=question_emb,
+                is_variant=bool(qc.get("is_variant", False)),
             ))
 
     print(f"  generated {len(samples)} training samples "
@@ -392,15 +475,14 @@ def train_dynamic_head(
     device = get_device()
     print(f"Training dynamic head on device: {device} ({len(samples)} samples)")
 
-    # Separate base vs variant samples for curriculum
-    base_samples = [s for s in samples if "variant" not in s.question_text]
-    variant_samples = [s for s in samples if "variant" in s.question_text]
+    # Separate base vs variant samples for curriculum (explicit flag —
+    # question texts no longer carry the "(variant)" marker)
+    base_samples = [s for s in samples if not s.is_variant]
+    variant_samples = [s for s in samples if s.is_variant]
     print(f"  anchor samples: {len(base_samples)}, variant samples: {len(variant_samples)}")
 
-    # Curriculum pools: base vs variant samples (by question text)
-    is_variant = torch.tensor(
-        ["variant" in s.question_text for s in samples], dtype=torch.bool,
-    )
+    # Curriculum pools: base vs variant samples
+    is_variant = torch.tensor([s.is_variant for s in samples], dtype=torch.bool)
     base_positions = torch.nonzero(~is_variant).squeeze(-1)
 
     # 3-way split for calibration holdout
@@ -416,7 +498,7 @@ def train_dynamic_head(
     val_positions = torch.tensor(rest_idx[split:], dtype=torch.long)
 
     # Anchor pool: base-question samples restricted to the train split
-    variant_arr = np.array([v.item() for v in is_variant], dtype=bool)
+    variant_arr = np.array([s.is_variant for s in samples], dtype=bool)
     in_train = np.zeros(n, dtype=bool)
     in_train[rest_idx[:split]] = True
     anchor_pool = torch.tensor(
@@ -465,12 +547,12 @@ def train_dynamic_head(
         order = pool[torch.randperm(len(pool))]
 
         for start in range(0, len(order), batch_size):
-            xb, mask, ob, yb = collate_dynamic_batch(
+            xb, mask, ob, qb, yb = collate_dynamic_batch(
                 batch_at(order, start, batch_size), device,
             )
 
             optimizer.zero_grad()
-            scores = model.forward_choice(xb, ob, mask)          # (B, N)
+            scores = model.forward_choice(xb, ob, mask, qb)      # (B, N)
             loss = F.cross_entropy(scores, yb)
             loss.backward()
             optimizer.step()
@@ -484,15 +566,28 @@ def train_dynamic_head(
         val_total = 0
         with torch.no_grad():
             for start in range(0, len(val_positions), batch_size):
-                xb, mask, ob, yb = collate_dynamic_batch(
+                xb, mask, ob, qb, yb = collate_dynamic_batch(
                     batch_at(val_positions, start, batch_size), device,
                 )
-                scores = model.forward_choice(xb, ob, mask)
+                scores = model.forward_choice(xb, ob, mask, qb)
                 pred = scores.argmax(dim=1)
                 val_correct += int((pred == yb).sum().item())
                 val_total += len(yb)
 
         val_acc = val_correct / val_total if val_total > 0 else 0.0
+
+        # Escape guard: breakout-domain training can sit at a near-symmetric
+        # plateau (all options reading the same field) whose escape is a
+        # stochastic bootstrap event. A healthy run has escaped by a few
+        # epochs into the generalize phase (val_acc jumps ~0.52 → ~0.80);
+        # if it hasn't, further epochs are wasted — abort so the caller can
+        # retry with a different init instead of burning the full schedule.
+        guard_epoch = anchor_epochs + 10
+        if epoch == guard_epoch and val_acc < 0.65:
+            print(f"  ESCAPE GUARD: val_acc={val_acc:.3f} at epoch {epoch} — "
+                  f"still at the symmetric plateau, aborting (caller should retry "
+                  f"with a different init)")
+            return None
 
         if epoch == 1 or epoch % 10 == 0 or epoch == hc.max_epochs:
             print(f"  epoch {epoch:3d} [{phase}]: train_loss={train_loss:.4f}  val_acc={val_acc:.3f}")
@@ -543,8 +638,8 @@ def _fit_global_temperature(
     with torch.no_grad():
         for start in range(0, len(calib_samples), batch_size):
             chunk = calib_samples[start : start + batch_size]
-            xb, mask, ob, yb = collate_dynamic_batch(chunk, device)
-            logits = model.forward_choice(xb, ob, mask)
+            xb, mask, ob, qb, yb = collate_dynamic_batch(chunk, device)
+            logits = model.forward_choice(xb, ob, mask, qb)
             batch_logits.append((logits.cpu().detach(), yb.cpu().detach(), len(chunk)))
 
     log_t = torch.zeros(1, requires_grad=True)

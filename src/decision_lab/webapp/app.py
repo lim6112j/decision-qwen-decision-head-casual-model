@@ -100,7 +100,10 @@ class DynamicDecideRequest(BaseModel):
     questions: list[dict] = Field(min_length=1)
     """Each dict: {"type": "choice", "options": [...], "question": "..."}
        or {"type": "score", "levels": [...], "question": "..."}
-       or {"type": "noul", "question": "..."}"""
+       or {"type": "noul", "question": "..."}
+    The "question" string conditions the head (v3 question-fused queries) —
+    it may be omitted, in which case a learned null-question behavior is
+    used. Legacy (pre-v3) checkpoints ignore it."""
 
 
 def _sse(event: str, data: dict) -> str:

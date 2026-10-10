@@ -60,13 +60,13 @@ def _embed_state(server, head, text: str, device, include_summary: bool) -> torc
 
 
 def _predict(server, head, temperature, text: str, options: list[str], device,
-             include_summary: bool) -> dict:
+             include_summary: bool, question_text: str = USER_QUESTION) -> dict:
     state_emb = _embed_state(server, head, text, device, include_summary)
     cache = {}
-    embs = server.embed(options)
-    for opt, emb in zip(options, embs):
-        cache[opt] = torch.tensor(emb, dtype=torch.float32, device=device)
-    questions = [{"type": "choice", "options": list(options), "question": USER_QUESTION}]
+    embs = server.embed([*options, question_text])
+    for t, emb in zip([*options, question_text], embs):
+        cache[t] = torch.tensor(emb, dtype=torch.float32, device=device)
+    questions = [{"type": "choice", "options": list(options), "question": question_text}]
     results = predict_dynamic(state_emb, questions, cache, head, temperature)
     return results[0]
 
@@ -119,10 +119,34 @@ def main():
                   f"  ({answer['confidence']:.2f})  {row['text'][:70]}")
         print(f"  distinct predictions: {sorted(predicted_labels)}")
 
+        # 4. Question-flip probe (v3): one state, same options, two questions
+        print("=" * 70)
+        print("Question-flip probe (same state, same options, two questions):")
+        row = rows[0]
+        paddle_gold = row["labels"]["paddle_direction"]
+        motion_gold = row["labels"]["ball_motion"]
+        BALL_MOTION_QUESTION = "Which way is the ball moving horizontally?"
+        answer_paddle = _predict(server, head, temperature, row["text"],
+                                 ["left", "right", "stay"], device, include_summary)
+        answer_motion = _predict(server, head, temperature, row["text"],
+                                 ["left", "right", "stay"], device, include_summary,
+                                 question_text=BALL_MOTION_QUESTION)
+        print(f"  paddle_direction (gold={paddle_gold}): → {answer_paddle['predicted']}")
+        print(f"  ball_motion      (gold={motion_gold}): → {answer_motion['predicted']}")
+        ok_flip = (answer_paddle["predicted"] == paddle_gold
+                   and answer_motion["predicted"] == motion_gold)
+        if ok_flip:
+            print("  → both questions match their own gold (question text is functional)")
+        else:
+            print("  → MISMATCH: the head is not conditioning on the question text")
+
     if not (ok_base and ok_shuffled):
         print("FAIL: exact user state did not predict 'left' in both option orders")
         sys.exit(1)
-    print("PASS: exact user state predicts 'left' in both option orders")
+    if not ok_flip:
+        print("FAIL: question-flip probe did not match both golds")
+        sys.exit(1)
+    print("PASS: exact user state predicts 'left' in both option orders + question flip works")
 
 
 if __name__ == "__main__":

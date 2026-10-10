@@ -285,6 +285,7 @@ class TestPredictDynamic:
             "High": torch.randn(64),
             "false": torch.randn(64),
             "true": torch.randn(64),
+            "done?": torch.randn(64),
         }
         head.eval()
         results = predict_dynamic(state_emb, questions, cache, head)
@@ -297,7 +298,7 @@ class TestPredictDynamic:
         """noul must be scored via forward_choice with ['false','true'] —
         the deprecated forward_noul path was never trained."""
         questions = [make_noul_question("done?")]
-        cache = {"false": torch.randn(64), "true": torch.randn(64)}
+        cache = {"false": torch.randn(64), "true": torch.randn(64), "done?": torch.randn(64)}
         head.eval()
         results = predict_dynamic(state_emb, questions, cache, head)
         assert set(results[0]["distribution"]) == {"false", "true"}
@@ -434,11 +435,229 @@ class TestFieldSetCheckpoint:
         head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
         head.eval()
         questions = [make_choice_question(["a", "b"]), make_noul_question("ok?")]
-        cache = {t: torch.randn(64) for t in ["a", "b", "false", "true"]}
+        cache = {t: torch.randn(64) for t in ["a", "b", "false", "true", "ok?"]}
         results = predict_dynamic(torch.randn(3, 64), questions, cache, head)
         assert len(results) == 2
         assert results[0]["predicted"] in ("a", "b")
         assert isinstance(results[1]["predicted"], bool)
+
+
+# ---------------------------------------------------------------------------
+# v3 question fusion
+# ---------------------------------------------------------------------------
+
+
+class TestQuestionFusion:
+    """v3: question text modulates option queries (FiLM gate + shift)."""
+
+    @pytest.fixture
+    def set_head(self):
+        return DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
+
+    def test_v3_modules_present(self, set_head):
+        assert hasattr(set_head, "q_mod_scale")
+        assert hasattr(set_head, "q_mod_bias")
+        assert hasattr(set_head, "z_mod_scale")
+        assert hasattr(set_head, "z_mod_bias")
+        for mod in ("q_mod_scale", "q_mod_bias", "z_mod_scale", "z_mod_bias"):
+            assert torch.count_nonzero(getattr(set_head, mod).weight) == 0
+
+    def test_identity_at_init(self, set_head):
+        """Zero-init fusion: any question embedding (or None) reproduces the
+        v2 forward exactly — the uniform-softmax stall cannot recur."""
+        set_head.eval()
+        torch.manual_seed(0)
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        q_a, q_b = torch.randn(64), torch.randn(64)
+        with torch.no_grad():
+            base = set_head.forward_choice(fields, opt_embs)
+            with_qa = set_head.forward_choice(fields, opt_embs, question_emb=q_a)
+            with_qb = set_head.forward_choice(fields, opt_embs, question_emb=q_b)
+            with_none = set_head.forward_choice(fields, opt_embs, question_emb=None)
+        assert torch.allclose(base, with_qa, atol=1e-6)
+        assert torch.allclose(base, with_qb, atol=1e-6)
+        assert torch.allclose(base, with_none, atol=1e-6)
+
+    def test_none_equals_zero_embedding(self, set_head):
+        """None → zero vector → identical output, always (not just at init)."""
+        set_head.eval()
+        torch.manual_seed(3)
+        # Perturb fusion weights so modulation is non-identity
+        with torch.no_grad():
+            set_head.q_mod_bias.weight.normal_(0, 0.1)
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            with_none = set_head.forward_choice(fields, opt_embs, question_emb=None)
+            with_zero = set_head.forward_choice(
+                fields, opt_embs, question_emb=torch.zeros(64)
+            )
+        assert torch.allclose(with_none, with_zero, atol=1e-6)
+
+    def test_1d_question_broadcast(self, set_head):
+        """(D,) question broadcasts across the state batch."""
+        set_head.eval()
+        fields = torch.randn(4, 5, 64)
+        opt_embs = torch.randn(3, 64)
+        q = torch.randn(64)
+        with torch.no_grad():
+            scores = set_head.forward_choice(fields, opt_embs, question_emb=q)
+        assert scores.shape == (4, 3)
+        # Row i must equal the unbatched pass for state i
+        with torch.no_grad():
+            for i in range(4):
+                single = set_head.forward_choice(
+                    fields[i], opt_embs, question_emb=q
+                )
+                assert torch.allclose(scores[i], single[0], atol=1e-6)
+
+    def test_batched_question_shape(self, set_head):
+        set_head.eval()
+        scores = set_head.forward_choice(
+            torch.randn(4, 5, 64), torch.randn(3, 64), question_emb=torch.randn(4, 64)
+        )
+        assert scores.shape == (4, 3)
+
+    def test_question_changes_output_after_training_signal(self, set_head):
+        """A non-trivially-trained modulation must actually depend on the
+        question embedding (fusion pathway is live, not a constant)."""
+        set_head.eval()
+        with torch.no_grad():
+            set_head.q_mod_scale.weight.normal_(0, 0.05)
+            set_head.q_mod_scale.bias.normal_(0, 0.05)
+            set_head.q_mod_bias.weight.normal_(0, 0.05)
+            set_head.q_mod_bias.bias.normal_(0, 0.05)
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            out_a = set_head.forward_choice(fields, opt_embs, question_emb=torch.randn(64))
+            out_b = set_head.forward_choice(fields, opt_embs, question_emb=torch.randn(64))
+        assert not torch.allclose(out_a, out_b, atol=1e-5)
+
+    def test_permutation_equivariance_with_question(self, set_head):
+        """Field-set permutation equivariance holds under question modulation."""
+        set_head.eval()
+        torch.manual_seed(0)
+        with torch.no_grad():
+            set_head.q_mod_scale.weight.normal_(0, 0.1)
+            set_head.q_mod_bias.weight.normal_(0, 0.1)
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        q = torch.randn(64)
+        with torch.no_grad():
+            scores_a = set_head.forward_choice(fields, opt_embs, question_emb=q)
+            scores_b = set_head.forward_choice(fields.flip(0), opt_embs, question_emb=q)
+        assert torch.allclose(scores_a, scores_b, atol=1e-5)
+
+    def test_same_state_options_flip_with_question(self):
+        """THE question-functionality proof: the same state + same options
+        must predict different options under two different questions.
+
+        Tiny overfit — 2 samples, opposite golds, ~600 Adam steps on CE.
+        If the fusion pathway can't condition on the question embedding,
+        the two golds can never both be recovered.
+        """
+        torch.manual_seed(7)
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        q_left = torch.randn(64)
+        q_right = torch.randn(64) + 2.0  # well separated from q_left
+
+        opt = torch.optim.Adam(head.parameters(), lr=5e-3)
+        for _ in range(600):
+            for q_emb, gold in ((q_left, 0), (q_right, 1)):
+                scores = head.forward_choice(
+                    fields, opt_embs, question_emb=q_emb
+                )
+                loss = torch.nn.functional.cross_entropy(scores, torch.tensor([gold]))
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+        head.eval()
+        with torch.no_grad():
+            scores_left = head.forward_choice(fields, opt_embs, question_emb=q_left)
+            scores_right = head.forward_choice(fields, opt_embs, question_emb=q_right)
+        assert int(scores_left.argmax()) == 0
+        assert int(scores_right.argmax()) == 1
+
+
+class TestQuestionFusionCheckpoint:
+    def test_v3_roundtrip_with_question(self):
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
+        head.eval()
+        with torch.no_grad():
+            # Non-identity fusion so the question genuinely matters
+            head.q_mod_scale.weight.normal_(0, 0.1)
+            head.q_mod_bias.bias.normal_(0, 0.1)
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        q = torch.randn(64)
+        with torch.no_grad():
+            orig = head.forward_choice(fields, opt_embs, question_emb=q)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "v3.pt"
+            save_dynamic_head(head, path, temperature=0.7)
+            loaded = load_dynamic_head(path)
+            loaded.eval()
+            assert loaded.temperature == 0.7
+            with torch.no_grad():
+                assert torch.allclose(
+                    orig, loaded.forward_choice(fields, opt_embs, question_emb=q),
+                    atol=1e-6,
+                )
+
+    def test_v2_checkpoint_loads_identity_fusion(self, capsys):
+        """A hand-built v2 checkpoint (arch_version 2, no q_mod_* keys) loads
+        with the fusion at identity init: question embeddings change nothing,
+        and a warning is printed."""
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
+        head.eval()
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            orig = head.forward_choice(fields, opt_embs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            v3_path = Path(tmp) / "v3.pt"
+            save_dynamic_head(head, v3_path)
+            checkpoint = torch.load(str(v3_path), map_location="cpu")
+            checkpoint["arch"]["arch_version"] = 2
+            for key in list(checkpoint["model_state"]):
+                if key.startswith("q_mod_"):
+                    del checkpoint["model_state"][key]
+            path = Path(tmp) / "v2.pt"
+            torch.save(checkpoint, str(path))
+
+            loaded = load_dynamic_head(path)
+            loaded.eval()
+            assert loaded.state_set is True
+            out = capsys.readouterr()
+            assert "identity init" in out.out
+            with torch.no_grad():
+                scores = loaded.forward_choice(fields, opt_embs, question_emb=torch.randn(64))
+            assert torch.allclose(orig, scores, atol=1e-6)
+
+
+class TestPredictDynamicQuestionCache:
+    def test_question_text_in_cache_used(self):
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
+        head.eval()
+        q = make_choice_question(["a", "b"], "Which one?")
+        cache = {"a": torch.randn(64), "b": torch.randn(64), "Which one?": torch.randn(64)}
+        results = predict_dynamic(torch.randn(3, 64), [q], cache, head)
+        assert results[0]["predicted"] in ("a", "b")
+
+    def test_empty_question_no_keyerror(self):
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
+        head.eval()
+        q = make_choice_question(["a", "b"], "")
+        cache = {"a": torch.randn(64), "b": torch.randn(64)}
+        results = predict_dynamic(torch.randn(3, 64), [q], cache, head)
+        assert results[0]["predicted"] in ("a", "b")
 
 
 # ---------------------------------------------------------------------------

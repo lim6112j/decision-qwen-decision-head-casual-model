@@ -59,7 +59,10 @@ dynamic_head:
   weight_decay: 0.00001
   batch_size: 64
   max_epochs: 100
-  patience: 10
+  # The anchor phase plateaus (its val set already contains variant samples
+  # the anchor-only model can't answer), so patience must outlast it —
+  # patience 10 occasionally stopped mid-anchor before the generalize jump.
+  patience: 20
   anchor_epochs: 30
   variants_per_question: 3
   breakout_weight: 3   # oversample factor for breakout states (see generator note)

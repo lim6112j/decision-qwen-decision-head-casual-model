@@ -34,9 +34,13 @@ def extract_features(
     """
     from decision_lab.states.dataset import load_dataset
 
+    fingerprint = _cache_fingerprint(data_path, include_summary_field=False)
     if cache_path.exists():
         data = np.load(cache_path)
-        return data["features"]
+        stored = str(data["fingerprint"]) if "fingerprint" in data else ""
+        if stored == fingerprint:
+            return data["features"]
+        print(f"  cache stale (source changed) — re-extracting {cache_path.name}")
 
     states = load_dataset(data_path)
     texts = [s.render() for s in states]
@@ -49,8 +53,24 @@ def extract_features(
 
     features = np.array(all_embeds, dtype=np.float32)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(cache_path, features=features)
+    np.savez_compressed(cache_path, features=features, fingerprint=fingerprint)
     return features
+
+
+def _cache_fingerprint(data_path: Path, include_summary_field: bool) -> str:
+    """Fingerprint tying a feature cache to its source dataset + settings.
+
+    A stale cache silently returning embeddings for a DIFFERENT dataset is
+    catastrophic (training pairs embeddings of one text set with labels of
+    another) and nearly invisible — the counts barely differ. Fingerprint
+    the source file bytes plus every setting that changes the output.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    h.update(data_path.read_bytes())
+    h.update(f"|include_summary_field={include_summary_field}".encode())
+    return h.hexdigest()
 
 
 def extract_field_features(
@@ -66,6 +86,10 @@ def extract_field_features(
     inference uses, so training-time chunking always matches run-time
     chunking.
 
+    The cache carries a fingerprint of the source dataset; a mismatch
+    (dataset regenerated, setting changed) triggers re-extraction instead
+    of silently serving stale embeddings.
+
     Returns:
         (features, field_counts): features is (ΣM_i, input_dim) stacked
         row-major; field_counts is (N,) with state i owning rows
@@ -74,9 +98,13 @@ def extract_field_features(
     from decision_lab.states.dataset import load_dataset
     from decision_lab.states.fields import state_field_set
 
+    fingerprint = _cache_fingerprint(data_path, include_summary_field)
     if cache_path.exists():
         data = np.load(cache_path)
-        return data["features"], data["field_counts"]
+        stored = str(data["fingerprint"]) if "fingerprint" in data else ""
+        if stored == fingerprint:
+            return data["features"], data["field_counts"]
+        print(f"  cache stale (source changed) — re-extracting {cache_path.name}")
 
     states = load_dataset(data_path)
 
@@ -109,7 +137,10 @@ def extract_field_features(
 
     features = np.concatenate(chunks, axis=0)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(cache_path, features=features, field_counts=field_counts)
+    np.savez_compressed(
+        cache_path, features=features, field_counts=field_counts,
+        fingerprint=fingerprint,
+    )
     print(f"  {len(states)} states, {int(field_counts.sum())} fields "
           f"({len(unique_texts)} unique texts)")
     return features, field_counts

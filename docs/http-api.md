@@ -62,9 +62,12 @@ request — no retraining or server restart for new question types.
   - `{"type": "choice", "options": [...], "question": "..."}` — ≥2 option strings
   - `{"type": "score", "levels": [...], "question": "..."}` — ≥2 ordered rubric levels
 
-Note: the `question` string is metadata only — the model sees the state text
-and the option/level label strings (embedded via the backbone, cached
-server-side per label). Sending identical option strings across calls is cheap.
+Note: the `question` string conditions the head (v3 question-fused queries)
+— the same state text with different question strings can produce different
+answers. It may be omitted (learned null-question behavior). Legacy
+pre-v3 checkpoints ignore it. Option/level label strings are embedded via
+the backbone, cached server-side per label — sending identical option
+strings across calls is cheap.
 
 ### Supported question domains
 
@@ -95,12 +98,12 @@ Breakout example:
 → `{"predicted": "left", ...}` — the ball's side decides the direction even
 when its motion points the other way ("moving right … away from the paddle").
 
-Deferred: feeding the `question` string into the state embedding. Training
-embeds states via the pre-extracted `features_*.npz` cache while inference
-embeds `custom_text` live, so question-conditioned states would require
-re-extracting features per question on both sides. Until then, all
-question-specific meaning must live in the state text itself — put the
-geometry (side, gap) in `custom_text`, not in `question`.
+Since v3, the `question` string is functional: it is embedded with the same
+backbone and FiLM-modulates each option's query before it reads the state
+field set. One head answers different questions over the same `custom_text`
+(e.g. Breakout `paddle_direction` vs `ball_motion` share the options
+`left/right/stay` but have independent golds). Pre-v3 checkpoints ignore
+the question string — retrain and restart the server to enable it.
 
 ### Response
 

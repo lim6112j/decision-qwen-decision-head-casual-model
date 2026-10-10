@@ -24,6 +24,32 @@ v2 (state_set=True) — field-set cross-attention:
     α_ij = softmax_fields(q_j · k_i / √d_k)
     z_j = Σ_i α_ij · field_repr_i → (B, N, hidden)
     Logits = score_head(z_j)  (Linear(hidden → 1), shared over options)
+
+v3 (state_set=True, arch_version 3) — question-conditioned queries AND reads:
+    The ``question`` config string is embedded (same backbone as state/option
+    texts) and modulates the head in two places, both identity-initialized:
+    query side — each option's query before it reads the field set:
+        Q = normalize((1 + gate) * opt_query(opt) + shift)
+        gate, shift = q_mod_scale(question_emb), q_mod_bias(question_emb)
+    value side — the attention-weighted state summary before scoring:
+        z' = (1 + z_gate) * z + z_shift
+        z_gate, z_shift = z_mod_scale(question_emb), z_mod_bias(question_emb)
+    All four linears are ZERO-initialized, so at init the modulations are
+    exactly identity for ANY question embedding — v3 starts as v2,
+    preserving the O(1) cosine-attention logit spread (see __init__ note).
+    The (1 + gate) forms are load-bearing: a bare gate*Q would be
+    normalize(0) at init → NaN.
+    The value-side gate exists because the score path is shared across
+    questions: with query-side gating alone, an adversarial lexical shortcut
+    (option "left" matching a "LEFT" geometry field) is right for one
+    question and wrong for another, and the shared field_enc/score_head are
+    torn between the two — training settles at a compromise (~chance on
+    breakout). Conditioning the read-out lets one question re-interpret the
+    same attended content the other question reads differently.
+    question_emb=None (empty question) falls back to a zero vector, whose
+    mod outputs are learned constants — trained via ~5% empty-question
+    samples. v2 checkpoints load with the fusion keys at identity init
+    (question text ignored until retrain); v1 heads ignore it entirely.
 """
 
 import math
@@ -152,6 +178,28 @@ class DynamicDecisionHead(nn.Module):
             # small random projections), softmax is uniform, every option
             # reads the same mean field, and training stalls at ln(n_max).
             self.attn_scale = nn.Parameter(torch.tensor(float(d_k) ** 0.5))
+            # v3 question fusion (FiLM gate + shift on the query side).
+            # Zero-init (weight AND bias) → gate=0, shift=0 → the modulation
+            # (1 + gate) * Q_opt + shift is exactly Q_opt for any question,
+            # i.e. v3 at init == v2 forward. Gradients still reach both
+            # linears at W=0 (d/dW = grad_out ⊗ input ≠ 0).
+            self.q_mod_scale = nn.Linear(input_dim, d_k)
+            self.q_mod_bias = nn.Linear(input_dim, d_k)
+            nn.init.zeros_(self.q_mod_scale.weight)
+            nn.init.zeros_(self.q_mod_scale.bias)
+            nn.init.zeros_(self.q_mod_bias.weight)
+            nn.init.zeros_(self.q_mod_bias.bias)
+            # v3 value-side question fusion: the score path (field_enc +
+            # score_head) is shared across questions, so query-side gating
+            # alone leaves an adversarial lexical shortcut contested between
+            # questions — see the module docstring. Zero-init identity, same
+            # rationale as the query-side gate above.
+            self.z_mod_scale = nn.Linear(input_dim, hidden_dim)
+            self.z_mod_bias = nn.Linear(input_dim, hidden_dim)
+            nn.init.zeros_(self.z_mod_scale.weight)
+            nn.init.zeros_(self.z_mod_scale.bias)
+            nn.init.zeros_(self.z_mod_bias.weight)
+            nn.init.zeros_(self.z_mod_bias.bias)
         else:
             # v1: pooled-state attention (legacy, kept for checkpoint compat)
             self.trunk = nn.Sequential(
@@ -181,12 +229,19 @@ class DynamicDecisionHead(nn.Module):
         state_embedding: torch.Tensor,
         option_embeddings: torch.Tensor,
         state_mask: torch.Tensor | None = None,
+        question_emb: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """v2 core: each option queries the state field set → (B, N) logits.
+        """v3 core: question-modulated option queries read the field set → (B, N).
 
         Cosine attention: q and k are L2-normalized before the dot product
         and scaled by the learnable ``attn_scale`` (init √d_k) — see the
         __init__ note for why raw q·k/√d_k stalls training.
+
+        Args:
+            question_emb: (input_dim,) or (batch, input_dim) question-text
+                embedding, or None for an empty question (zero vector — a
+                learned constant modulation, trained on empty-question
+                samples).
         """
         state, batch_size = self._normalize_state_set(state_embedding)
         if option_embeddings.dim() == 2:
@@ -194,9 +249,22 @@ class DynamicDecisionHead(nn.Module):
         if option_embeddings.shape[0] == 1 and batch_size > 1:
             option_embeddings = option_embeddings.expand(batch_size, -1, -1)
 
+        # Question → (B, input_dim); None → zeros (empty-question fallback)
+        if question_emb is None:
+            question_emb = torch.zeros(
+                batch_size, self.input_dim,
+                device=state.device, dtype=state.dtype,
+            )
+        elif question_emb.dim() == 1:
+            question_emb = question_emb.unsqueeze(0).expand(batch_size, -1)
+
         field_repr = self.field_enc(state)                        # (B, M, H)
         K = F.normalize(self.field_key(field_repr), dim=-1)       # (B, M, d_k)
-        Q = F.normalize(self.opt_query(option_embeddings), dim=-1)  # (B, N, d_k)
+        Q_opt = self.opt_query(option_embeddings)                 # (B, N, d_k)
+        # v3 question modulation (identity at init — see __init__ note)
+        gate = self.q_mod_scale(question_emb).unsqueeze(1)        # (B, 1, d_k)
+        shift = self.q_mod_bias(question_emb).unsqueeze(1)        # (B, 1, d_k)
+        Q = F.normalize((1.0 + gate) * Q_opt + shift, dim=-1)     # (B, N, d_k)
 
         # (B, N, d_k) × (B, d_k, M) → (B, N, M)
         attn = torch.bmm(Q, K.transpose(1, 2)) * self.attn_scale
@@ -206,6 +274,10 @@ class DynamicDecisionHead(nn.Module):
             attn = attn.masked_fill(~state_mask.unsqueeze(1), float("-inf"))
         alpha = torch.softmax(attn, dim=-1)                       # over fields
         z = torch.bmm(alpha, field_repr)                          # (B, N, H)
+        # v3 value-side question modulation (identity at init)
+        z_gate = self.z_mod_scale(question_emb).unsqueeze(1)      # (B, 1, H)
+        z_shift = self.z_mod_bias(question_emb).unsqueeze(1)      # (B, 1, H)
+        z = (1.0 + z_gate) * z + z_shift                          # (B, N, H)
         return self.score_head(z).squeeze(-1)                     # (B, N)
 
     def _forward_attention(
@@ -253,11 +325,16 @@ class DynamicDecisionHead(nn.Module):
         state_embedding: torch.Tensor,
         option_embeddings: torch.Tensor,
         state_mask: torch.Tensor | None = None,
+        question_emb: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Score state against choice options → (batch, n_opts) logits."""
+        """Score state against choice options → (batch, n_opts) logits.
+
+        question_emb (v2/v3 heads) modulates the option queries; ignored
+        by v1 heads.
+        """
         if self.state_set:
             return self._forward_attention_set(
-                state_embedding, option_embeddings, state_mask,
+                state_embedding, option_embeddings, state_mask, question_emb,
             )
         return self._forward_attention(state_embedding, option_embeddings)
 
@@ -266,11 +343,16 @@ class DynamicDecisionHead(nn.Module):
         state_embedding: torch.Tensor,
         level_embeddings: torch.Tensor,
         state_mask: torch.Tensor | None = None,
+        question_emb: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Score state against rubric levels → (batch, n_levels) logits."""
+        """Score state against rubric levels → (batch, n_levels) logits.
+
+        question_emb (v2/v3 heads) modulates the level queries; ignored
+        by v1 heads.
+        """
         if self.state_set:
             return self._forward_attention_set(
-                state_embedding, level_embeddings, state_mask,
+                state_embedding, level_embeddings, state_mask, question_emb,
             )
         return self._forward_attention(state_embedding, level_embeddings)
 
@@ -380,9 +462,10 @@ def predict_dynamic(
         state_embedding: (input_dim,) single state vector (v1) or
             (M, input_dim) field set (v2).
         questions: list of dynamic question configs.
-        option_embeddings_cache: {option_text: (input_dim,) embedding} —
-            pre-computed embeddings for all option texts referenced by
-            questions, including "false" and "true" for noul.
+        option_embeddings_cache: {text: (input_dim,) embedding} — pre-computed
+            embeddings for all option texts referenced by questions (including
+            "false" and "true" for noul) AND for the question strings
+            themselves (v3 question conditioning).
         head: trained DynamicDecisionHead in eval mode.
 
     Returns:
@@ -397,7 +480,14 @@ def predict_dynamic(
             opt_embs = torch.stack(
                 [option_embeddings_cache[t] for t in texts]
             )  # (n_opts, D)
-            scores = head.forward_choice(state_embedding, opt_embs)
+            # v3: empty/missing question → None → zero-vector modulation
+            qtext = (q.get("question") or "").strip()
+            question_emb = (
+                option_embeddings_cache[qtext] if qtext else None
+            )
+            scores = head.forward_choice(
+                state_embedding, opt_embs, question_emb=question_emb,
+            )
             results[i] = decode_dynamic_answer(q, scores, temperature)
     return results
 
@@ -443,7 +533,7 @@ def save_dynamic_head(
             "arch": {
                 "type": "dynamic",
                 "state_set": model.state_set,
-                "arch_version": 2,
+                "arch_version": 3,
                 "input_dim": model.input_dim,
                 "hidden_dim": model.hidden_dim,
                 "d_k": model.d_k,
@@ -458,7 +548,7 @@ def load_dynamic_head(
     path: str | Path,
     device: torch.device | None = None,
 ) -> DynamicDecisionHead:
-    """Load a DynamicDecisionHead from checkpoint (v1 or v2 arch)."""
+    """Load a DynamicDecisionHead from checkpoint (v1, v2 or v3 arch)."""
     checkpoint = torch.load(str(path), map_location="cpu")
     arch = checkpoint["arch"]
     if arch.get("type") != "dynamic":
@@ -472,7 +562,25 @@ def load_dynamic_head(
         d_k=arch.get("d_k", D_K),
         state_set=arch.get("state_set", False),
     )
-    model.load_state_dict(checkpoint["model_state"])
+    arch_version = arch.get("arch_version", 2)
+    if arch_version < 3:
+        # v2 (or earlier state_set) checkpoints predate the question-fusion
+        # keys; load what exists and leave q_mod_* at zero-init — identity
+        # modulation, i.e. question text ignored until retrain.
+        result = model.load_state_dict(checkpoint["model_state"], strict=False)
+        missing, unexpected = result.missing_keys, result.unexpected_keys
+        if missing:
+            print(
+                f"v{arch_version} checkpoint: {len(missing)} v3 fusion keys "
+                f"left at identity init — question text is ignored until "
+                f"retrain"
+            )
+        if unexpected:
+            raise ValueError(
+                f"Checkpoint at {path} has unexpected state keys: {unexpected}"
+            )
+    else:
+        model.load_state_dict(checkpoint["model_state"])
     if device is not None:
         model = model.to(device)
     model.temperature = checkpoint.get("temperature", DEFAULT_TEMPERATURE)

@@ -20,6 +20,7 @@ from decision_lab.states.fields import _flatten_json, split_sentences
 
 BREAKOUT_STATE_TYPE = "breakout"
 PADDLE_QID = "paddle_direction"
+MOTION_QID = "ball_motion"
 
 # |ball_x - paddle_x| <= this → gold "stay"
 STAY_THRESHOLD_PX = 24
@@ -29,7 +30,7 @@ GAP_MIN_SKIP = 8  # side gaps start at STAY_THRESHOLD_PX + this
 
 PADDLE_X_RANGE = (360, 480)   # keeps ±GAP_MAX_PX ball positions on a 800px board
 BALL_Y_RANGE = (100, 500)
-VELOCITIES = (-3, -2, -1, 1, 2, 3)   # nonzero vx/vy magnitudes
+VELOCITIES = (-3, -2, -1, 0, 1, 2, 3)   # vx/vy magnitudes; 0 → ball_motion "stay"
 
 BREAKOUT_TEMPLATES: tuple[str, ...] = (
     "prose", "prose_short", "prose_vague", "structured", "log",
@@ -53,8 +54,19 @@ class BreakoutLatents:
     template: str
 
     def labels(self) -> dict:
-        """Gold label: move toward the ball's horizontal position."""
-        return {PADDLE_QID: GOLD_BY_SIDE[self.side]}
+        """Gold labels for both breakout questions.
+
+        paddle_direction: move toward the ball's horizontal position.
+        ball_motion: sign of ball_vx — deliberately independent of the
+        paddle gold (vx is decorrelated from side), so the same state has
+        different answers under the two questions and the head must read
+        the question text (v3 conditioning).
+        """
+        motion = "stay" if self.ball_vx == 0 else ("left" if self.ball_vx < 0 else "right")
+        return {
+            PADDLE_QID: GOLD_BY_SIDE[self.side],
+            MOTION_QID: motion,
+        }
 
 
 def _sample_latents(rng: Random) -> BreakoutLatents:
@@ -114,7 +126,12 @@ def generate_breakout_dataset(cfg: Config, data_dir: Path, rng: Random) -> None:
 
 
 def breakout_question_spec() -> dict:
-    """Dynamic question spec for paddle-direction choice questions."""
+    """Dynamic question specs for the two breakout choice questions.
+
+    ball_motion deliberately shares BREAKOUT_OPTIONS with paddle_direction:
+    identical option texts (→ identical option embeddings) with independent
+    golds make the question text the only discriminator.
+    """
     return {
         PADDLE_QID: {
             "type": "choice",
@@ -123,6 +140,15 @@ def breakout_question_spec() -> dict:
                 "left": "Move the paddle left",
                 "right": "Move the paddle right",
                 "stay": "Keep the paddle still",
+            },
+        },
+        MOTION_QID: {
+            "type": "choice",
+            "options": list(BREAKOUT_OPTIONS),
+            "option_descriptions": {
+                "left": "The ball moves left",
+                "right": "The ball moves right",
+                "stay": "The ball has no horizontal motion",
             },
         },
     }
@@ -178,21 +204,41 @@ def _motion_phrase(vx: int, vy: int) -> str:
 
     The toward/away clause follows the vertical motion (rising reads as
     "away" regardless of side), matching the phrasing real game states use.
+    vx or vy may be 0 (ball_motion "stay"). Zero-motion phrases must stay
+    lexically NEUTRAL: wording like "holding its horizontal position"
+    embeds near the "stay" option (and its "hold" synonym variant), so the
+    stay query matches the geometry field regardless of side — contradictory
+    supervision that stalls head training at uniform attention (verified:
+    val 0.33 → 0.99 after neutralizing the phrasing).
     """
+    if vx == 0:
+        return "not moving left or right"
     horiz = "moving right" if vx > 0 else "moving left"
-    vert = "up" if vy < 0 else "down"
-    relation = "away from the paddle" if vy < 0 else "toward the paddle"
+    if vy < 0:
+        vert, relation = "up", "away from the paddle"
+    elif vy > 0:
+        vert, relation = "down", "toward the paddle"
+    else:
+        return f"{horiz} and not moving up or down"
     return f"{horiz} and {vert}, {relation}"
 
 
 def _short_motion(vx: int, vy: int) -> str:
-    """Compact motion words for the short/vague templates."""
+    """Compact motion words for the short/vague templates.
+
+    Zero-motion words are lexically neutral — see _motion_phrase.
+    """
     parts = []
     if vx > 0:
         parts.append("drifting right")
     elif vx < 0:
         parts.append("drifting left")
-    parts.append("rising" if vy < 0 else "falling")
+    if vy < 0:
+        parts.append("rising")
+    elif vy > 0:
+        parts.append("falling")
+    else:
+        parts.append("not moving up or down")
     return ", ".join(parts)
 
 
@@ -214,6 +260,8 @@ def _motion_echo(vy: int, side: str) -> str:
     """Echo sentence real game states append ("Rising away from the paddle.")."""
     if side == "center":
         return "The paddle is under the ball"
+    if vy == 0:
+        return "The ball is not moving up or down"
     return "Rising away from the paddle" if vy < 0 else "Falling toward the paddle"
 
 
