@@ -215,6 +215,11 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   border-radius: 5px;
 }
 .dist-pct { color: var(--muted); font-size: 11px; min-width: 44px; }
+.dist-warning {
+  margin-top: 4px;
+  color: var(--warn);
+  font-size: 11px;
+}
 
 /* LM raw output */
 .raw-output-details { margin-top: 10px; }

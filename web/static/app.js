@@ -253,7 +253,25 @@ function renderDistribution(q) {
     `;
     wrap.appendChild(row);
   }
+  if (isNearUniform(q.distribution)) {
+    const warn = document.createElement("div");
+    warn.className = "dist-warning";
+    warn.textContent = "near-uniform — answer unreliable (state text likely outside the trained shape/domain)";
+    wrap.appendChild(warn);
+  }
   return wrap;
+}
+
+// A distribution whose top probability is barely above uniform carries no
+// decision signal — the head fell back to mush (e.g. unseen state shape or
+// out-of-domain options). Flag it so the UI never presents mush as an answer.
+// Margin below the top option: uniform = 1/n, mush cutoff = halfway to certain.
+function isNearUniform(distribution) {
+  const probs = Object.values(distribution);
+  const n = probs.length;
+  if (n < 2) return false;
+  const top = Math.max(...probs);
+  return top < 1 / n + 0.5 * (1 - 1 / n);
 }
 
 function showSummary(agentOutputs) {
