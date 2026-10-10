@@ -77,8 +77,6 @@ dynamic_head:
   # v4: separate checkpoint filename — the preserved v3 head_dynamic.pt is
   # never overwritten by a v4 retrain (this branch only).
   checkpoint_filename: "head_dynamic_v4.pt"
-  question_logit_bias: false
-  question_resample_per_epoch: false
 
 # Post-training temperature calibration (per question)
 calibration:

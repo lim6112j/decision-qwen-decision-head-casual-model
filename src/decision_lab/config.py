@@ -76,12 +76,6 @@ class DynamicHeadConfig:
     # v4: checkpoint filename (new name so the preserved v3 checkpoint at
     # head_dynamic.pt is never overwritten by a v4 retrain)
     checkpoint_filename: str = "head_dynamic.pt"
-    # v4 ablation: add a per-field relevance bias from the question query
-    # to the option attention logits (off = question affects read-out only)
-    question_logit_bias: bool = False
-    # v4: re-draw (phrasing, option-variant) assignments per epoch if
-    # val curves show phrasing memorization (pure cache lookups, cheap)
-    question_resample_per_epoch: bool = False
     # Add shape-variant duplicates of document states (flattened /
     # marker-stripped, same gold — states/shapes.py) to dynamic-head
     # training. The field-set head collapses to near-uniform logits on

@@ -53,8 +53,6 @@ dynamic_head:
   max_fields: 16
   shape_augmentation: true
   checkpoint_filename: "head_dynamic_v4.pt"
-  question_logit_bias: false
-  question_resample_per_epoch: false
 
 calibration:
   holdout_fraction: 0.1
