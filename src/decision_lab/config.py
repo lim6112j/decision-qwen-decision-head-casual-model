@@ -59,7 +59,7 @@ class DynamicHeadConfig:
     dropout: float = 0.1
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
-    batch_size: int = 64
+    batch_size: int = 128
     max_epochs: int = 100
     patience: int = 10
     # Curriculum: epochs before introducing varied option sets
@@ -73,6 +73,9 @@ class DynamicHeadConfig:
     # between feature extraction and inference — enforced via config.
     include_summary_field: bool = True
     max_fields: int = 16
+    # v4: checkpoint filename (new name so the preserved v3 checkpoint at
+    # head_dynamic.pt is never overwritten by a v4 retrain)
+    checkpoint_filename: str = "head_dynamic.pt"
     # Add shape-variant duplicates of document states (flattened /
     # marker-stripped, same gold — states/shapes.py) to dynamic-head
     # training. The field-set head collapses to near-uniform logits on

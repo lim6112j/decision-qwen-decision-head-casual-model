@@ -54,18 +54,24 @@ class BreakoutLatents:
     template: str
 
     def labels(self) -> dict:
-        """Gold labels for both breakout questions.
+        """Gold labels for the breakout question bank.
 
         paddle_direction: move toward the ball's horizontal position.
         ball_motion: sign of ball_vx — deliberately independent of the
         paddle gold (vx is decorrelated from side), so the same state has
         different answers under the two questions and the head must read
-        the question text (v3 conditioning).
+        the question text (v3 conditioning; the v4 forcing pair).
+        Derived predicates (v4 compositional bank): exact by construction
+        from the latents.
         """
         motion = "stay" if self.ball_vx == 0 else ("left" if self.ball_vx < 0 else "right")
+        paddle = GOLD_BY_SIDE[self.side]
         return {
-            PADDLE_QID: GOLD_BY_SIDE[self.side],
+            PADDLE_QID: paddle,
             MOTION_QID: motion,
+            "is_ball_left": self.side == "left",
+            "ball_moving": self.ball_vx != 0,
+            "ball_rising": self.ball_vy < 0,
         }
 
 

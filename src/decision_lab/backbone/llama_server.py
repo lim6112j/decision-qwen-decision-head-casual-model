@@ -18,6 +18,7 @@ class LlamaServer:
         self.context_length = context_length
         self._proc: Optional[subprocess.Popen] = None
         self._log_file = None
+        self._adopted = False
         self.base_url = f"http://127.0.0.1:{port}"
 
     @property
@@ -27,9 +28,31 @@ class LlamaServer:
         poll = self._proc.poll()
         return poll is None
 
+    def _health_ok(self, timeout: float = 2.0) -> bool:
+        """True if a server already answers /health on the port."""
+        try:
+            r = requests.get(f"{self.base_url}/health", timeout=timeout)
+        except requests.RequestException:
+            return False
+        return r.status_code == 200
+
     def start(self) -> None:
-        """Launch llama-server subprocess."""
+        """Launch llama-server subprocess, or adopt a healthy one already up.
+
+        If something is already answering /health on the port (e.g. a remote
+        llama-server reached over an ssh tunnel), reuse it and do NOT spawn a
+        local process — stop() then leaves it untouched.
+
+        Consistency caveat: embedding vectors depend on the served backend
+        (model file, quantization, pooling). Feature caches extracted from
+        one backend and option/question embeddings from another land in
+        different spaces and silently corrupt the head — extract and train
+        against the SAME server.
+        """
         if self.running:
+            return
+        if self._health_ok():
+            self._adopted = True
             return
         if not self.gguf_path.exists():
             raise FileNotFoundError(f"GGUF model not found: {self.gguf_path}")
@@ -54,6 +77,10 @@ class LlamaServer:
 
     def stop(self) -> None:
         if self._proc is None:
+            return
+        if getattr(self, "_adopted", False):
+            # We didn't spawn this server (a remote/tunneled one) — leave it up.
+            self._proc = None
             return
         self._proc.terminate()
         try:

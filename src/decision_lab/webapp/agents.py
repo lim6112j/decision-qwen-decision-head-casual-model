@@ -192,7 +192,7 @@ class DynamicHeadAgent:
     ) -> torch.Tensor:
         """Embed options + question (cached) and score them → (1, n_opts).
 
-        question_text conditions the option queries (v3 FiLM fusion);
+        question_text provides the question-field attention query (v4);
         empty string → zero-vector modulation (learned null question).
         """
         texts = list(option_texts)
@@ -326,7 +326,7 @@ def _load_dynamic_agent(
     """Load a DynamicHeadAgent (trained or fallback to random init)."""
     from decision_lab import MODELS_DIR
 
-    path = MODELS_DIR / "head_dynamic.pt"
+    path = MODELS_DIR / cfg.dynamic_head.checkpoint_filename
     question_spec_copy = dict(question_spec)
 
     try:

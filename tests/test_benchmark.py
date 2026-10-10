@@ -160,12 +160,14 @@ class TestLoadDynamicForBenchmark:
             _load_dynamic_for_benchmark(cfg, tmp_path, torch.device("cpu"))
 
     def test_valid_checkpoint_loads(self, cfg, tmp_path):
-        head = DynamicDecisionHead()
+        head = DynamicDecisionHead(state_set=True)   # v4 is state_set
         torch.save(
             {
                 "model_state": head.state_dict(),
                 "arch": {
                     "type": "dynamic",
+                    "state_set": True,
+                    "arch_version": 4,
                     "input_dim": head.input_dim,
                     "hidden_dim": head.hidden_dim,
                     "d_k": head.d_k,
@@ -179,3 +181,84 @@ class TestLoadDynamicForBenchmark:
         )
         assert isinstance(loaded, DynamicDecisionHead)
         assert temperature == 2.5
+
+class TestBenchmarkDynamicPhrasings:
+    """The v4 held-out-phrasing eval must actually run end to end.
+
+    Regression guard: this function shipped with a NameError (is_correct_dynamic
+    not imported) that the whole suite passed through, because nothing
+    exercised it. It is the row that measures the v4 generalization claim.
+    """
+
+    @pytest.fixture
+    def cfg(self):
+        return Config()
+
+    class _FakeServer:
+        """Deterministic embedder: hash-free, index-stable, right shape."""
+
+        def __init__(self, dim=64):
+            self.dim = dim
+
+        def embed(self, texts):
+            out = []
+            for t in texts:
+                g = torch.Generator().manual_seed(abs(hash(t)) % (2**31))
+                out.append(torch.randn(self.dim, generator=g).numpy())
+            return out
+
+    def _write_split(self, data_dir, name, states, dim):
+        from decision_lab.backbone.features import extract_field_features  # noqa
+        from decision_lab.states.dataset import save_dataset
+
+        save_dataset(states, data_dir / f"{name}.jsonl")
+        # hand-build the ragged field cache: 1 field per state, `dim` wide
+        rng = np.random.RandomState(0)
+        feats = rng.randn(len(states), dim).astype(np.float32)
+        counts = np.ones(len(states), dtype=np.int64)
+        np.savez_compressed(
+            data_dir / f"features_{name}_fields.npz",
+            features=feats, field_counts=counts, fingerprint="test",
+        )
+
+    def test_runs_and_reports_per_qid_accuracy(self, cfg, tmp_path):
+        from decision_lab.eval.benchmark import _benchmark_dynamic_phrasings
+        from decision_lab.head.dynamic_model import save_dynamic_head
+        from decision_lab.states.dataset import TextState
+
+        dim = 64
+        states = [
+            TextState(
+                doc_id=i, state_type="text", text=f"doc {i}",
+                labels={"sentiment": "positive", "urgency": "low",
+                        "quality": 1, "is_actionable": False,
+                        "contains_pii": False, "is_urgent": False},
+            )
+            for i in range(3)
+        ]
+        self._write_split(tmp_path, "test_indist", states, dim)
+
+        head = DynamicDecisionHead(input_dim=dim, hidden_dim=32, d_k=16,
+                                   dropout=0.0, state_set=True)
+        save_dynamic_head(head, tmp_path / cfg.dynamic_head.checkpoint_filename)
+
+        cfg_bench = Config()
+        metrics = _benchmark_dynamic_phrasings(
+            tmp_path, cfg_bench, self._FakeServer(dim), tmp_path,
+            cfg_bench.benchmark, {},
+        )
+        assert metrics is not None
+        assert "test_indist" in metrics
+        per_q = metrics["test_indist"].per_question_accuracy
+        # non-canonical phrasings of bank qids are evaluated
+        assert "sentiment" in per_q
+        assert "not_urgent" in per_q        # qid outside the fixed bank
+        assert all(0.0 <= a <= 1.0 for a in per_q.values())
+
+    def test_missing_splits_return_none(self, cfg, tmp_path):
+        from decision_lab.eval.benchmark import _benchmark_dynamic_phrasings
+
+        metrics = _benchmark_dynamic_phrasings(
+            tmp_path, cfg, self._FakeServer(64), tmp_path, cfg.benchmark, {},
+        )
+        assert metrics is None

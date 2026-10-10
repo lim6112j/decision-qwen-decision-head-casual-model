@@ -138,7 +138,7 @@ def cmd_train_dynamic(args):
             include_summary_field=dcfg.include_summary_field,
         )
         train_dynamic_head(
-            samples, cfg, args.models_dir / "head_dynamic.pt",
+            samples, cfg, args.models_dir / dcfg.checkpoint_filename,
             anchor_fraction=dcfg.anchor_epochs / max(dcfg.max_epochs, 1),
         )
 

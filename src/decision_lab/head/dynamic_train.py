@@ -30,9 +30,6 @@ from decision_lab.config import Config
 from decision_lab.head.dynamic_model import (
     DynamicDecisionHead,
     get_device,
-    make_choice_question,
-    make_noul_question,
-    make_score_question,
     question_option_texts,
     save_dynamic_head,
 )
@@ -138,38 +135,8 @@ SCORE_SYNONYM_MAPS: dict[str, list[list[str]]] = {
     ],
 }
 
-# v3: hand-written natural-language phrasings per qid. The backbone uses
-# "last"-token pooling (order-sensitive), so these are FIXED lists — no
-# generated or permuted phrasings. Entry 0 is the canonical/default question;
-# variants sample from the whole list.
-QUESTION_PHRASINGS: dict[str, list[str]] = {
-    "paddle_direction": [
-        "Which direction should the paddle move?",
-        "which direction the paddle move?",
-        "paddle direction?",
-        "Where should the paddle go next?",
-    ],
-    "ball_motion": [
-        "Which way is the ball moving horizontally?",
-        "ball horizontal motion?",
-        "Is the ball drifting left or right?",
-    ],
-    "sentiment": [
-        "What is the sentiment of this message?",
-        "sentiment of the message?",
-        "How does this message feel tonally?",
-    ],
-    "urgency": [
-        "How urgent is this item?",
-        "urgency level?",
-        "How soon does this need attention?",
-    ],
-    "quality": [
-        "What is the quality of this text?",
-        "quality rating?",
-        "How well written is this?",
-    ],
-}
+# v4: the question bank (question_bank.py) owns phrasings; canonical text
+# per qid = bank phrasings entry 0.
 
 # Fraction of training samples that carry NO question (question_emb=None).
 # The zero-vector modulation is a learned constant — the head must see it
@@ -178,125 +145,16 @@ EMPTY_QUESTION_FRACTION = 0.05
 
 
 def default_question_text(qid: str) -> str:
-    """Canonical question text for a qid (entry 0 of QUESTION_PHRASINGS)."""
-    phrasings = QUESTION_PHRASINGS.get(qid)
-    return phrasings[0] if phrasings else qid
+    """Canonical question text for a qid (bank phrasings entry 0).
 
-
-def _generate_choice_variants(
-    base_options: list[str],
-    qid: str,
-    rng: Random,
-    num_variants: int,
-) -> list[dict]:
-    """Generate variant option sets for a choice question.
-
-    Returns list of {"options": [...], "gold_map": {orig_opt: variant_opt}}.
+    Falls back to the qid itself for questions outside the v4 bank (the
+    serving agent's fixed-bank path still asks config-bank qids).
     """
-    synonym_map = CHOICE_SYNONYM_MAPS.get(qid, {})
-    if not synonym_map:
-        return []
-
-    variants = []
-    # Each "column" of synonyms becomes a variant
-    num_cols = min(len(next(iter(synonym_map.values()))), num_variants)
-    for col in range(num_cols):
-        gold_map = {}
-        options = []
-        for orig_opt in base_options:
-            syns = synonym_map.get(orig_opt, [orig_opt])
-            variant_opt = syns[col] if col < len(syns) else orig_opt
-            gold_map[orig_opt] = variant_opt
-            options.append(variant_opt)
-        # Shuffle option order (head must learn permutation invariance)
-        idx = list(range(len(options)))
-        rng.shuffle(idx)
-        shuffled_opts = [options[i] for i in idx]
-        shuffled_map = {
-            orig: shuffled_opts[idx.index(i)]
-            for i, orig in enumerate(gold_map)
-        }
-        variants.append({"options": shuffled_opts, "gold_map": shuffled_map})
-
-    return variants
-
-
-def _generate_score_variants(
-    base_levels: list[str],
-    qid: str,
-    rng: Random,
-    num_variants: int,
-) -> list[dict]:
-    """Generate variant level sets for a score question.
-
-    Each variant has a different number of levels and/or different labels.
-    """
-    level_variants = SCORE_SYNONYM_MAPS.get(qid, [])
-    if not level_variants:
-        return []
-
-    variants = []
-    for level_set in level_variants[:num_variants]:
-        # Map base level index → variant level index via proportional scaling
-        base_n = len(base_levels)
-        var_n = len(level_set)
-        gold_map = {}
-        for base_idx in range(base_n):
-            # Scale: base_idx ∈ [0, base_n-1] → var_idx ∈ [0, var_n-1]
-            var_idx = min(int(round(base_idx * (var_n - 1) / max(base_n - 1, 1))), var_n - 1)
-            gold_map[str(base_idx)] = var_idx
-        variants.append({"levels": list(level_set), "gold_map": gold_map})
-
-    return variants
-
-
-def generate_variant_questions(
-    base_spec: dict,
-    rng: Random | None = None,
-    num_choice_variants: int = 3,
-    num_score_variants: int = 3,
-) -> list[dict]:
-    """Generate varied question configs from the base question spec.
-
-    Returns list of dynamic question configs. Each config has the same
-    question type as the base but with different option/level labels.
-    """
-    if rng is None:
-        rng = Random(42)
-
-    variants = []
-    for qid, spec in base_spec.items():
-        kind = spec["type"]
-        if kind == "choice":
-            choice_variants = _generate_choice_variants(
-                spec["options"], qid, rng, num_choice_variants,
-            )
-            for v in choice_variants:
-                variants.append({
-                    "qid": qid,
-                    "base_type": "choice",
-                    "question": make_choice_question(
-                        v["options"], rng.choice(QUESTION_PHRASINGS.get(qid, [qid])),
-                    ),
-                    "gold_map": v["gold_map"],
-                    "is_variant": True,
-                })
-        elif kind == "score":
-            score_variants = _generate_score_variants(
-                spec["levels"], qid, rng, num_score_variants,
-            )
-            for v in score_variants:
-                variants.append({
-                    "qid": qid,
-                    "base_type": "score",
-                    "question": make_score_question(
-                        v["levels"], rng.choice(QUESTION_PHRASINGS.get(qid, [qid])),
-                    ),
-                    "gold_map": v["gold_map"],
-                    "is_variant": True,
-                })
-
-    return variants
+    from decision_lab.head.question_bank import build_question_bank
+    for entry in build_question_bank():
+        if entry.qid == qid:
+            return entry.phrasings[0]
+    return qid
 
 
 # ---------------------------------------------------------------------------
@@ -314,19 +172,24 @@ def generate_dynamic_training_data(
     shape_augmentation: bool = False,
     include_summary_field: bool = True,
 ) -> list[DynamicTrainingSample]:
-    """Generate (state, options, gold) training samples.
+    """Generate (state, options, gold) training samples from the v4 bank.
 
-    For each state and each question (base + variants), produces one sample
-    with option embeddings and a gold label index.
+    v4 rewrite: the compositional bank (question_bank.build_question_bank)
+    replaces base_spec + hand-written variants. One sample per (state, qid)
+    pair — phrasing and option-set drawn with the seeded rng — never the
+    full phrasing cross-product (that's 10M+ samples; one draw keeps ~200k).
+    Stage 1 (is_stage2=False): canonical phrasing, base option set — every
+    qid including the breakout forcing pair. Stage 2: everything else.
 
     Args:
         states: list of TextState objects with gold labels.
         field_features: per-state (M_i, input_dim) field-set embeddings,
-            aligned with ``states`` (v1 pooled vectors = M_i == 1).
-        base_spec: normalized question bank from build_question_spec(cfg.questions).
-        server: LlamaServer (must be running) for embedding option texts.
-        rng: random state for shuffling.
-        num_variants_per_question: how many option-set variants to generate.
+            aligned with ``states``.
+        base_spec: kept for signature compatibility (unused by the bank;
+            callers may pass the config bank for logging).
+        server: LlamaServer (must be running) for embedding option/question texts.
+        rng: random state for phrasing/variant draws.
+        num_variants_per_question: option-set synonym variants per qid (2).
         shape_augmentation: add shape-variant duplicates of document states
             (flattened / marker-stripped re-renderings with identical gold —
             see states/shapes.py). Breakout states are skipped: they are
@@ -342,61 +205,30 @@ def generate_dynamic_training_data(
     if rng is None:
         rng = Random(42)
 
-    # Generate variant question configs
-    variants = generate_variant_questions(base_spec, rng, num_variants_per_question, num_variants_per_question)
+    from decision_lab.head.question_bank import build_question_bank
 
-    # Build base question configs
-    base_questions = []
-    for qid, spec in base_spec.items():
-        kind = spec["type"]
-        if kind == "choice":
-            base_questions.append({
-                "qid": qid,
-                "base_type": "choice",
-                "question": make_choice_question(spec["options"], default_question_text(qid)),
-                "gold_map": None,  # no mapping needed (1:1)
-            })
-        elif kind == "score":
-            base_questions.append({
-                "qid": qid,
-                "base_type": "score",
-                "question": make_score_question(spec["levels"], default_question_text(qid)),
-                "gold_map": None,
-            })
-        elif kind == "noul":
-            base_questions.append({
-                "qid": qid,
-                "base_type": "noul",
-                "question": make_noul_question(spec.get("question", qid)),
-                "gold_map": None,
-            })
+    bank = build_question_bank()
 
-    all_question_configs = base_questions + variants
+    # Option-set synonym variants per choice/score qid (CHOICE/SCORE_SYNONYM_MAPS
+    # keyed by qid; bank qids without an entry get base options only).
+    option_variants: dict[str, list[dict]] = {}
+    for entry in bank:
+        if entry.kind == "choice" or entry.kind == "score":
+            variants = _variants_for_bank_entry(entry, num_variants_per_question, rng)
+            if variants:
+                option_variants[entry.qid] = variants
 
-    # Collect all unique option texts AND question texts and embed them
-    all_option_texts: set[str] = set()
-    # Always include false/true for noul binary head (they're implied labels)
-    all_option_texts.update(["false", "true"])
-    for qc in all_question_configs:
-        q = qc["question"]
-        if q["type"] != "noul":
-            for t in question_option_texts(q):
-                all_option_texts.add(t)
-        # v3: question strings ride the same embed pass (FiLM-modulate queries)
-        if q.get("question"):
-            all_option_texts.add(q["question"])
+    # Collect all unique option/question texts and embed them in one pass
+    all_texts: set[str] = {"false", "true"}
+    for entry in bank:
+        all_texts.update(entry.options or ())
+        all_texts.update(entry.phrasings)
+        for v in option_variants.get(entry.qid, []):
+            all_texts.update(v["options"])
 
-    # Embed all option/question texts in one batch
-    unique_texts = sorted(all_option_texts)
+    unique_texts = sorted(all_texts)
     print(f"  embedding {len(unique_texts)} unique option/question texts...")
-    text_to_emb = {}
-    if unique_texts:
-        batch_size = 32
-        for i in range(0, len(unique_texts), batch_size):
-            batch = unique_texts[i : i + batch_size]
-            embs = server.embed(batch)
-            for text, emb in zip(batch, embs):
-                text_to_emb[text] = np.array(emb, dtype=np.float32)
+    text_to_emb = _embed_texts(server, unique_texts)
 
     # Shape-variant duplicates of document states: same latents → same gold,
     # different surface shape. Their field sets don't exist in the precomputed
@@ -421,13 +253,7 @@ def generate_dynamic_training_data(
                 texts.extend(field_texts)
         unique = list(dict.fromkeys(texts))
         print(f"  shape augmentation: embedding {len(unique)} unique variant field texts...")
-        emb_by_text: dict[str, np.ndarray] = {}
-        batch_size = 32
-        for i in range(0, len(unique), batch_size):
-            batch = unique[i : i + batch_size]
-            embs = server.embed(batch)
-            for text, emb in zip(batch, embs):
-                emb_by_text[text] = np.array(emb, dtype=np.float32)
+        emb_by_text = _embed_texts(server, unique)
         for state_index, field_texts in pending:
             extra.append((
                 np.stack([emb_by_text[t] for t in field_texts]),
@@ -438,50 +264,55 @@ def generate_dynamic_training_data(
     samples = []
 
     def emit(i: int, state_fields_emb: np.ndarray) -> None:
-        """Emit one sample per question config for one state embedding."""
+        """Emit ONE sample per applicable qid for one state embedding."""
         state = states[i]
-        for qc in all_question_configs:
-            q = qc["question"]
-            qid = qc["qid"]
-            gold = state.labels.get(qid)
+        for entry in bank:
+            if not entry.applicable(state):
+                continue
 
-            if gold is None:
-                continue  # question not applicable to this state
+            gold = entry.gold(state)
 
-            kind = q["type"]
+            # Draw phrasing + option set for this (state, qid) pair
+            phrasing_idx = rng.randrange(len(entry.phrasings))
+            question_text = entry.phrasings[phrasing_idx]
+            # Stage-2 marker: any non-canonical phrasing or option variant.
+            # Canonical-phrasing base-option samples are stage 1 — that
+            # includes EVERY qid, so the breakout forcing pair anchors the
+            # question path in stage 1.
+            variant_opts = option_variants.get(entry.qid)
+            # occasionally keep base options even in stage 2 samples
+            use_variant = variant_opts is not None and (
+                phrasing_idx != 0 or rng.random() < 0.5
+            )
+            if use_variant:
+                v = variant_opts[rng.randrange(len(variant_opts))]
+                option_texts, gold_map = v["options"], v["gold_map"]
+            else:
+                option_texts, gold_map = list(entry.options), None
+
+            kind = entry.kind
             if kind == "noul":
                 gold_idx = 1 if bool(gold) else 0
                 # noul goes through the attention path with [false, true]
                 opt_embs = np.stack([text_to_emb["false"], text_to_emb["true"]])
-            else:
-                # Map gold label to variant option index
-                gold_map = qc.get("gold_map")
-                if gold_map is not None:
-                    mapped_gold = gold_map[str(gold)]
-                else:
-                    mapped_gold = gold
-
-                option_texts = question_option_texts(q)
-                if kind == "choice":
-                    # gold is option key → find its index in the variant's option list
-                    gold_idx = option_texts.index(str(mapped_gold))
-                else:
-                    # gold is level index → mapped_gold is the variant level index
-                    gold_idx = int(mapped_gold)
-
+            elif kind == "choice":
+                mapped = gold_map[str(gold)] if gold_map else gold
+                gold_idx = option_texts.index(str(mapped))
+                opt_embs = np.stack([text_to_emb[t] for t in option_texts])
+            else:  # score
+                mapped = gold_map[str(gold)] if gold_map else gold
+                gold_idx = int(mapped)
                 opt_embs = np.stack([text_to_emb[t] for t in option_texts])
 
-            # v3: mostly attach the question embedding; a small fraction is
-            # the empty question (None → zero-vector modulation at forward).
+            # Mostly attach the question embedding; a small fraction is the
+            # empty question (None → zero-vector query at forward).
             if rng.random() < EMPTY_QUESTION_FRACTION:
                 question_text = ""
                 question_emb = None
             else:
-                question_text = q.get("question", "")
-                # noul falls back to qid when the spec has no question text
-                if not question_text:
-                    question_text = default_question_text(qid)
                 question_emb = text_to_emb[question_text]  # by reference
+
+            is_stage2 = phrasing_idx != 0 or use_variant
 
             samples.append(DynamicTrainingSample(
                 state_fields_emb=state_fields_emb,
@@ -490,7 +321,7 @@ def generate_dynamic_training_data(
                 question_type=kind,
                 question_text=question_text,
                 question_emb=question_emb,
-                is_variant=bool(qc.get("is_variant", False)),
+                is_variant=is_stage2,
             ))
 
     for i in range(len(states)):
@@ -501,10 +332,73 @@ def generate_dynamic_training_data(
         # axis saved for phase 2.
         emit(state_index, field_emb)
 
+    n_stage1 = sum(1 for s in samples if not s.is_variant)
     print(f"  generated {len(samples)} training samples "
-          f"({len(base_questions)} base + {len(variants)} variant questions × "
-          f"{len(states) + len(extra)} states incl. shape variants)")
+          f"({n_stage1} stage-1 / {len(samples) - n_stage1} stage-2) over "
+          f"{len(bank)} bank qids × {len(states) + len(extra)} states incl. shape variants")
     return samples
+
+
+def _embed_texts(server, texts: list[str]) -> dict[str, np.ndarray]:
+    """Embed texts in fixed batches → {text: (input_dim,) float32}."""
+    emb: dict[str, np.ndarray] = {}
+    batch_size = 32
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        embs = server.embed(batch)
+        for text, e in zip(batch, embs):
+            emb[text] = np.array(e, dtype=np.float32)
+    return emb
+
+
+def _variants_for_bank_entry(
+    entry, num_variants: int, rng: Random,
+) -> list[dict]:
+    """Option-set synonym variants for a bank entry (choice/score).
+
+    Choice: one variant per synonym "column", option order shuffled
+    (permutation invariance). Score: full alternative rubric sets, gold
+    index mapped proportionally. Bank qids without a synonym entry get none.
+    """
+    kind = entry.kind
+    if kind == "choice":
+        synonym_map = CHOICE_SYNONYM_MAPS.get(entry.qid, {})
+        if not synonym_map:
+            return []
+        variants = []
+        num_cols = min(len(next(iter(synonym_map.values()))), num_variants)
+        for col in range(num_cols):
+            gold_map = {}
+            options = []
+            for orig_opt in entry.options:
+                syns = synonym_map.get(orig_opt, [orig_opt])
+                variant_opt = syns[col] if col < len(syns) else orig_opt
+                gold_map[orig_opt] = variant_opt
+                options.append(variant_opt)
+            idx = list(range(len(options)))
+            rng.shuffle(idx)
+            shuffled_opts = [options[i] for i in idx]
+            shuffled_map = {
+                orig: shuffled_opts[idx.index(i)]
+                for i, orig in enumerate(gold_map)
+            }
+            variants.append({"options": shuffled_opts, "gold_map": shuffled_map})
+        return variants
+
+    # score: full alternative rubric sets via proportional gold mapping
+    level_variants = SCORE_SYNONYM_MAPS.get(entry.qid, [])
+    if not level_variants:
+        return []
+    variants = []
+    base_n = len(entry.options)
+    for level_set in level_variants[:num_variants]:
+        var_n = len(level_set)
+        gold_map = {}
+        for base_idx in range(base_n):
+            var_idx = min(int(round(base_idx * (var_n - 1) / max(base_n - 1, 1))), var_n - 1)
+            gold_map[str(base_idx)] = var_idx
+        variants.append({"options": list(level_set), "gold_map": gold_map})
+    return variants
 
 
 # ---------------------------------------------------------------------------
@@ -533,15 +427,15 @@ def train_dynamic_head(
     device = get_device()
     print(f"Training dynamic head on device: {device} ({len(samples)} samples)")
 
-    # Separate base vs variant samples for curriculum (explicit flag —
-    # question texts no longer carry the "(variant)" marker)
-    base_samples = [s for s in samples if not s.is_variant]
-    variant_samples = [s for s in samples if s.is_variant]
-    print(f"  anchor samples: {len(base_samples)}, variant samples: {len(variant_samples)}")
+    # Separate stage-1 (canonical) vs stage-2 samples for curriculum
+    # (explicit is_stage2 flag — the v4 bank's two-stage curriculum)
+    stage1_samples = [s for s in samples if not s.is_variant]
+    stage2_samples = [s for s in samples if s.is_variant]
+    print(f"  stage-1 samples: {len(stage1_samples)}, stage-2 samples: {len(stage2_samples)}")
 
-    # Curriculum pools: base vs variant samples
-    is_variant = torch.tensor([s.is_variant for s in samples], dtype=torch.bool)
-    base_positions = torch.nonzero(~is_variant).squeeze(-1)
+    # Curriculum pools: stage-1 vs all samples
+    is_stage2 = torch.tensor([s.is_variant for s in samples], dtype=torch.bool)
+    stage1_positions = torch.nonzero(~is_stage2).squeeze(-1)
 
     # 3-way split for calibration holdout
     n = len(samples)
@@ -555,19 +449,19 @@ def train_dynamic_head(
     train_positions = torch.tensor(rest_idx[:split], dtype=torch.long)
     val_positions = torch.tensor(rest_idx[split:], dtype=torch.long)
 
-    # Anchor pool: base-question samples restricted to the train split
-    variant_arr = np.array([s.is_variant for s in samples], dtype=bool)
+    # Stage-1 pool: canonical-phrasing/base-option samples in the train split
+    stage2_arr = np.array([s.is_variant for s in samples], dtype=bool)
     in_train = np.zeros(n, dtype=bool)
     in_train[rest_idx[:split]] = True
-    anchor_pool = torch.tensor(
-        np.where(~variant_arr & in_train)[0], dtype=torch.long,
+    stage1_pool = torch.tensor(
+        np.where(~stage2_arr & in_train)[0], dtype=torch.long,
     )
 
     print(f"  train: {len(train_positions)}, val: {len(val_positions)}, "
           f"calibration holdout: {calib_n} "
-          f"(anchor pool: {len(anchor_pool)})")
+          f"(stage-1 pool: {len(stage1_pool)})")
 
-    # Model — v2 field-set architecture
+    # Model — v4 question-field attention architecture
     model = DynamicDecisionHead(
         input_dim=1024,
         hidden_dim=hc.hidden_dim,
@@ -590,14 +484,14 @@ def train_dynamic_head(
 
     batch_size = hc.batch_size
     for epoch in range(1, hc.max_epochs + 1):
-        # Curriculum: first anchor_epochs use base samples only. Both phases
-        # train on the train split only — never on val/calibration samples.
-        if epoch <= anchor_epochs and len(anchor_pool) > 0:
-            pool = anchor_pool
-            phase = "anchor"
+        # Curriculum: first anchor_epochs use stage-1 samples only. Both
+        # phases train on the train split only — never on val/calibration.
+        if epoch <= anchor_epochs and len(stage1_pool) > 0:
+            pool = stage1_pool
+            phase = "stage-1"
         else:
             pool = train_positions
-            phase = "generalize"
+            phase = "stage-2"
 
         model.train()
         train_loss = 0.0
@@ -618,37 +512,47 @@ def train_dynamic_head(
 
         train_loss /= len(order)
 
-        # Validation
+        # Validation (full val set + stage-1-only subset for the guard)
         model.eval()
         val_correct = 0
         val_total = 0
+        s1_correct = 0
+        s1_total = 0
         with torch.no_grad():
             for start in range(0, len(val_positions), batch_size):
-                xb, mask, ob, qb, yb = collate_dynamic_batch(
-                    batch_at(val_positions, start, batch_size), device,
-                )
+                batch = batch_at(val_positions, start, batch_size)
+                xb, mask, ob, qb, yb = collate_dynamic_batch(batch, device)
                 scores = model.forward_choice(xb, ob, mask, qb)
                 pred = scores.argmax(dim=1)
                 val_correct += int((pred == yb).sum().item())
                 val_total += len(yb)
+                # stage-1 subset for the escape guard
+                s1_idx = [j for j, s in enumerate(batch) if not s.is_variant]
+                if s1_idx:
+                    s1_correct += int((pred[s1_idx] == yb[s1_idx]).sum().item())
+                    s1_total += len(s1_idx)
 
         val_acc = val_correct / val_total if val_total > 0 else 0.0
+        s1_val_acc = s1_correct / s1_total if s1_total > 0 else val_acc
 
         # Escape guard: breakout-domain training can sit at a near-symmetric
         # plateau (all options reading the same field) whose escape is a
-        # stochastic bootstrap event. A healthy run has escaped by a few
-        # epochs into the generalize phase (val_acc jumps ~0.52 → ~0.80);
-        # if it hasn't, further epochs are wasted — abort so the caller can
-        # retry with a different init instead of burning the full schedule.
+        # stochastic bootstrap event. Computed on the STAGE-1 val subset so
+        # the 0.65 threshold keeps its meaning (the full val set mixes in
+        # stage-2 samples the anchor-phase model can't answer yet). A
+        # healthy run has escaped by a few epochs into stage 2 (val_acc
+        # jumps ~0.52 → ~0.80); if it hasn't, further epochs are wasted —
+        # abort so the caller can retry with a different init.
         guard_epoch = anchor_epochs + 10
-        if epoch == guard_epoch and val_acc < 0.65:
-            print(f"  ESCAPE GUARD: val_acc={val_acc:.3f} at epoch {epoch} — "
+        if epoch == guard_epoch and s1_val_acc < 0.65:
+            print(f"  ESCAPE GUARD: stage-1 val_acc={s1_val_acc:.3f} at epoch {epoch} — "
                   f"still at the symmetric plateau, aborting (caller should retry "
                   f"with a different init)")
             return None
 
         if epoch == 1 or epoch % 10 == 0 or epoch == hc.max_epochs:
-            print(f"  epoch {epoch:3d} [{phase}]: train_loss={train_loss:.4f}  val_acc={val_acc:.3f}")
+            print(f"  epoch {epoch:3d} [{phase}]: train_loss={train_loss:.4f}  "
+                  f"val_acc={val_acc:.3f}  stage-1 val_acc={s1_val_acc:.3f}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc

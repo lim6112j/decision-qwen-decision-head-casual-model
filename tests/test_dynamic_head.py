@@ -413,23 +413,15 @@ class TestFieldSetCheckpoint:
             with torch.no_grad():
                 assert torch.allclose(orig, loaded.forward_choice(state, opt_embs), atol=1e-6)
 
-    def test_v1_checkpoint_loads_via_default_flag(self):
-        """A v1 checkpoint (no state_set key) loads with state_set=False."""
+    def test_v1_checkpoint_refused(self):
+        """Clean break: a saved non-state_set head is refused on load —
+        v4 implies state_set=True (question-field attention)."""
         head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0)
-        head.eval()
-        state = torch.randn(64)
-        opt_embs = torch.randn(3, 64)
-        with torch.no_grad():
-            orig = head.forward_choice(state, opt_embs)
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "v1.pt"
             save_dynamic_head(head, path)
-            loaded = load_dynamic_head(path)
-            loaded.eval()
-            assert loaded.state_set is False
-            with torch.no_grad():
-                assert torch.allclose(orig, loaded.forward_choice(state, opt_embs), atol=1e-6)
+            with pytest.raises(ValueError, match="state_set"):
+                load_dynamic_head(path)
 
     def test_v2_predict_dynamic_with_field_set(self):
         head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
@@ -443,28 +435,103 @@ class TestFieldSetCheckpoint:
 
 
 # ---------------------------------------------------------------------------
-# v3 question fusion
+# v4 question-field attention
 # ---------------------------------------------------------------------------
 
 
-class TestQuestionFusion:
-    """v3: question text modulates option queries (FiLM gate + shift)."""
+class TestQuestionAttention:
+    """v4: the question queries the field set directly (no FiLM)."""
 
     @pytest.fixture
     def set_head(self):
         return DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
 
-    def test_v3_modules_present(self, set_head):
-        assert hasattr(set_head, "q_mod_scale")
-        assert hasattr(set_head, "q_mod_bias")
-        assert hasattr(set_head, "z_mod_scale")
-        assert hasattr(set_head, "z_mod_bias")
-        for mod in ("q_mod_scale", "q_mod_bias", "z_mod_scale", "z_mod_bias"):
-            assert torch.count_nonzero(getattr(set_head, mod).weight) == 0
+    def test_v4_modules_present(self, set_head):
+        assert hasattr(set_head, "q_question")
+        assert hasattr(set_head, "attn_scale_q")
+        assert hasattr(set_head, "qz_readout")
+        assert hasattr(set_head, "q_query_shift")
+        # v3 FiLM modules are gone
+        for gone in ("q_mod_scale", "q_mod_bias", "z_mod_scale", "z_mod_bias"):
+            assert not hasattr(set_head, gone)
+
+    def test_qz_readout_zero_init(self, set_head):
+        """Only the LAST linear is zero-init (LoRA-style bootstrap: its
+        gradient is alive at init; the first layer follows)."""
+        assert torch.count_nonzero(set_head.qz_readout[2].weight) == 0
+        assert torch.count_nonzero(set_head.qz_readout[2].bias) == 0
+
+    def test_q_query_gate_shift_zero_init(self, set_head):
+        """The question→query gate and shift are zero at init → identity on
+        the option queries (same guard as the read-out)."""
+        for lin in (set_head.q_query_gate, set_head.q_query_shift):
+            assert torch.count_nonzero(lin.weight) == 0
+            assert torch.count_nonzero(lin.bias) == 0
+
+    def test_q_query_shift_steers_option_queries(self, set_head):
+        """Once the shift is live the question changes what each option
+        reads, and the mask invariant still holds."""
+        set_head.eval()
+        torch.manual_seed(5)
+        with torch.no_grad():
+            set_head.q_query_gate.weight.normal_(0, 0.5)
+            set_head.q_query_shift.weight.normal_(0, 0.5)
+        fields = torch.randn(6, 64)
+        opt_embs = torch.randn(3, 64)
+        q_a, q_b = torch.randn(64), torch.randn(64)
+        with torch.no_grad():
+            out_a = set_head.forward_choice(fields, opt_embs, question_emb=q_a)
+            out_b = set_head.forward_choice(fields, opt_embs, question_emb=q_b)
+            padded = torch.zeros(8, 64)
+            padded[:6] = fields
+            mask = torch.tensor([True] * 6 + [False] * 2)
+            masked = set_head.forward_choice(
+                padded, opt_embs, state_mask=mask, question_emb=q_a,
+            )
+        assert not torch.allclose(out_a, out_b, atol=1e-5)
+        assert torch.allclose(out_a, masked, atol=1e-5)
+
+    def test_query_shift_repoints_option_matching(self):
+        """THE property a shared per-field bias cannot provide: the same
+        option must be able to match a DIFFERENT field under a different
+        question. Two options, two fields; with the shift trained, question A
+        routes option 0 to field 0 and question B routes it to field 1."""
+        torch.manual_seed(4)
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16,
+                                   dropout=0.0, state_set=True)
+        g = torch.Generator().manual_seed(4)
+        fields = torch.randn(2, 64, generator=g)
+        opt_embs = torch.randn(2, 64, generator=g)
+        q_a = torch.randn(64, generator=g)
+        q_b = torch.randn(64, generator=g) + 2.0
+
+        opt = torch.optim.Adam(head.parameters(), lr=5e-3)
+        for _ in range(900):
+            for q_emb, gold in ((q_a, 0), (q_b, 1)):
+                scores = head.forward_choice(fields, opt_embs, question_emb=q_emb)
+                loss = torch.nn.functional.cross_entropy(scores, torch.tensor([gold]))
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+        head.eval()
+        with torch.no_grad():
+            s_a = head.forward_choice(fields, opt_embs, question_emb=q_a)
+            s_b = head.forward_choice(fields, opt_embs, question_emb=q_b)
+        assert int(s_a.argmax()) == 0
+        assert int(s_b.argmax()) == 1
+        assert torch.count_nonzero(head.q_query_gate.weight) > 0
+
+    def test_attn_scale_q_init(self, set_head):
+        """Separate scale, init √d_k — the O(1) cosine logit-spread property
+        applies to the question attention too (sharing attn_scale would
+        couple the two heads' softmax temperature)."""
+        assert set_head.attn_scale_q.item() == pytest.approx(16 ** 0.5)  # √d_k
+        assert set_head.attn_scale_q is not set_head.attn_scale
 
     def test_identity_at_init(self, set_head):
-        """Zero-init fusion: any question embedding (or None) reproduces the
-        v2 forward exactly — the uniform-softmax stall cannot recur."""
+        """Zero-init read-out: any question embedding (or None) reproduces
+        the v2 forward exactly — the uniform-softmax stall cannot recur."""
         set_head.eval()
         torch.manual_seed(0)
         fields = torch.randn(4, 64)
@@ -483,9 +550,10 @@ class TestQuestionFusion:
         """None → zero vector → identical output, always (not just at init)."""
         set_head.eval()
         torch.manual_seed(3)
-        # Perturb fusion weights so modulation is non-identity
+        # Perturb the question path so it's non-identity
         with torch.no_grad():
-            set_head.q_mod_bias.weight.normal_(0, 0.1)
+            set_head.qz_readout[2].weight.normal_(0, 0.1)
+            set_head.qz_readout[2].bias.normal_(0, 0.1)
         fields = torch.randn(4, 64)
         opt_embs = torch.randn(3, 64)
         with torch.no_grad():
@@ -520,14 +588,12 @@ class TestQuestionFusion:
         assert scores.shape == (4, 3)
 
     def test_question_changes_output_after_training_signal(self, set_head):
-        """A non-trivially-trained modulation must actually depend on the
-        question embedding (fusion pathway is live, not a constant)."""
+        """A non-trivially-trained read-out must actually depend on the
+        question embedding (question pathway is live, not a constant)."""
         set_head.eval()
         with torch.no_grad():
-            set_head.q_mod_scale.weight.normal_(0, 0.05)
-            set_head.q_mod_scale.bias.normal_(0, 0.05)
-            set_head.q_mod_bias.weight.normal_(0, 0.05)
-            set_head.q_mod_bias.bias.normal_(0, 0.05)
+            set_head.qz_readout[2].weight.normal_(0, 0.05)
+            set_head.qz_readout[2].bias.normal_(0, 0.05)
         fields = torch.randn(4, 64)
         opt_embs = torch.randn(3, 64)
         with torch.no_grad():
@@ -535,13 +601,31 @@ class TestQuestionFusion:
             out_b = set_head.forward_choice(fields, opt_embs, question_emb=torch.randn(64))
         assert not torch.allclose(out_a, out_b, atol=1e-5)
 
-    def test_permutation_equivariance_with_question(self, set_head):
-        """Field-set permutation equivariance holds under question modulation."""
+    def test_masked_fields_ignored_in_question_attention(self, set_head):
+        """The question attention must honor the state mask too."""
         set_head.eval()
         torch.manual_seed(0)
         with torch.no_grad():
-            set_head.q_mod_scale.weight.normal_(0, 0.1)
-            set_head.q_mod_bias.weight.normal_(0, 0.1)
+            set_head.qz_readout[2].weight.normal_(0, 0.1)
+        fields = torch.randn(3, 64)
+        opt_embs = torch.randn(2, 64)
+        q = torch.randn(64)
+        with torch.no_grad():
+            clean = set_head.forward_choice(fields, opt_embs, question_emb=q)
+            padded = torch.zeros(5, 64)
+            padded[:3] = fields
+            mask = torch.tensor([True, True, True, False, False])
+            with_mask = set_head.forward_choice(
+                padded, opt_embs, state_mask=mask, question_emb=q
+            )
+        assert torch.allclose(clean, with_mask, atol=1e-5)
+
+    def test_permutation_equivariance_with_question(self, set_head):
+        """Field-set permutation equivariance holds under question attention."""
+        set_head.eval()
+        torch.manual_seed(0)
+        with torch.no_grad():
+            set_head.qz_readout[2].weight.normal_(0, 0.1)
         fields = torch.randn(4, 64)
         opt_embs = torch.randn(3, 64)
         q = torch.randn(64)
@@ -555,8 +639,9 @@ class TestQuestionFusion:
         must predict different options under two different questions.
 
         Tiny overfit — 2 samples, opposite golds, ~600 Adam steps on CE.
-        If the fusion pathway can't condition on the question embedding,
-        the two golds can never both be recovered.
+        If the question pathway can't condition on the question embedding,
+        the two golds can never both be recovered. This is also the
+        dead-path canary: qz_readout starts at zero and must escape.
         """
         torch.manual_seed(7)
         head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
@@ -582,16 +667,71 @@ class TestQuestionFusion:
             scores_right = head.forward_choice(fields, opt_embs, question_emb=q_right)
         assert int(scores_left.argmax()) == 0
         assert int(scores_right.argmax()) == 1
+        # The question path must actually have moved off zero-init
+        assert torch.count_nonzero(head.qz_readout[2].weight) > 0
+
+    def test_unseen_question_type_smoke(self, set_head):
+        """A never-trained random question embedding: finite logits,
+        distribution sums to 1, no NaN (graceful degradation)."""
+        set_head.eval()
+        with torch.no_grad():
+            set_head.qz_readout[2].weight.normal_(0, 0.1)
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            scores = set_head.forward_choice(
+                fields, opt_embs, question_emb=torch.randn(64) * 10
+            )
+        assert torch.isfinite(scores).all()
+        probs = dynamic_probabilities(scores[0])
+        assert probs.sum().item() == pytest.approx(1.0, abs=1e-5)
+
+    def test_unseen_paraphrase_generalization(self):
+        """The v3 failure-mode guard: train on a few phrasings of a question
+        (modeled as base embedding + small noise — a backbone-similarity
+        stand-in), then eval on HELD-OUT noisy copies. The question path
+        must generalize within an embedding neighborhood, not memorize."""
+        torch.manual_seed(11)
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        q_base_a = torch.randn(64)
+        q_base_b = torch.randn(64) + 2.0
+
+        # "Phrasings": base + N(0, 0.05); 2 per question for training
+        torch.manual_seed(12)
+        train_samples = []
+        for q_base, gold in ((q_base_a, 0), (q_base_b, 1)):
+            for _ in range(2):
+                train_samples.append((q_base + torch.randn(64) * 0.05, gold))
+
+        opt = torch.optim.Adam(head.parameters(), lr=5e-3)
+        for _ in range(600):
+            for q_emb, gold in train_samples:
+                scores = head.forward_choice(fields, opt_embs, question_emb=q_emb)
+                loss = torch.nn.functional.cross_entropy(scores, torch.tensor([gold]))
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+
+        head.eval()
+        # Held-out paraphrases: fresh noise draws, same bases
+        torch.manual_seed(99)
+        for q_base, gold in ((q_base_a, 0), (q_base_b, 1)):
+            q_held = q_base + torch.randn(64) * 0.05
+            with torch.no_grad():
+                scores = head.forward_choice(fields, opt_embs, question_emb=q_held)
+            assert int(scores.argmax()) == gold
 
 
-class TestQuestionFusionCheckpoint:
-    def test_v3_roundtrip_with_question(self):
+class TestQuestionAttentionCheckpoint:
+    def test_v4_roundtrip_strict_with_question(self):
         head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
         head.eval()
         with torch.no_grad():
-            # Non-identity fusion so the question genuinely matters
-            head.q_mod_scale.weight.normal_(0, 0.1)
-            head.q_mod_bias.bias.normal_(0, 0.1)
+            # Non-identity read-out so the question genuinely matters
+            head.qz_readout[2].weight.normal_(0, 0.1)
+            head.qz_readout[2].bias.normal_(0, 0.1)
         fields = torch.randn(4, 64)
         opt_embs = torch.randn(3, 64)
         q = torch.randn(64)
@@ -599,9 +739,9 @@ class TestQuestionFusionCheckpoint:
             orig = head.forward_choice(fields, opt_embs, question_emb=q)
 
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "v3.pt"
+            path = Path(tmp) / "v4.pt"
             save_dynamic_head(head, path, temperature=0.7)
-            loaded = load_dynamic_head(path)
+            loaded = load_dynamic_head(path)   # strict load
             loaded.eval()
             assert loaded.temperature == 0.7
             with torch.no_grad():
@@ -610,36 +750,21 @@ class TestQuestionFusionCheckpoint:
                     atol=1e-6,
                 )
 
-    def test_v2_checkpoint_loads_identity_fusion(self, capsys):
-        """A hand-built v2 checkpoint (arch_version 2, no q_mod_* keys) loads
-        with the fusion at identity init: question embeddings change nothing,
-        and a warning is printed."""
+    def test_v3_checkpoint_refused(self, capsys):
+        """Clean break: a hand-built v3-style checkpoint (FiLM keys) raises
+        ValueError — no silent fallback, the v3 checkpoint stays preserved
+        in the main checkout."""
         head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
-        head.eval()
-        fields = torch.randn(4, 64)
-        opt_embs = torch.randn(3, 64)
-        with torch.no_grad():
-            orig = head.forward_choice(fields, opt_embs)
-
         with tempfile.TemporaryDirectory() as tmp:
-            v3_path = Path(tmp) / "v3.pt"
-            save_dynamic_head(head, v3_path)
-            checkpoint = torch.load(str(v3_path), map_location="cpu")
-            checkpoint["arch"]["arch_version"] = 2
-            for key in list(checkpoint["model_state"]):
-                if key.startswith("q_mod_"):
-                    del checkpoint["model_state"][key]
-            path = Path(tmp) / "v2.pt"
+            v4_path = Path(tmp) / "v4.pt"
+            save_dynamic_head(head, v4_path)
+            checkpoint = torch.load(str(v4_path), map_location="cpu")
+            checkpoint["arch"]["arch_version"] = 3
+            path = Path(tmp) / "v3.pt"
             torch.save(checkpoint, str(path))
 
-            loaded = load_dynamic_head(path)
-            loaded.eval()
-            assert loaded.state_set is True
-            out = capsys.readouterr()
-            assert "identity init" in out.out
-            with torch.no_grad():
-                scores = loaded.forward_choice(fields, opt_embs, question_emb=torch.randn(64))
-            assert torch.allclose(orig, scores, atol=1e-6)
+            with pytest.raises(ValueError, match="arch_version"):
+                load_dynamic_head(path)
 
 
 class TestPredictDynamicQuestionCache:
@@ -693,10 +818,12 @@ class TestIsCorrectDynamic:
 
 class TestDynamicCheckpoint:
     def test_save_load_roundtrip(self):
-        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0)
+        """v4 heads are state_set=True — the non-state_set variant is only
+        constructible by hand and refused on load (see TestFieldSetCheckpoint)."""
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
         head.eval()
-        state = torch.randn(64)
-        opt_embs = torch.randn(3, 64)
+        state = torch.randn(3, 64)
+        opt_embs = torch.randn(2, 64)
 
         with torch.no_grad():
             orig_scores = head.forward_choice(state, opt_embs)
@@ -810,12 +937,12 @@ class TestPaddleDirectionVariants:
     """The paddle_direction synonym map yields shuffled left/right/stay variants."""
 
     def test_variants_generated(self):
-        from decision_lab.head.dynamic_train import _generate_choice_variants
+        from decision_lab.head.dynamic_train import _variants_for_bank_entry
+        from decision_lab.head.question_bank import build_question_bank
         from random import Random
 
-        variants = _generate_choice_variants(
-            ["left", "right", "stay"], "paddle_direction", Random(0), 3,
-        )
+        entry = next(e for e in build_question_bank() if e.qid == "paddle_direction")
+        variants = _variants_for_bank_entry(entry, 3, Random(0))
         assert len(variants) == 3
         for v in variants:
             assert len(v["options"]) == 3
@@ -826,12 +953,12 @@ class TestPaddleDirectionVariants:
             assert v["options"] != ["left", "right", "stay"]
 
     def test_gold_map_permutes_consistently(self):
-        from decision_lab.head.dynamic_train import _generate_choice_variants
+        from decision_lab.head.dynamic_train import _variants_for_bank_entry
+        from decision_lab.head.question_bank import build_question_bank
         from random import Random
 
-        variants = _generate_choice_variants(
-            ["left", "right", "stay"], "paddle_direction", Random(1), 3,
-        )
+        entry = next(e for e in build_question_bank() if e.qid == "paddle_direction")
+        variants = _variants_for_bank_entry(entry, 3, Random(1))
         for v in variants:
             # gold_map values must be a permutation of the option set
             assert sorted(v["gold_map"].values()) == sorted(v["options"])
