@@ -7,7 +7,6 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
-from pathlib import Path
 from random import Random
 from typing import Optional
 
@@ -17,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from decision_lab import CONFIG_DIR, DATA_DIR, PROJECT_ROOT
-from decision_lab.backbone.llama_server import LlamaServer
+from decision_lab.backbone.llama_server import LlamaServer, server_from_config
 from decision_lab.config import Config, load_config
 from decision_lab.head.model import build_question_spec
 from decision_lab.real.labels import (
@@ -64,12 +63,7 @@ class WebAppState:
         self.traffic = TrafficLogger(TRAFFIC_DIR, enabled=cfg.web.log_traffic)
 
     def start(self) -> None:
-        gguf = Path(self.cfg.model.gguf_path).expanduser().resolve()
-        self.server = LlamaServer(
-            gguf,
-            port=self.cfg.model.server_port,
-            context_length=self.cfg.model.context_length,
-        )
+        self.server = server_from_config(self.cfg)
         self.server.start()
         self.agents = build_agents(self.cfg, self.server)
         self.question_spec = build_question_spec(self.cfg.questions)

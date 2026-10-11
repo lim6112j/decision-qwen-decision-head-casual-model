@@ -415,6 +415,7 @@ def train_dynamic_head(
     cfg: Config,
     model_path: Path,
     anchor_fraction: float = 0.3,
+    backbone_id: str | None = None,
 ) -> DynamicDecisionHead:
     """Train a DynamicDecisionHead with curriculum.
 
@@ -426,6 +427,9 @@ def train_dynamic_head(
         cfg: full Config.
         model_path: where to save the checkpoint.
         anchor_fraction: fraction of max_epochs spent on anchor-only training.
+        backbone_id: identity of the embedding backend these samples came
+            from; stored in the checkpoint so it can never be served
+            against a different backend by accident.
     """
     hc = cfg.dynamic_head
     device = get_device()
@@ -575,7 +579,9 @@ def train_dynamic_head(
     # Global temperature calibration (single scalar, not per-question)
     temperature = _fit_global_temperature(model, samples, calib_idx_set, device)
 
-    save_dynamic_head(model, str(model_path), temperature=temperature)
+    save_dynamic_head(
+        model, str(model_path), temperature=temperature, backbone_id=backbone_id
+    )
     print(f"  saved to {model_path}  (best val_acc={best_val_acc:.3f}, T={temperature:.3f})")
     return model
 

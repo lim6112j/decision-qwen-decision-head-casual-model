@@ -83,6 +83,10 @@ import torch.nn.functional as F
 D_K = 128
 DEFAULT_TEMPERATURE = 1.0
 
+# (trained_on, serving) backbone pairs already warned about — a benchmark
+# run loads the same head once per pass and should not repeat itself.
+_WARNED_BACKBONE_MISMATCH: set[tuple[str, str]] = set()
+
 # ---------------------------------------------------------------------------
 # Dynamic question configuration helpers
 # ---------------------------------------------------------------------------
@@ -591,8 +595,14 @@ def save_dynamic_head(
     model: DynamicDecisionHead,
     path: str | Path,
     temperature: float = DEFAULT_TEMPERATURE,
+    backbone_id: str | None = None,
 ) -> None:
-    """Save a DynamicDecisionHead checkpoint (self-describing, no question_spec)."""
+    """Save a DynamicDecisionHead checkpoint (self-describing, no question_spec).
+
+    ``backbone_id`` records which embedding backend the head was trained on.
+    A head is only meaningful against embeddings from that same backend —
+    loading it under another silently produces confident nonsense.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -605,6 +615,7 @@ def save_dynamic_head(
                 "input_dim": model.input_dim,
                 "hidden_dim": model.hidden_dim,
                 "d_k": model.d_k,
+                "backbone_id": backbone_id,
             },
             "temperature": temperature,
         },
@@ -652,7 +663,38 @@ def load_dynamic_head(
     if device is not None:
         model = model.to(device)
     model.temperature = checkpoint.get("temperature", DEFAULT_TEMPERATURE)
+    # Optional metadata: checkpoints saved before this existed carry no
+    # backbone_id and load as None (guard simply not applied).
+    model.backbone_id = arch.get("backbone_id")
     return model
+
+
+def check_backbone_match(head: DynamicDecisionHead, server, where: str = "") -> None:
+    """Warn if a head is about to be served against a different backbone.
+
+    A head trained on one backend's embeddings produces confident nonsense
+    against another's — same shape, different space. The checkpoint records
+    the backend it was trained on; checkpoints predating that field record
+    nothing and are skipped. Never raises: a mismatch is worth shouting
+    about, not worth taking the server down for.
+    """
+    trained_on = getattr(head, "backbone_id", None)
+    if not trained_on:
+        return
+    current = getattr(server, "backend_id", "")
+    if not current or current == trained_on:
+        return
+    # A benchmark run loads the same head several times; warn once per pair.
+    key = (trained_on, current)
+    if key in _WARNED_BACKBONE_MISMATCH:
+        return
+    _WARNED_BACKBONE_MISMATCH.add(key)
+    print(
+        f"  warning: head{where} was trained on a different backbone — "
+        f"predictions are meaningless.\n"
+        f"    trained on: {trained_on}\n"
+        f"    now serving: {current}"
+    )
 
 
 def create_random_dynamic_head(**kwargs) -> DynamicDecisionHead:

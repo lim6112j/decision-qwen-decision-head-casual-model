@@ -20,6 +20,7 @@ from decision_lab.head.model import (
 )
 from decision_lab.head.dynamic_model import (
     DynamicDecisionHead,
+    check_backbone_match,
     create_random_dynamic_head,
     decode_dynamic_answer,
     is_correct_dynamic,
@@ -401,18 +402,20 @@ def run_benchmark(
         all_metrics[test_name] = {}
 
         # 1. Head trained (temperatures come from the checkpoint)
-        head_trained = load_head(str(models_dir / "head_trained.pt"), device=device)
-        print(f"  [{test_name}] benchmarking head_trained...")
-        rows = benchmark_head(states, features, head_trained, head_trained.temperatures,
-                              "head_trained", device)
-        all_metrics[test_name]["head_trained"] = compute_metrics(rows, question_spec)
+        if "head_trained" not in bc.skip_agents:
+            head_trained = load_head(str(models_dir / "head_trained.pt"), device=device)
+            print(f"  [{test_name}] benchmarking head_trained...")
+            rows = benchmark_head(states, features, head_trained, head_trained.temperatures,
+                                  "head_trained", device)
+            all_metrics[test_name]["head_trained"] = compute_metrics(rows, question_spec)
 
         # 2. Head random
-        head_random = create_random_head(question_spec, hidden_dim=cfg.head.hidden_dim,
-                                         dropout=cfg.head.dropout)
-        print(f"  [{test_name}] benchmarking head_random...")
-        rows = benchmark_head(states, features, head_random, {}, "head_random", device)
-        all_metrics[test_name]["head_random"] = compute_metrics(rows, question_spec)
+        if "head_random" not in bc.skip_agents:
+            head_random = create_random_head(question_spec, hidden_dim=cfg.head.hidden_dim,
+                                             dropout=cfg.head.dropout)
+            print(f"  [{test_name}] benchmarking head_random...")
+            rows = benchmark_head(states, features, head_random, {}, "head_random", device)
+            all_metrics[test_name]["head_random"] = compute_metrics(rows, question_spec)
 
         # 3. Dynamic head (attention-based, option values as inputs)
         # Pre-embed all option texts via backbone
@@ -423,7 +426,7 @@ def run_benchmark(
             for t, emb in option_emb_cache_np.items()
         }
 
-        dynamic_head, dynamic_temp = _load_dynamic_for_benchmark(cfg, models_dir, device)
+        dynamic_head, dynamic_temp = _load_dynamic_for_benchmark(cfg, models_dir, device, server)
         if field_sets is None and dynamic_head.state_set:
             raise RuntimeError(
                 f"missing {field_path} for the v2 dynamic head — run `python -m decision_lab extract`"
@@ -437,11 +440,12 @@ def run_benchmark(
         all_metrics[test_name]["head_dynamic"] = compute_metrics(rows, question_spec)
 
         # 4. Prompt LM zero-shot
-        agent_zero = PromptAgent(cfg, server, mode=PromptMode.ZERO_SHOT)
-        print(f"  [{test_name}] benchmarking prompt_lm_zero_shot...")
-        rows = benchmark_prompt(states, agent_zero, "prompt_lm_zero_shot",
-                                bc.warmup_runs, bc.timed_runs, bc.latency_sample_size)
-        all_metrics[test_name]["prompt_lm_zero_shot"] = compute_metrics(rows, question_spec)
+        if "prompt_lm_zero_shot" not in bc.skip_agents:
+            agent_zero = PromptAgent(cfg, server, mode=PromptMode.ZERO_SHOT)
+            print(f"  [{test_name}] benchmarking prompt_lm_zero_shot...")
+            rows = benchmark_prompt(states, agent_zero, "prompt_lm_zero_shot",
+                                    bc.warmup_runs, bc.timed_runs, bc.latency_sample_size)
+            all_metrics[test_name]["prompt_lm_zero_shot"] = compute_metrics(rows, question_spec)
 
     breakout_metrics = _benchmark_dynamic_breakout(data_dir, cfg, server, models_dir, bc)
     if breakout_metrics is not None:
@@ -486,7 +490,7 @@ def _benchmark_dynamic_real(
     if not samples:
         return None
 
-    head, _temp = _load_dynamic_for_benchmark(cfg, models_dir, device)
+    head, _temp = _load_dynamic_for_benchmark(cfg, models_dir, device, server)
     if not head.state_set:
         return None
 
@@ -531,7 +535,7 @@ def _benchmark_dynamic_phrasings(
     """
     from decision_lab.head.question_bank import build_question_bank
 
-    dynamic_head, dynamic_temp = _load_dynamic_for_benchmark(cfg, models_dir, device=get_device())
+    dynamic_head, dynamic_temp = _load_dynamic_for_benchmark(cfg, models_dir, device=get_device(), server=server)
     if not dynamic_head.state_set:
         return None
 
@@ -665,7 +669,7 @@ def _benchmark_dynamic_breakout(
         for t, emb in _embed_options_batch(server, _collect_option_texts(breakout_spec)).items()
     }
 
-    dynamic_head, dynamic_temp = _load_dynamic_for_benchmark(cfg, models_dir, device)
+    dynamic_head, dynamic_temp = _load_dynamic_for_benchmark(cfg, models_dir, device, server)
     if field_sets is None and dynamic_head.state_set:
         raise RuntimeError(
             f"missing {field_path} for the v2 dynamic head — run `python -m decision_lab extract`"
@@ -714,7 +718,7 @@ def _embed_options_batch(server, option_texts: list[str]) -> dict[str, np.ndarra
 
 
 def _load_dynamic_for_benchmark(
-    cfg: Config, models_dir: Path, device: torch.device,
+    cfg: Config, models_dir: Path, device: torch.device, server=None,
 ) -> tuple[DynamicDecisionHead, float]:
     """Load trained dynamic head checkpoint or fall back to random init.
 
@@ -745,4 +749,6 @@ def _load_dynamic_for_benchmark(
     else:
         temperature = getattr(head, "temperature", 1.0)
         print(f"  loaded dynamic head from {path} (T={temperature:.3f})")
+        if server is not None:
+            check_backbone_match(head, server, where=f" at {path}")
     return head, temperature

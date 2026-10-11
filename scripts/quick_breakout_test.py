@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from decision_lab.backbone.llama_server import LlamaServer
+from decision_lab.backbone.llama_server import server_from_config
 from decision_lab.config import load_config
 from decision_lab.head.dynamic_model import (
     get_device,
@@ -80,8 +80,7 @@ def main():
     temperature = getattr(head, "temperature", 1.0)
     include_summary = cfg.dynamic_head.include_summary_field
 
-    gguf = Path(cfg.model.gguf_path).expanduser().resolve()
-    with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
+    with server_from_config(cfg) as server:
         # 1. The user's exact failing state
         print("=" * 70)
         print("Exact user state (expect 'left'):")
