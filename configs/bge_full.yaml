@@ -1,0 +1,95 @@
+# bge-m3 backbone experiment (production-size data), local llama-server on 8091.
+#
+# Tests whether a *bidirectional* (non-causal) encoder gives better frozen
+# embeddings than Qwen3.5's last-token states. The v4 head's generalization
+# runs through cosine nearest-neighbour over embeddings, and causal-LM
+# hidden states are trained for next-token prediction, not embedding
+# geometry. See the README "bge-m3 backbone" section.
+#
+# Port note: 8091, NOT 8080/8090 — LlamaServer adopts whatever answers
+# /health on its port, and adopting the Qwen server would silently embed
+# with the wrong backend. The feature-cache fingerprint now records the
+# backend, so a mismatch re-extracts rather than silently reusing.
+#
+# Run with:
+#   no_proxy=localhost,127.0.0.1 uv run python -m decision_lab \
+#     --config configs/bge_full.yaml --data-dir data_bge train-dynamic
+#
+generator:
+  num_train: 10000
+  num_test_indist: 1000
+  num_test_heldout: 1000
+  seed: 42
+  heldout_templates: ["report", "config_file"]
+  num_breakout_train: 4000
+  num_breakout_test: 500
+
+questions:
+  choice:
+    sentiment:
+      options:
+        positive: "Positive sentiment"
+        negative: "Negative sentiment"
+        neutral: "Neutral sentiment"
+    urgency:
+      options:
+        low: "Low priority"
+        medium: "Medium priority"
+        high: "High priority"
+        critical: "Requires immediate attention"
+  score:
+    quality:
+      levels: ["Poor", "Fair", "Good", "Excellent"]
+  noul:
+    is_actionable: "Does this state require a response or action?"
+    contains_pii: "Does this state contain personally identifiable information?"
+    is_urgent: "Is this state time-sensitive?"
+
+model:
+  gguf_path: "models/bge-m3-Q8_0.gguf"
+  context_length: 2048
+  server_port: 8091
+  # bge-m3 is XLM-RoBERTa-based: CLS pooling, not last-token.
+  pooling: "cls"
+  backbone: "bge-m3"
+  embed_dim: 1024
+
+dynamic_head:
+  hidden_dim: 256
+  d_k: 128
+  dropout: 0.1
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  batch_size: 128
+  max_epochs: 100
+  patience: 20
+  anchor_epochs: 30
+  variants_per_question: 3
+  breakout_weight: 3
+  include_summary_field: true
+  max_fields: 16
+  shape_augmentation: true
+  # Side-by-side with head_dynamic_v4.pt — the Qwen head is never touched.
+  checkpoint_filename: "head_dynamic_bge.pt"
+  real_data_path: ""
+  real_weight: 1
+
+calibration:
+  holdout_fraction: 0.1
+  lr: 0.01
+  max_iter: 1000
+
+benchmark:
+  max_test_states: 200
+  # head_trained/head_random read the pooled Qwen feature cache, and
+  # prompt_lm_zero_shot calls chat() — bge-m3 serves neither.
+  skip_agents: ["head_trained", "head_random", "prompt_lm_zero_shot"]
+
+web:
+  log_traffic: false
+
+real:
+  holdout_fraction: 0.2
+  teacher_model: "deepseek/deepseek-v4.1-flash"
+  exclude_auto: false
+  seed: 42

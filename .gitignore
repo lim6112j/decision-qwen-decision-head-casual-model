@@ -7,6 +7,9 @@ __pycache__/
 data/
 results/
 models/
+# Per-backbone dataset trees (bge-m3 experiment) and their results
+data_*/
+results_*/
 
 # OS
 .DS_Store

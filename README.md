@@ -10,6 +10,11 @@ Compares three agents on the same backbone (`Qwen3.5-0.8B`, GGUF via llama-serve
 | `head_random` | Frozen backbone + random MLP head | No |
 | `prompt_lm_zero_shot` | Prompt-based causal LM | No (zero-shot) |
 
+The backbone is swappable. On held-out documents a **bidirectional encoder**
+(`bge-m3`) beats the causal Qwen backbone by **+15.9pp** (75.7% → 91.6%) with
+no change to the decision head — see
+[Non-autoregressive backbone](#non-autoregressive-backbone-bge-m3-2026-10-11).
+
 ## Setup
 
 ```bash
@@ -456,3 +461,86 @@ three question-conditioning designs.
 Trade-off: v4 gives up ~4pp of v3's breakout `paddle_direction` (v3
 overfit that domain with 2 questions and 3-4 phrasings). Remaining ideas
 are tracked in `docs/v4-open-issues.md`.
+
+### Non-autoregressive backbone: bge-m3 (2026-10-11)
+
+The decision path was **already non-autoregressive** — `forward_choice` is a
+single forward pass over frozen embeddings, argmax over option logits, no
+decoding. The only autoregressive code in the repo is the prompt-LM
+baseline, and it is the weakest agent by an order of magnitude (8.7% /
+2.3%). So "use a non-autoregressive *model*" does not mean "stop generating".
+
+The untested axis was the backbone's **attention pattern**. `Qwen3.5-0.8B` is
+decoder-only: every hidden state is causally masked, `--pooling last` reads
+the final token, and the vectors are shaped by a next-token-prediction
+objective. But v4's generalization mechanism rides entirely on cosine
+nearest-neighbour over those embeddings — the question query is matched
+against field keys by cosine similarity, so an unseen question "lands near a
+trained one". Causal-LM hidden states are not trained to have useful cosine
+geometry.
+
+**Hypothesis:** a bidirectional, contrastively-trained encoder gives
+embedding geometry better suited to that matching, lifting the held-out wall.
+
+**Setup.** `bge-m3` (XLM-RoBERTa-based, bidirectional, **1024-d — identical
+to Qwen3.5's, so `DynamicDecisionHead` is unchanged**) served by the *same*
+`llama-server` over the *same* `/v1/embeddings` seam, with `--pooling cls`
+instead of `last`. Only the embedding backend changed: same JSONL, same
+seed, same 200-state subsample, same `shape_augmentation` / `breakout_weight`
+/ `include_summary_field`, head retrained from scratch.
+
+**Results** (200-state subsample, direct comparison against the v4 row above):
+
+| Split / question | v4 (Qwen, causal) | bge-m3 (bidirectional) |
+|---|---|---|
+| `test_indist` | 94.3% | **95.1%** |
+| `test_heldout` | 75.7% | **91.6%** |
+| `test_breakout` `paddle_direction` | 94.0% | **95.5%** |
+| `test_breakout` `ball_motion` | 99.5% | **100.0%** |
+| held-out phrasings, doc bank | 96.4% | **96.7%** |
+| held-out phrasings, breakout | 97.3% | **97.6%** |
+
+Serving latency 12.3 ms vs ~11 ms for Qwen — the encoder is not a speed
+regression.
+
+**The held-out gain is almost entirely one question.** `quality` (the
+4-level ordinal rubric) went **56.0% → 93.0%**. `sentiment` and `urgency`
+are at 100% on held-out under both backbones. A 4-level rubric is the
+question most dependent on reading the whole document, which is exactly
+where last-token pooling on a causal LM is weakest and a bidirectional
+encoder is strongest — the mechanism the hypothesis predicted.
+
+**What did *not* improve.** Held-out `contains_pii` (79.0%) and `is_urgent`
+(79.5%) are essentially where v4 was (76.0%). The bidirectional backbone did
+not fix those; they are a different failure (label ambiguity or numeric
+reasoning), not an embedding-geometry one.
+
+**Open caveats.** (a) The headline is a 200-state subsample —
+apples-to-apples with the recorded v4 numbers, but a full-test-set
+confirmation run has not been done. (b) bge's *in-dist* `quality` (81.5%) is
+lower than its own *held-out* `quality` (93%), which usually means the
+200-state in-dist subsample is unusually hard for that question rather than
+that held-out is genuinely easier — worth checking before calling `quality`
+solved.
+
+**Running it** (keeps both backbones side by side; `data_bge/` holds the
+same JSONL with its own caches, `models/head_dynamic_bge.pt` its own head):
+
+```bash
+no_proxy=localhost,127.0.0.1 uv run python -m decision_lab \
+  --config configs/bge_full.yaml --data-dir data_bge extract
+no_proxy=localhost,127.0.0.1 uv run python -m decision_lab \
+  --config configs/bge_full.yaml --data-dir data_bge train-dynamic
+no_proxy=localhost,127.0.0.1 uv run python -m decision_lab \
+  --config configs/bge_full.yaml --data-dir data_bge --results-dir results_bge eval
+```
+
+Note the global flags (`--config`, `--data-dir`, `--results-dir`) must come
+**before** the subcommand. Extraction is ~60 min, training ~55 min.
+
+Backbone identity is recorded in both the checkpoint (`arch.backbone_id`) and
+the feature-cache fingerprint, so a head can never be silently served against
+a different backend, and a cache extracted from one backend is never reused
+for another — the stale-cache failure class this repo was bitten by in v3.
+The head prints a warning if a checkpoint's recorded backbone does not match
+the running server.
