@@ -8,6 +8,7 @@ from decision_lab.real.labels import (
     LabelItem,
     append_label,
     build_queue,
+    discard_item,
     items_from_call,
     make_item_id,
     option_texts,
@@ -83,7 +84,28 @@ def test_build_queue_dedupes_and_excludes_labeled(tmp_path):
     assert queue2[0].item_id != one.item_id
 
     s = stats(traffic, labels)
-    assert s == {"total": 2, "labeled": 1, "remaining": 1}
+    assert s == {"total": 2, "labeled": 1, "discarded": 0, "remaining": 1}
+
+
+def test_discard_removes_without_labeling(tmp_path):
+    traffic = tmp_path / "traffic"
+    traffic.mkdir()
+    (traffic / "2026-01-01.jsonl").write_text(
+        json.dumps(_call()) + "\n" + json.dumps(_call(call_id="c2", text="a different state"))
+    )
+    labels = tmp_path / "labels.jsonl"
+    discarded = tmp_path / "discarded.jsonl"
+
+    queue = build_queue(traffic, labels, discarded)
+    assert len(queue) == 2
+    assert discard_item(queue[0].item_id, discarded) is True
+    assert discard_item(queue[0].item_id, discarded) is False   # idempotent
+
+    remaining = build_queue(traffic, labels, discarded)
+    assert [i.item_id for i in remaining] == [queue[1].item_id]
+    assert stats(traffic, labels, discarded) == {
+        "total": 2, "labeled": 0, "discarded": 1, "remaining": 1,
+    }
 
 
 def test_append_label_idempotent(tmp_path):

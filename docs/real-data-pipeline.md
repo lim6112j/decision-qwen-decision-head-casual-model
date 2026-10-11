@@ -52,6 +52,9 @@ buttons with the head's prediction marked `★`.
 
 - **Manual:** click the correct option. Clicking the `★` records `accepted`;
   any other option records `overridden`.
+- **Remove (✕):** drop an item from the queue *without* labeling it — for
+  calls you can't adjudicate. Recorded in `data/real/discarded.jsonl` and
+  excluded from the queue (never used for training).
 - **Auto-label 1:** label the first pending item with OpenRouter.
 - **Auto-label all:** label every pending item (SSE progress stream).
 

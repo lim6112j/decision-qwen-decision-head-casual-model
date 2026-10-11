@@ -185,13 +185,44 @@ def load_labels(labels_path: Path) -> dict[str, LabelItem]:
     return labeled
 
 
-def build_queue(traffic_dir: Path, labels_path: Path) -> list[LabelItem]:
-    """Pending items: unique traffic items not yet present in the label file."""
+def load_discarded(discarded_path: Path | None) -> set[str]:
+    """Item ids removed from the queue without being labeled."""
+    if discarded_path is None or not discarded_path.exists():
+        return set()
+    ids: set[str] = set()
+    for line in discarded_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ids.add(json.loads(line)["item_id"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+    return ids
+
+
+def discard_item(item_id: str, discarded_path: Path) -> bool:
+    """Remove an item from the queue without labeling it. Idempotent."""
+    with _APPEND_LOCK:
+        if item_id in load_discarded(discarded_path):
+            return False
+        discarded_path.parent.mkdir(parents=True, exist_ok=True)
+        row = {"item_id": item_id, "discarded_at": _now_iso()}
+        with discarded_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return True
+
+
+def build_queue(
+    traffic_dir: Path, labels_path: Path, discarded_path: Path | None = None,
+) -> list[LabelItem]:
+    """Pending items: unique traffic items not labeled and not discarded."""
     labeled = load_labels(labels_path)
+    discarded = load_discarded(discarded_path)
     seen: dict[str, LabelItem] = {}
     for row in read_traffic(traffic_dir):
         for item in items_from_call(row):
-            if item.item_id in seen or item.item_id in labeled:
+            if item.item_id in seen or item.item_id in labeled or item.item_id in discarded:
                 continue
             seen[item.item_id] = item
     return list(seen.values())
@@ -213,8 +244,12 @@ def append_label(item: LabelItem, labels_path: Path) -> bool:
         return True
 
 
-def stats(traffic_dir: Path, labels_path: Path) -> dict:
-    """Counts for the UI progress bar: unique items, labeled, remaining."""
-    total = len(build_queue(traffic_dir, labels_path)) + len(load_labels(labels_path))
+def stats(
+    traffic_dir: Path, labels_path: Path, discarded_path: Path | None = None,
+) -> dict:
+    """Counts for the UI progress bar: total / labeled / discarded / remaining."""
     labeled = len(load_labels(labels_path))
-    return {"total": total, "labeled": labeled, "remaining": total - labeled}
+    discarded = len(load_discarded(discarded_path))
+    remaining = len(build_queue(traffic_dir, labels_path, discarded_path))
+    total = labeled + discarded + remaining
+    return {"total": total, "labeled": labeled, "discarded": discarded, "remaining": remaining}

@@ -40,6 +40,7 @@ def client(tmp_path, monkeypatch):
     labels = tmp_path / "labels.jsonl"
     monkeypatch.setattr(app_module, "TRAFFIC_DIR", traffic)
     monkeypatch.setattr(app_module, "LABELS_PATH", labels)
+    monkeypatch.setattr(app_module, "DISCARDED_PATH", tmp_path / "discarded.jsonl")
     # state is None (lifespan not run) → endpoints fall back to default config
     return TestClient(app_module.app)
 
@@ -110,6 +111,17 @@ def test_auto_all_streams_progress_and_done(client, monkeypatch):
 
 def test_stats_reflects_progress(client, monkeypatch):
     monkeypatch.setattr(app_module, "OpenRouterLabeler", FakeLabeler)
-    assert client.get("/api/label/stats").json() == {"total": 2, "labeled": 0, "remaining": 2}
+    assert client.get("/api/label/stats").json() == {
+        "total": 2, "labeled": 0, "discarded": 0, "remaining": 2}
     client.post("/api/label/auto", json={})
-    assert client.get("/api/label/stats").json() == {"total": 2, "labeled": 1, "remaining": 1}
+    assert client.get("/api/label/stats").json() == {
+        "total": 2, "labeled": 1, "discarded": 0, "remaining": 1}
+
+
+def test_discard_removes_item_without_labeling(client):
+    item = client.get("/api/label/queue").json()["items"][0]
+    res = client.post("/api/label/discard", json={"item_id": item["item_id"]}).json()
+    assert res["discarded"] is True
+    assert client.post("/api/label/discard", json={"item_id": item["item_id"]}).json()["discarded"] is False
+    assert len(client.get("/api/label/queue").json()["items"]) == 1
+    assert client.get("/api/label/stats").json()["discarded"] == 1

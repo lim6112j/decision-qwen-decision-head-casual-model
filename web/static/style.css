@@ -418,6 +418,18 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 }
 .label-q { font-weight: bold; }
 .label-src { margin-left: auto; color: var(--good); font-size: 12px; }
+.label-remove {
+  flex: 0 0 auto;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.label-remove:hover { color: var(--bad); border-color: var(--bad); }
 .label-state {
   margin: 0 0 10px;
   padding: 10px;

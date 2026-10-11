@@ -27,6 +27,7 @@ from decision_lab.real.labels import (
     LabelItem,
     append_label,
     build_queue,
+    discard_item,
     load_labels,
     stats as label_stats,
 )
@@ -41,6 +42,7 @@ TEXT_PREVIEW_CHARS = 160
 TRAFFIC_DIR = DATA_DIR / "traffic"
 REAL_DIR = DATA_DIR / "real"
 LABELS_PATH = REAL_DIR / "labels.jsonl"
+DISCARDED_PATH = REAL_DIR / "discarded.jsonl"
 
 
 def _now_iso() -> str:
@@ -382,8 +384,13 @@ def _label_item_payload(item: LabelItem) -> dict:
     }
 
 
+def _pending_queue() -> list[LabelItem]:
+    """Pending items: logged traffic minus everything already labeled/discarded."""
+    return build_queue(TRAFFIC_DIR, LABELS_PATH, DISCARDED_PATH)
+
+
 def _find_pending(item_id: str) -> LabelItem:
-    for item in build_queue(TRAFFIC_DIR, LABELS_PATH):
+    for item in _pending_queue():
         if item.item_id == item_id:
             return item
     raise HTTPException(status_code=404, detail=f"pending item {item_id} not found")
@@ -392,12 +399,22 @@ def _find_pending(item_id: str) -> LabelItem:
 @app.get("/api/label/queue")
 def label_queue():
     """Every pending (unlabeled) item, pre-filled with the head's prediction."""
-    return {"items": [_label_item_payload(i) for i in build_queue(TRAFFIC_DIR, LABELS_PATH)]}
+    return {"items": [_label_item_payload(i) for i in _pending_queue()]}
 
 
 @app.get("/api/label/stats")
 def label_stats_endpoint():
-    return label_stats(TRAFFIC_DIR, LABELS_PATH)
+    return label_stats(TRAFFIC_DIR, LABELS_PATH, DISCARDED_PATH)
+
+
+class DiscardRequest(BaseModel):
+    item_id: str = Field(min_length=1)
+
+
+@app.post("/api/label/discard")
+def discard_label(req: DiscardRequest):
+    """Remove an item from the queue without labeling it (idempotent)."""
+    return {"discarded": discard_item(req.item_id, DISCARDED_PATH)}
 
 
 @app.post("/api/label")
@@ -441,7 +458,7 @@ def auto_label_one(req: AutoLabelRequest):
     if req.item_id:
         item = _find_pending(req.item_id)
     else:
-        queue = build_queue(TRAFFIC_DIR, LABELS_PATH)
+        queue = _pending_queue()
         if not queue:
             raise HTTPException(status_code=404, detail="no pending items to label")
         item = queue[0]
@@ -467,7 +484,7 @@ async def auto_label_all():
             yield _sse("fatal", {"detail": str(exc)})
             return
 
-        queue = build_queue(TRAFFIC_DIR, LABELS_PATH)
+        queue = _pending_queue()
         labeled = failed = 0
         for item in queue:
             try:

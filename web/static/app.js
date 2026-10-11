@@ -676,7 +676,8 @@ async function loadLabelStats() {
     const s = await res.json();
     els.labelStats.innerHTML =
       `labeled <strong>${s.labeled}</strong> / ${s.total} ` +
-      `<span class="hint">(${s.remaining} remaining)</span>`;
+      `<span class="hint">(${s.remaining} remaining` +
+      (s.discarded ? `, ${s.discarded} removed` : "") + `)</span>`;
     labelState.count = s.remaining;
   } catch {
     els.labelStats.textContent = "stats unavailable";
@@ -713,11 +714,15 @@ function renderLabelCard(item) {
       <span class="type-badge type-${escapeHtml(item.kind)}">${escapeHtml(item.kind)}</span>
       <span class="label-q">${escapeHtml(item.question || "(no question text)")}</span>
       <span class="label-src"></span>
+      <button class="label-remove" type="button"
+              title="Remove from the queue without labeling">✕</button>
     </div>
     <pre class="state-text label-state"></pre>
     <div class="label-options"></div>
   `;
   card.querySelector(".label-state").textContent = item.text;
+  card.querySelector(".label-remove")
+    .addEventListener("click", () => removeItem(card, item));
 
   const opts = card.querySelector(".label-options");
   item.options.forEach((label, idx) => {
@@ -746,6 +751,24 @@ function applyLabel(card, item) {
   card.querySelectorAll(".label-option").forEach((b, idx) => {
     b.classList.toggle("chosen", idx === item.gold_idx);
   });
+}
+
+async function removeItem(card, item) {
+  try {
+    const res = await fetch(`${API_BASE}/api/label/discard`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ item_id: item.item_id }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    card.remove();
+    loadLabelStats();
+  } catch (err) {
+    labelSummary("failure", `<strong>Error:</strong> ${escapeHtml(err.message)}`);
+  }
 }
 
 async function submitLabel(card, item, idx) {
