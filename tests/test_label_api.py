@@ -59,17 +59,31 @@ def test_manual_label_accept_and_override(client):
 
     acc = client.post("/api/label", json={"item_id": item["item_id"], "gold_idx": 0,
                                            "source": "accepted"}).json()
-    assert acc["written"] is True
+    assert acc["written"] is True and acc["updated"] is False
     assert acc["item"]["source"] == "accepted"
 
-    # same item again → idempotent no-op
+    # re-click the same labeled card → overwrite the label (last row wins)
     again = client.post("/api/label", json={"item_id": item["item_id"], "gold_idx": 2,
                                             "source": "overridden"}).json()
-    assert again["written"] is False
+    assert again["written"] is True and again["updated"] is True
+    assert again["item"]["gold_idx"] == 2 and again["item"]["source"] == "overridden"
 
     # only the other item remains pending
     remaining = client.get("/api/label/queue").json()["items"]
     assert len(remaining) == 1
+
+
+def test_manual_override_after_auto_label(client, monkeypatch):
+    monkeypatch.setattr(app_module, "OpenRouterLabeler", FakeLabeler)
+    auto = client.post("/api/label/auto", json={}).json()["item"]
+    assert auto["source"] == "auto" and auto["gold_idx"] == 0
+
+    body = client.post("/api/label", json={"item_id": auto["item_id"], "gold_idx": 2,
+                                           "source": "overridden"}).json()
+    assert body["updated"] is True
+    assert body["item"]["gold_idx"] == 2
+    assert body["item"]["source"] == "overridden"
+    assert body["item"]["labeled_by"] == "human"
 
 
 def test_manual_label_rejects_bad_source(client):
@@ -125,6 +139,19 @@ def test_discard_removes_item_without_labeling(client):
     assert client.post("/api/label/discard", json={"item_id": item["item_id"]}).json()["discarded"] is False
     assert len(client.get("/api/label/queue").json()["items"]) == 1
     assert client.get("/api/label/stats").json()["discarded"] == 1
+
+
+def test_include_labeled_lists_labeled_items(client):
+    item = client.get("/api/label/queue").json()["items"][0]
+    client.post("/api/label", json={"item_id": item["item_id"], "gold_idx": 2,
+                                     "source": "overridden"})
+    # default queue hides labeled items
+    assert len(client.get("/api/label/queue").json()["items"]) == 1
+    # include_labeled=1 appends them for review/correction
+    items = client.get("/api/label/queue?include_labeled=1").json()["items"]
+    assert len(items) == 2
+    got = next(i for i in items if i["item_id"] == item["item_id"])
+    assert got["gold_idx"] == 2 and got["source"] == "overridden"
 
 
 def test_discard_all_clears_queue(client):

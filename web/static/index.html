@@ -76,12 +76,17 @@
                   title="Remove every pending item without labeling it">
             Remove all
           </button>
+          <label class="label-toggle" title="Also list already-labeled items so you can correct them">
+            <input type="checkbox" id="show-labeled-toggle">
+            Show labeled
+          </label>
         </div>
       </div>
       <p class="label-note">
         Each card shows the head's prediction (<span class="pred-marker">★</span>).
         Click the correct label to save it — a click on the ★ option records
         <em>accepted</em>, any other records <em>overridden</em>.
+        Re-click any card (including an auto-labeled one) to change its label.
         <span class="warn-inline">Auto-label sends the text to OpenRouter (a third party).</span>
       </p>
       <div id="label-summary" class="summary hidden"></div>

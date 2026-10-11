@@ -12,6 +12,7 @@ from decision_lab.real.labels import (
     items_from_call,
     make_item_id,
     option_texts,
+    overwrite_label,
     predicted_index,
     stats,
 )
@@ -115,3 +116,20 @@ def test_append_label_idempotent(tmp_path):
     assert append_label(item, labels) is True
     assert append_label(item, labels) is False
     assert len(labels.read_text().splitlines()) == 1
+
+
+def test_overwrite_label_last_wins(tmp_path):
+    from decision_lab.real.labels import load_labels
+
+    labels = tmp_path / "labels.jsonl"
+    item = LabelItem(item_id="x", call_id="c", text="t", question="q",
+                     kind="choice", options=["a", "b"], gold_idx=0, source=SOURCE_ACCEPTED)
+    append_label(item, labels)
+
+    changed = LabelItem(item_id="x", call_id="c", text="t", question="q",
+                        kind="choice", options=["a", "b"], gold_idx=1, source=SOURCE_OVERRIDDEN)
+    overwrite_label(changed, labels)
+
+    assert len(labels.read_text().splitlines()) == 2
+    assert load_labels(labels)["x"].gold_idx == 1          # last row wins
+    assert load_labels(labels)["x"].source == SOURCE_OVERRIDDEN

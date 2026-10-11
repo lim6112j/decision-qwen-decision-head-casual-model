@@ -28,7 +28,9 @@ from decision_lab.real.labels import (
     append_label,
     build_queue,
     discard_item,
+    labeled_items,
     load_labels,
+    overwrite_label,
     stats as label_stats,
 )
 from decision_lab.real.teacher import LabelingError, OpenRouterLabeler
@@ -389,17 +391,39 @@ def _pending_queue() -> list[LabelItem]:
     return build_queue(TRAFFIC_DIR, LABELS_PATH, DISCARDED_PATH)
 
 
-def _find_pending(item_id: str) -> LabelItem:
+def _find_item(item_id: str) -> tuple[LabelItem, bool]:
+    """Find an item by id → (item, already_labeled).
+
+    Looks in the pending queue first, then in the label file, so a re-click on
+    an already-labeled card (human or auto) can overwrite its label.
+    """
     for item in _pending_queue():
         if item.item_id == item_id:
-            return item
-    raise HTTPException(status_code=404, detail=f"pending item {item_id} not found")
+            return item, False
+    existing = load_labels(LABELS_PATH).get(item_id)
+    if existing is not None:
+        return existing, True
+    raise HTTPException(status_code=404, detail=f"item {item_id} not found")
+
+
+def _find_pending(item_id: str) -> LabelItem:
+    item, labeled = _find_item(item_id)
+    if labeled:
+        raise HTTPException(status_code=404, detail=f"pending item {item_id} not found")
+    return item
 
 
 @app.get("/api/label/queue")
-def label_queue():
-    """Every pending (unlabeled) item, pre-filled with the head's prediction."""
-    return {"items": [_label_item_payload(i) for i in _pending_queue()]}
+def label_queue(include_labeled: bool = False):
+    """Pending items, pre-filled with the head's prediction.
+
+    With ``include_labeled=1`` the already-labeled items are appended too, so
+    the UI can show them for review/correction.
+    """
+    items = [_label_item_payload(i) for i in _pending_queue()]
+    if include_labeled:
+        items += [_label_item_payload(i) for i in labeled_items(LABELS_PATH)]
+    return {"items": items}
 
 
 @app.get("/api/label/stats")
@@ -427,17 +451,14 @@ def discard_all_labels():
 
 @app.post("/api/label")
 def submit_label(req: LabelRequest):
-    """Record a manual label (accept the pre-fill or override it)."""
+    """Record a manual label. Re-clicking a labeled card (human or auto)
+    overwrites its label."""
     if req.source not in (SOURCE_ACCEPTED, SOURCE_OVERRIDDEN):
         raise HTTPException(
             status_code=400,
             detail=f"source must be '{SOURCE_ACCEPTED}' or '{SOURCE_OVERRIDDEN}'",
         )
-    # Idempotent: re-labeling an already-labeled item is a no-op, not a 404.
-    already = load_labels(LABELS_PATH)
-    if req.item_id in already:
-        return {"written": False, "item": _label_item_payload(already[req.item_id])}
-    item = _find_pending(req.item_id)
+    item, was_labeled = _find_item(req.item_id)
     if req.gold_idx >= len(item.options):
         raise HTTPException(
             status_code=400,
@@ -446,8 +467,12 @@ def submit_label(req: LabelRequest):
     item.gold_idx = req.gold_idx
     item.source = req.source
     item.labeled_by = "human"
-    written = append_label(item, LABELS_PATH)
-    return {"written": written, "item": _label_item_payload(item)}
+    if was_labeled:
+        overwrite_label(item, LABELS_PATH)   # last row wins → replaces the old label
+        written = True
+    else:
+        written = append_label(item, LABELS_PATH)
+    return {"written": written, "updated": was_labeled, "item": _label_item_payload(item)}
 
 
 def _auto_label(item: LabelItem) -> LabelItem:

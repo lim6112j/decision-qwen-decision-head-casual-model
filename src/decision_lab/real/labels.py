@@ -244,6 +244,25 @@ def append_label(item: LabelItem, labels_path: Path) -> bool:
         return True
 
 
+def labeled_items(labels_path: Path) -> list[LabelItem]:
+    """Already-labeled items (last row wins), for review/correction in the UI."""
+    return list(load_labels(labels_path).values())
+
+
+def overwrite_label(item: LabelItem, labels_path: Path) -> None:
+    """Append a label row that replaces any previous label for this item_id.
+
+    ``load_labels`` keeps the last row per id, so a later append wins — this is
+    how a human re-labels an item the auto-labeler already filled in.
+    """
+    with _APPEND_LOCK:
+        labels_path.parent.mkdir(parents=True, exist_ok=True)
+        if not item.labeled_at:
+            item.labeled_at = _now_iso()
+        with labels_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(item.to_dict(), ensure_ascii=False) + "\n")
+
+
 def stats(
     traffic_dir: Path, labels_path: Path, discarded_path: Path | None = None,
 ) -> dict:

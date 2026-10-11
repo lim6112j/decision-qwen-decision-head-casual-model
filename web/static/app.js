@@ -662,8 +662,9 @@ els.labelSummary = document.getElementById("label-summary");
 els.autoOneBtn = document.getElementById("auto-one-btn");
 els.autoAllBtn = document.getElementById("auto-all-btn");
 els.discardAllBtn = document.getElementById("discard-all-btn");
+els.showLabeledToggle = document.getElementById("show-labeled-toggle");
 
-const labelState = { count: 0 };
+const labelState = { count: 0, includeLabeled: false };
 
 function labelSummary(kind, html) {
   els.labelSummary.className = `summary ${kind}`;
@@ -689,7 +690,8 @@ async function loadLabelQueue() {
   els.labelList.innerHTML = `<p class="loading">Loading pending items…</p>`;
   await loadLabelStats();
   try {
-    const res = await fetch(`${API_BASE}/api/label/queue`);
+    const q = labelState.includeLabeled ? "?include_labeled=1" : "";
+    const res = await fetch(`${API_BASE}/api/label/queue${q}`);
     const body = await res.json();
     els.labelList.innerHTML = "";
     if (body.items.length === 0) {
@@ -738,6 +740,9 @@ function renderLabelCard(item) {
     b.addEventListener("click", () => submitLabel(card, item, idx));
     opts.appendChild(b);
   });
+
+  // Already-labeled items (Show labeled) render with their saved choice.
+  if (item.gold_idx !== null && item.gold_idx !== undefined) applyLabel(card, item);
   return card;
 }
 
@@ -881,3 +886,7 @@ async function autoLabelAll() {
 els.autoOneBtn.addEventListener("click", autoLabelOne);
 els.autoAllBtn.addEventListener("click", autoLabelAll);
 els.discardAllBtn.addEventListener("click", discardAll);
+els.showLabeledToggle.addEventListener("change", () => {
+  labelState.includeLabeled = els.showLabeledToggle.checked;
+  loadLabelQueue();
+});

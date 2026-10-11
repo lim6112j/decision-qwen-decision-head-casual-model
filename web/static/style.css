@@ -399,6 +399,16 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .label-toolbar button { flex: 0 0 auto; }
 #auto-one-btn { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
 #discard-all-btn { background: transparent; color: var(--bad); border: 1px solid var(--bad); }
+.label-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.label-toggle input { accent-color: var(--accent); cursor: pointer; }
 .label-stats { color: var(--muted); font-size: 13px; }
 .label-note { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0 0 14px; }
 .warn-inline { color: var(--warn); }
