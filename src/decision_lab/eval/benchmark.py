@@ -456,7 +456,60 @@ def run_benchmark(
     if phrasing_metrics is not None:
         all_metrics["test_phrasings"] = phrasing_metrics
 
+    real_metrics = _benchmark_dynamic_real(data_dir, cfg, server, models_dir)
+    if real_metrics is not None:
+        all_metrics["test_real"] = real_metrics
+
     return all_metrics
+
+
+def _benchmark_dynamic_real(
+    data_dir: Path,
+    cfg: Config,
+    server,
+    models_dir: Path,
+) -> dict[str, AgentMetrics] | None:
+    """Benchmark the dynamic head on the human-held-out real-traffic split.
+
+    This is the honest measure of whether real data helped: items the head
+    never trained on, with labels this dataset did not use for training.
+    """
+    from decision_lab.head.dynamic_train import collate_dynamic_batch
+    from decision_lab.real.build_dataset import build_samples, load_items
+
+    items = load_items(data_dir / "real" / "test_real.jsonl")
+    if not items:
+        return None
+
+    device = get_device()
+    samples = build_samples(items, server, cfg.dynamic_head.include_summary_field)
+    if not samples:
+        return None
+
+    head, _temp = _load_dynamic_for_benchmark(cfg, models_dir, device)
+    if not head.state_set:
+        return None
+
+    head.eval()
+    head.to(device)
+    correct = 0
+    with torch.no_grad():
+        for start in range(0, len(samples), 64):
+            chunk = samples[start : start + 64]
+            xb, mask, ob, qb, yb = collate_dynamic_batch(chunk, device)
+            scores = head.forward_choice(xb, ob, mask, qb)
+            correct += int((scores.argmax(dim=1) == yb).sum().item())
+
+    acc = correct / len(samples)
+    print(f"  [test_real] head_dynamic accuracy: {acc:.3f} over {len(samples)} held-out items")
+    return {
+        "head_dynamic": AgentMetrics(
+            mean_accuracy=acc,
+            per_question_accuracy={"real_traffic": acc},
+            mean_confidence=0.0, ece=0.0, ece_per_question={},
+            mean_latency_ms=0.0, median_latency_ms=0.0, p99_latency_ms=0.0,
+        )
+    }
 
 
 def _benchmark_dynamic_phrasings(

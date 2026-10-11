@@ -228,7 +228,7 @@ def generate_dynamic_training_data(
 
     unique_texts = sorted(all_texts)
     print(f"  embedding {len(unique_texts)} unique option/question texts...")
-    text_to_emb = _embed_texts(server, unique_texts)
+    text_to_emb = embed_texts(server, unique_texts)
 
     # Shape-variant duplicates of document states: same latents → same gold,
     # different surface shape. Their field sets don't exist in the precomputed
@@ -253,7 +253,7 @@ def generate_dynamic_training_data(
                 texts.extend(field_texts)
         unique = list(dict.fromkeys(texts))
         print(f"  shape augmentation: embedding {len(unique)} unique variant field texts...")
-        emb_by_text = _embed_texts(server, unique)
+        emb_by_text = embed_texts(server, unique)
         for state_index, field_texts in pending:
             extra.append((
                 np.stack([emb_by_text[t] for t in field_texts]),
@@ -339,8 +339,12 @@ def generate_dynamic_training_data(
     return samples
 
 
-def _embed_texts(server, texts: list[str]) -> dict[str, np.ndarray]:
-    """Embed texts in fixed batches → {text: (input_dim,) float32}."""
+def embed_texts(server, texts: list[str]) -> dict[str, np.ndarray]:
+    """Embed texts in fixed batches → {text: (input_dim,) float32}.
+
+    Shared by synthetic training-data generation and the real-traffic
+    converter (real/build_dataset.py).
+    """
     emb: dict[str, np.ndarray] = {}
     batch_size = 32
     for i in range(0, len(texts), batch_size):

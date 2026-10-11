@@ -153,6 +153,15 @@ a natural-language question about the state's fields.
 
 `answers` is parallel to `questions` in the request (same order, same length).
 
+### Opt-in call logging (real-data pipeline)
+
+To contribute a call to the real-traffic training dataset, send the header
+`X-Decision-Lab-Log: 1` **and** enable `web.log_traffic: true` in config. The
+call is then written to `data/traffic/` (local only). Nothing is logged
+otherwise — capture is never silent. See
+[docs/real-data-pipeline.md](real-data-pipeline.md) for the full
+capture → label → train flow.
+
 ### Errors
 
 | Status | Meaning |

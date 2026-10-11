@@ -11,10 +11,14 @@
   <header>
     <h1>Decision Lab</h1>
     <p class="subtitle">Typed question analysis — choice / score / noul in a single forward pass</p>
+    <nav id="tabs" aria-label="View">
+      <button class="tab active" data-view="eval" type="button">Evaluate</button>
+      <button class="tab" data-view="label" type="button">Label</button>
+    </nav>
     <span id="status" class="status-dot" title="checking server…"></span>
   </header>
 
-  <main>
+  <main id="view-eval">
     <section id="controls">
       <h2>Model</h2>
       <div id="agent-cards" role="radiogroup" aria-label="Model selection">
@@ -51,6 +55,37 @@
     <section id="results-panel">
       <h2>Results</h2>
       <div id="results"></div>
+    </section>
+  </main>
+
+  <main id="view-label" class="hidden">
+    <section id="label-panel">
+      <h2>Label Real Traffic <span class="hint">— your labels, or one click from OpenRouter</span></h2>
+      <div class="label-toolbar">
+        <div id="label-stats" class="label-stats">Loading…</div>
+        <div class="button-row">
+          <button id="auto-one-btn" type="button"
+                  title="Label the first pending item with OpenRouter — this sends the state text to OpenRouter">
+            Auto-label 1
+          </button>
+          <button id="auto-all-btn" type="button"
+                  title="Label every pending item with OpenRouter — this sends each state text to OpenRouter">
+            Auto-label all
+          </button>
+          <button id="discard-all-btn" type="button"
+                  title="Remove every pending item without labeling it">
+            Remove all
+          </button>
+        </div>
+      </div>
+      <p class="label-note">
+        Each card shows the head's prediction (<span class="pred-marker">★</span>).
+        Click the correct label to save it — a click on the ★ option records
+        <em>accepted</em>, any other records <em>overridden</em>.
+        <span class="warn-inline">Auto-label sends the text to OpenRouter (a third party).</span>
+      </p>
+      <div id="label-summary" class="summary hidden"></div>
+      <div id="label-list"></div>
     </section>
   </main>
 

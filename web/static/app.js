@@ -538,7 +538,9 @@ async function runDynamic() {
   try {
     const res = await fetch(DYNAMIC_API_BASE, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      // Opt this UI run into traffic capture; the server still requires
+      // web.log_traffic to be enabled (see docs/real-data-pipeline.md).
+      headers: { "Content-Type": "application/json", "X-Decision-Lab-Log": "1" },
       body: JSON.stringify({
         ...currentStatePayload(),
         questions,
@@ -631,3 +633,251 @@ loadDefaultQuestions();
 
 pollStatus();
 setInterval(pollStatus, 5000);
+
+/* ---------- view tabs ---------- */
+
+const tabButtons = document.querySelectorAll("#tabs .tab");
+const views = {
+  eval: document.getElementById("view-eval"),
+  label: document.getElementById("view-label"),
+};
+
+function showView(name) {
+  for (const [key, el] of Object.entries(views)) {
+    el.classList.toggle("hidden", key !== name);
+  }
+  for (const t of tabButtons) t.classList.toggle("active", t.dataset.view === name);
+  if (name === "label") loadLabelQueue();
+}
+
+for (const t of tabButtons) {
+  t.addEventListener("click", () => showView(t.dataset.view));
+}
+
+/* ---------- real-traffic labeling ---------- */
+
+els.labelList = document.getElementById("label-list");
+els.labelStats = document.getElementById("label-stats");
+els.labelSummary = document.getElementById("label-summary");
+els.autoOneBtn = document.getElementById("auto-one-btn");
+els.autoAllBtn = document.getElementById("auto-all-btn");
+els.discardAllBtn = document.getElementById("discard-all-btn");
+
+const labelState = { count: 0 };
+
+function labelSummary(kind, html) {
+  els.labelSummary.className = `summary ${kind}`;
+  els.labelSummary.innerHTML = html;
+  els.labelSummary.classList.remove("hidden");
+}
+
+async function loadLabelStats() {
+  try {
+    const res = await fetch(`${API_BASE}/api/label/stats`);
+    const s = await res.json();
+    els.labelStats.innerHTML =
+      `labeled <strong>${s.labeled}</strong> / ${s.total} ` +
+      `<span class="hint">(${s.remaining} remaining` +
+      (s.discarded ? `, ${s.discarded} removed` : "") + `)</span>`;
+    labelState.count = s.remaining;
+  } catch {
+    els.labelStats.textContent = "stats unavailable";
+  }
+}
+
+async function loadLabelQueue() {
+  els.labelList.innerHTML = `<p class="loading">Loading pending items…</p>`;
+  await loadLabelStats();
+  try {
+    const res = await fetch(`${API_BASE}/api/label/queue`);
+    const body = await res.json();
+    els.labelList.innerHTML = "";
+    if (body.items.length === 0) {
+      els.labelList.innerHTML =
+        `<p class="loading">No pending items. Capture traffic with ` +
+        `<code>X-Decision-Lab-Log: 1</code> and <code>web.log_traffic: true</code>.</p>`;
+      return;
+    }
+    for (const item of body.items) els.labelList.appendChild(renderLabelCard(item));
+  } catch (err) {
+    els.labelList.innerHTML = `<p class="loading">Failed to load queue: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function renderLabelCard(item) {
+  const card = document.createElement("div");
+  card.className = "label-card";
+  card.dataset.itemId = item.item_id;
+  if (item.gold_idx !== null && item.gold_idx !== undefined) card.classList.add("labeled");
+
+  card.innerHTML = `
+    <div class="label-card-header">
+      <span class="type-badge type-${escapeHtml(item.kind)}">${escapeHtml(item.kind)}</span>
+      <span class="label-q">${escapeHtml(item.question || "(no question text)")}</span>
+      <span class="label-src"></span>
+      <button class="label-remove" type="button"
+              title="Remove from the queue without labeling">✕</button>
+    </div>
+    <pre class="state-text label-state"></pre>
+    <div class="label-options"></div>
+  `;
+  card.querySelector(".label-state").textContent = item.text;
+  card.querySelector(".label-remove")
+    .addEventListener("click", () => removeItem(card, item));
+
+  const opts = card.querySelector(".label-options");
+  item.options.forEach((label, idx) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "label-option";
+    if (idx === item.predicted_idx) {
+      b.classList.add("predicted");
+      b.title = "head prediction";
+    }
+    b.textContent = `${idx === item.predicted_idx ? "★ " : ""}${label}`;
+    b.addEventListener("click", () => submitLabel(card, item, idx));
+    opts.appendChild(b);
+  });
+  return card;
+}
+
+function applyLabel(card, item) {
+  card.classList.add("labeled");
+  const src = card.querySelector(".label-src");
+  if (src) {
+    src.textContent = item.source === "auto"
+      ? `auto · ${item.labeled_by || "openrouter"}`
+      : `you · ${item.source}`;
+  }
+  card.querySelectorAll(".label-option").forEach((b, idx) => {
+    b.classList.toggle("chosen", idx === item.gold_idx);
+  });
+}
+
+async function removeItem(card, item) {
+  try {
+    const res = await fetch(`${API_BASE}/api/label/discard`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ item_id: item.item_id }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    card.remove();
+    loadLabelStats();
+  } catch (err) {
+    labelSummary("failure", `<strong>Error:</strong> ${escapeHtml(err.message)}`);
+  }
+}
+
+async function submitLabel(card, item, idx) {
+  const source = idx === item.predicted_idx ? "accepted" : "overridden";
+  try {
+    const res = await fetch(`${API_BASE}/api/label`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ item_id: item.item_id, gold_idx: idx, source }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const body = await res.json();
+    item.gold_idx = body.item.gold_idx;
+    item.source = body.item.source;
+    item.labeled_by = body.item.labeled_by;
+    applyLabel(card, item);
+    loadLabelStats();
+  } catch (err) {
+    labelSummary("failure", `<strong>Error:</strong> ${escapeHtml(err.message)}`);
+  }
+}
+
+function findCard(itemId) {
+  return els.labelList.querySelector(`.label-card[data-item-id="${itemId}"]`);
+}
+
+async function autoLabelOne() {
+  els.autoOneBtn.disabled = true;
+  labelSummary("", "Auto-labeling one item…");
+  try {
+    const res = await fetch(`${API_BASE}/api/label/auto`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const body = await res.json();
+    const card = findCard(body.item.item_id);
+    if (card) applyLabel(card, body.item);
+    labelSummary("success", `Labeled <strong>${escapeHtml(body.item.gold_label)}</strong> via OpenRouter.`);
+    loadLabelStats();
+  } catch (err) {
+    labelSummary("failure", `<strong>Error:</strong> ${escapeHtml(err.message)}`);
+  } finally {
+    els.autoOneBtn.disabled = false;
+  }
+}
+
+async function discardAll() {
+  if (!confirm("Remove all pending items without labeling? They will not be used for training.")) {
+    return;
+  }
+  els.discardAllBtn.disabled = true;
+  try {
+    const res = await fetch(`${API_BASE}/api/label/discard-all`, { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const body = await res.json();
+    els.labelList.innerHTML = `<p class="loading">No pending items.</p>`;
+    labelSummary("success", `Removed <strong>${body.discarded}</strong> item(s) without labeling.`);
+    loadLabelStats();
+  } catch (err) {
+    labelSummary("failure", `<strong>Error:</strong> ${escapeHtml(err.message)}`);
+  } finally {
+    els.discardAllBtn.disabled = false;
+  }
+}
+
+async function autoLabelAll() {
+  els.autoAllBtn.disabled = true;
+  els.autoOneBtn.disabled = true;
+  labelSummary("", "Auto-labeling every pending item…");
+  let done = 0;
+  try {
+    await postSSE("/api/label/auto-all", {}, (event) => {
+      if (event.event === "fatal") {
+        throw new Error(event.data.detail);
+      }
+      if (event.event === "progress") {
+        done += 1;
+        if (event.data.ok) {
+          const card = findCard(event.data.item.item_id);
+          if (card) applyLabel(card, event.data.item);
+        }
+        labelSummary("", `Auto-labeling… ${done} processed`);
+      } else if (event.event === "done") {
+        labelSummary("success",
+          `Done — labeled <strong>${event.data.labeled}</strong>, ` +
+          `failed ${event.data.failed}, ${event.data.remaining} remaining.`);
+      }
+    });
+    loadLabelStats();
+  } catch (err) {
+    labelSummary("failure", `<strong>Error:</strong> ${escapeHtml(err.message)}`);
+  } finally {
+    els.autoAllBtn.disabled = false;
+    els.autoOneBtn.disabled = false;
+  }
+}
+
+els.autoOneBtn.addEventListener("click", autoLabelOne);
+els.autoAllBtn.addEventListener("click", autoLabelAll);
+els.discardAllBtn.addEventListener("click", discardAll);
