@@ -29,13 +29,12 @@ def cmd_extract(args):
     v1) and features_{split}_fields.npz (ragged field sets, v2).
     """
     from decision_lab.backbone.features import extract_features, extract_field_features
-    from decision_lab.backbone.llama_server import LlamaServer
+    from decision_lab.backbone.llama_server import server_from_config
 
     cfg = load_config(args.config)
-    gguf = Path(cfg.model.gguf_path).expanduser().resolve()
     include_summary = cfg.dynamic_head.include_summary_field
 
-    with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
+    with server_from_config(cfg) as server:
         for split in ["train", "test_indist", "test_heldout", "train_breakout", "test_breakout"]:
             data_path = args.data_dir / f"{split}.jsonl"
             if not data_path.exists():
@@ -81,13 +80,12 @@ def cmd_train(args):
 def cmd_train_dynamic(args):
     """Train dynamic decision head (v2 field-set attention) on extracted features."""
     from decision_lab.backbone.features import load_field_features
-    from decision_lab.backbone.llama_server import LlamaServer
+    from decision_lab.backbone.llama_server import server_from_config
     from decision_lab.head.model import build_question_spec
     from decision_lab.head.dynamic_train import generate_dynamic_training_data, train_dynamic_head
     from decision_lab.states.dataset import load_dataset
 
     cfg = load_config(args.config)
-    gguf = Path(cfg.model.gguf_path).expanduser().resolve()
 
     train_path = args.data_dir / "train.jsonl"
     if not train_path.exists():
@@ -130,7 +128,7 @@ def cmd_train_dynamic(args):
           f"summary_field={dcfg.include_summary_field}, "
           f"shape_augmentation={dcfg.shape_augmentation}")
 
-    with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
+    with server_from_config(cfg) as server:
         samples = generate_dynamic_training_data(
             states, field_sets, question_spec, server,
             num_variants_per_question=dcfg.variants_per_question,
@@ -141,6 +139,7 @@ def cmd_train_dynamic(args):
         train_dynamic_head(
             samples, cfg, args.models_dir / dcfg.checkpoint_filename,
             anchor_fraction=dcfg.anchor_epochs / max(dcfg.max_epochs, 1),
+            backbone_id=server.backend_id,
         )
 
 
@@ -166,13 +165,12 @@ def _load_real_samples(dcfg, data_dir: Path) -> list:
 
 def cmd_build_real(args):
     """Convert labeled real-traffic items into training samples (samples.pt)."""
-    from decision_lab.backbone.llama_server import LlamaServer
+    from decision_lab.backbone.llama_server import server_from_config
     from decision_lab.real.build_dataset import convert_labels
 
     cfg = load_config(args.config)
-    gguf = Path(cfg.model.gguf_path).expanduser().resolve()
 
-    with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
+    with server_from_config(cfg) as server:
         try:
             summary = convert_labels(cfg, server, args.data_dir)
         except ValueError as exc:
@@ -186,13 +184,12 @@ def cmd_build_real(args):
 
 def cmd_eval(args):
     """Run benchmarks for all agents on test sets."""
-    from decision_lab.backbone.llama_server import LlamaServer
+    from decision_lab.backbone.llama_server import server_from_config
     from decision_lab.eval.benchmark import run_benchmark
 
     cfg = load_config(args.config)
-    gguf = Path(cfg.model.gguf_path).expanduser().resolve()
 
-    with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
+    with server_from_config(cfg) as server:
         all_metrics = run_benchmark(args.data_dir, cfg, server, args.models_dir)
 
     from decision_lab.eval.report import generate_report

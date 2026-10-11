@@ -1,5 +1,7 @@
 """Tests for typed-question benchmark metrics (accuracy, ECE, latency)."""
 
+import json
+
 import numpy as np
 import pytest
 import torch
@@ -262,3 +264,62 @@ class TestBenchmarkDynamicPhrasings:
             tmp_path, cfg, self._FakeServer(64), tmp_path, cfg.benchmark, {},
         )
         assert metrics is None
+
+
+class TestSkipAgents:
+    """An embeddings-only backbone (e.g. bge-m3) cannot run three of the
+    four agents: head_trained/head_random read the pooled feature cache and
+    prompt_lm_zero_shot calls chat(), which such a model does not serve."""
+
+    class _Server:
+        def embed(self, texts):
+            return [[float(len(t))] * 1024 for t in texts]
+
+    def _data_dir(self, tmp_path):
+        from decision_lab.backbone.features import extract_field_features
+
+        rows = [
+            json.dumps({
+                "doc_id": i,
+                "state_type": "text",
+                "text": f"Note {i}: informational update. No action needed.",
+                "labels": {
+                    "sentiment": "neutral", "urgency": "low", "quality": 2,
+                    "is_actionable": False, "contains_pii": False,
+                    "is_urgent": False,
+                },
+            })
+            for i in range(3)
+        ]
+        data = tmp_path / "test_indist.jsonl"
+        data.write_text("\n".join(rows))
+        extract_field_features(
+            data,
+            tmp_path / "features_test_indist_fields.npz",
+            self._Server(),
+            include_summary_field=True,
+        )
+        return tmp_path
+
+    def test_skipped_agents_are_absent_from_results(self, tmp_path):
+        from decision_lab.eval.benchmark import run_benchmark
+
+        cfg = Config()
+        cfg.benchmark.max_test_states = 0
+        cfg.benchmark.skip_agents = [
+            "head_trained", "head_random", "prompt_lm_zero_shot",
+        ]
+        cfg.questions.choice = {
+            "sentiment": {
+                "options": {
+                    "positive": "Positive sentiment",
+                    "negative": "Negative sentiment",
+                    "neutral": "Neutral sentiment",
+                },
+            },
+        }
+        data_dir = self._data_dir(tmp_path)
+
+        metrics = run_benchmark(data_dir, cfg, self._Server(), tmp_path / "models")
+
+        assert set(metrics["test_indist"]) == {"head_dynamic"}

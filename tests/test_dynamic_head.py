@@ -14,6 +14,7 @@ from decision_lab.head.dynamic_model import (
     D_K,
     DEFAULT_TEMPERATURE,
     DynamicDecisionHead,
+    check_backbone_match,
     create_random_dynamic_head,
     decode_dynamic_answer,
     dynamic_probabilities,
@@ -962,3 +963,76 @@ class TestPaddleDirectionVariants:
         for v in variants:
             # gold_map values must be a permutation of the option set
             assert sorted(v["gold_map"].values()) == sorted(v["options"])
+
+# ---------------------------------------------------------------------------
+# Backbone identity
+# ---------------------------------------------------------------------------
+
+
+class _StubServer:
+    def __init__(self, backend_id: str):
+        self.backend_id = backend_id
+
+
+class TestBackboneIdentity:
+    """A head trained against one embedding backend is meaningless against
+    another — same vector shape, different space. The checkpoint records
+    which backend it was trained on so the mismatch is visible."""
+
+    def _head(self):
+        return DynamicDecisionHead(
+            input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True,
+        )
+
+    def test_backbone_id_survives_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "head.pt"
+            save_dynamic_head(self._head(), path, backbone_id="bge-m3|pooling=cls")
+            loaded = load_dynamic_head(path)
+        assert loaded.backbone_id == "bge-m3|pooling=cls"
+
+    def test_checkpoint_without_backbone_id_loads_as_none(self):
+        """Checkpoints predating the field must keep loading (v4 no-retrain
+        requirement) and must not trigger the guard."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "head.pt"
+            save_dynamic_head(self._head(), path)   # no backbone_id
+            loaded = load_dynamic_head(path)
+        assert loaded.backbone_id is None
+        check_backbone_match(loaded, _StubServer("anything"))   # no raise
+
+    def test_matching_backbone_is_silent(self, capsys):
+        head = self._head()
+        head.backbone_id = "qwen|pooling=last"
+        check_backbone_match(head, _StubServer("qwen|pooling=last"))
+        assert "warning" not in capsys.readouterr().out
+
+    def test_mismatched_backbone_warns(self, capsys):
+        # Unique ids: the warn-once cache is module-level and shared.
+        head = self._head()
+        head.backbone_id = "warn-test-trained|pooling=last"
+        check_backbone_match(head, _StubServer("warn-test-serving|pooling=cls"))
+        out = capsys.readouterr().out
+        assert "warning" in out
+        assert "warn-test-trained|pooling=last" in out
+        assert "warn-test-serving|pooling=cls" in out
+
+    def test_repeated_mismatch_warns_once(self, capsys):
+        """run_benchmark loads the same head once per pass — one warning."""
+        head = self._head()
+        head.backbone_id = "unique-a|pooling=last"
+        server = _StubServer("unique-b|pooling=cls")
+        check_backbone_match(head, server)
+        check_backbone_match(head, server)
+        assert capsys.readouterr().out.count("warning") == 1
+
+    def test_untrained_head_never_warns(self, capsys):
+        check_backbone_match(self._head(), _StubServer("bge-m3"))
+        assert "warning" not in capsys.readouterr().out
+
+    def test_server_without_backend_id_never_warns(self, capsys):
+        """Duck-typed test servers expose only embed()."""
+        head = self._head()
+        head.backbone_id = "qwen|pooling=last"
+        check_backbone_match(head, object())
+        assert "warning" not in capsys.readouterr().out

@@ -8,6 +8,7 @@ import torch
 from decision_lab.config import Config
 from decision_lab.head.dynamic_model import (
     DynamicDecisionHead,
+    check_backbone_match,
     create_random_dynamic_head,
     decode_dynamic_answer,
     get_device,
@@ -333,6 +334,7 @@ def _load_dynamic_agent(
         head = load_dynamic_head(str(path))
         temperature = getattr(head, "temperature", 1.0)
         print(f"  loaded dynamic head from {path} (T={temperature:.3f})")
+        check_backbone_match(head, server, where=f" at {path}")
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         print(f"  no dynamic head checkpoint at {path} ({exc}); using random init")
         head = create_random_dynamic_head(

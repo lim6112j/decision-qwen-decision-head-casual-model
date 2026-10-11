@@ -38,7 +38,14 @@ class ModelConfig:
     gguf_path: str = "models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf"
     context_length: int = 2048
     server_port: int = 8080
+    # "last"/"mean" suit causal LMs; "cls" suits BERT/XLM-R embedding models
+    # (e.g. bge-m3). Must match the served model family or embeddings are junk.
     pooling: str = "last"
+    # Identity label for the backbone — recorded in head checkpoints and
+    # feature-cache fingerprints so embeddings from different backbones can
+    # never be silently mixed.
+    backbone: str = "qwen3.5-0.8b"
+    embed_dim: int = 1024
 
 
 @dataclass
@@ -111,6 +118,10 @@ class BenchmarkConfig:
     timed_runs: int = 50
     max_test_states: int = 0        # 0 = use the full test set
     latency_sample_size: int = 50   # states used for warmup/timed latency runs
+    # Agents to leave out of run_benchmark. Needed when the backbone is an
+    # embeddings-only model: head_trained/head_random need the pooled feature
+    # cache and prompt_lm_zero_shot needs chat(), which such models lack.
+    skip_agents: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -183,8 +194,12 @@ def _validate(cfg: Config) -> None:
     for qid, spec in q.score.items():
         if len(spec.get("levels", [])) < 2:
             raise ValueError(f"score question '{qid}' needs >= 2 rubric levels")
-    if cfg.model.pooling not in ("last", "mean"):
-        raise ValueError(f"pooling must be 'last' or 'mean', got {cfg.model.pooling}")
+    if cfg.model.pooling not in ("last", "mean", "cls"):
+        raise ValueError(
+            f"pooling must be 'last', 'mean' or 'cls', got {cfg.model.pooling}"
+        )
+    if cfg.model.embed_dim <= 0:
+        raise ValueError(f"embed_dim must be positive, got {cfg.model.embed_dim}")
     if cfg.head.dropout < 0 or cfg.head.dropout > 0.9:
         raise ValueError(f"dropout {cfg.head.dropout} out of range")
     if not 0 < cfg.calibration.holdout_fraction < 0.5:

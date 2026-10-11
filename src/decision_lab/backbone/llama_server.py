@@ -10,16 +10,79 @@ import requests
 
 
 class LlamaServer:
-    """Context manager that starts/stops llama-server as a subprocess."""
+    """Context manager that starts/stops llama-server as a subprocess.
 
-    def __init__(self, gguf_path: Path, port: int = 8080, context_length: int = 2048):
+    Backend-agnostic: the same process manager serves a causal LM (Qwen, for
+    chat + embeddings) or a dedicated embedding GGUF (e.g. bge-m3, embeddings
+    only). Only ``embed()`` is assumed to work — ``chat()`` needs a model with
+    a chat template.
+    """
+
+    def __init__(
+        self,
+        gguf_path: Path,
+        port: int = 8080,
+        context_length: int = 2048,
+        pooling: str = "last",
+        embed_dim: int = 1024,
+    ):
         self.gguf_path = Path(gguf_path).expanduser().resolve()
         self.port = port
         self.context_length = context_length
+        # Pooling must match the model family: causal LMs pool the last token,
+        # XLM-R/BERT-family embedding models pool the CLS token.
+        self.pooling = pooling
+        self.embed_dim = embed_dim
         self._proc: Optional[subprocess.Popen] = None
         self._log_file = None
         self._adopted = False
+        self._served_model_path: Optional[str] = None
         self.base_url = f"http://127.0.0.1:{port}"
+
+    @property
+    def backend_id(self) -> str:
+        """Identity of the embedding backend behind this server.
+
+        Cache fingerprints hash this, so embeddings extracted from one
+        backend can never be silently reused for another. Prefer what the
+        server reports — ``start()`` adopts any healthy server on the port,
+        so ``gguf_path`` is not authoritative — and fall back to local file
+        identity when ``/props`` is unavailable.
+        """
+        source = (
+            f"served={self._served_model_path}"
+            if self._served_model_path
+            else f"file={self._local_file_id()}"
+        )
+        return "|".join([
+            source,
+            f"pooling={self.pooling}",
+            f"ctx={self.context_length}",
+            f"dim={self.embed_dim}",
+        ])
+
+    def _local_file_id(self) -> str:
+        try:
+            st = self.gguf_path.stat()
+        except OSError:
+            return f"{self.gguf_path.name}|missing"
+        return f"{self.gguf_path.name}|size={st.st_size}|mtime={int(st.st_mtime)}"
+
+    def _probe_served_model(self) -> None:
+        """Best-effort: ask the server which weights it actually loaded.
+
+        Never raises — an older build without /props, or a server that
+        answers it oddly, must not break startup.
+        """
+        try:
+            r = requests.get(f"{self.base_url}/props", timeout=5)
+            if r.status_code != 200:
+                return
+            path = r.json().get("model_path")
+        except (requests.RequestException, ValueError):
+            return
+        if isinstance(path, str) and path:
+            self._served_model_path = path
 
     @property
     def running(self) -> bool:
@@ -47,12 +110,16 @@ class LlamaServer:
         (model file, quantization, pooling). Feature caches extracted from
         one backend and option/question embeddings from another land in
         different spaces and silently corrupt the head — extract and train
-        against the SAME server.
+        against the SAME server. ``backend_id`` is folded into the feature
+        cache fingerprint so a stale cache is now detected instead of
+        silently reused; option/question embeddings are still embedded live
+        at train time, so the port discipline still matters.
         """
         if self.running:
             return
         if self._health_ok():
             self._adopted = True
+            self._probe_served_model()
             return
         if not self.gguf_path.exists():
             raise FileNotFoundError(f"GGUF model not found: {self.gguf_path}")
@@ -63,8 +130,14 @@ class LlamaServer:
             "--port", str(self.port),
             "--ctx-size", str(self.context_length),
             "--embeddings",
-            "--pooling", "last",
+            "--pooling", self.pooling,
             "--no-webui",
+            # Errors only. At the default verbosity the server logs one
+            # "srv update" line per prompt in every batch, which grew the
+            # log file past 30 GB during a single feature extraction.
+            # Errors (E ...) still land in the log, so a startup failure
+            # stays diagnosable.
+            "--verbosity", "1",
         ]
         # Log to a file rather than pipes: unbounded llama-server output on
         # PIPE buffers deadlocks the subprocess once the buffer fills.
@@ -74,6 +147,7 @@ class LlamaServer:
         )
 
         self._wait_ready()
+        self._probe_served_model()
 
     def stop(self) -> None:
         if self._proc is None:
@@ -142,3 +216,19 @@ class LlamaServer:
 
     def __exit__(self, *args) -> None:
         self.stop()
+
+
+def server_from_config(cfg) -> LlamaServer:
+    """Build a LlamaServer from a Config's ``model`` section.
+
+    Single construction point: call sites used to pass only path/port/ctx,
+    which silently dropped pooling and dimension — the settings that decide
+    whether an embedding cache is still valid.
+    """
+    return LlamaServer(
+        cfg.model.gguf_path,
+        port=cfg.model.server_port,
+        context_length=cfg.model.context_length,
+        pooling=cfg.model.pooling,
+        embed_dim=cfg.model.embed_dim,
+    )
