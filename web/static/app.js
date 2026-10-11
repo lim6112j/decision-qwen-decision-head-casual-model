@@ -538,7 +538,9 @@ async function runDynamic() {
   try {
     const res = await fetch(DYNAMIC_API_BASE, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      // Opt this UI run into traffic capture; the server still requires
+      // web.log_traffic to be enabled (see docs/real-data-pipeline.md).
+      headers: { "Content-Type": "application/json", "X-Decision-Lab-Log": "1" },
       body: JSON.stringify({
         ...currentStatePayload(),
         questions,
