@@ -76,6 +76,11 @@ class DynamicHeadConfig:
     # v4: checkpoint filename (new name so the preserved v3 checkpoint at
     # head_dynamic.pt is never overwritten by a v4 retrain)
     checkpoint_filename: str = "head_dynamic.pt"
+    # Real-traffic samples (data/real/samples.pt from `build-real`) mixed into
+    # dynamic training. Empty path disables the mix. Samples join stage 2
+    # (generalization) at integer weight `real_weight`.
+    real_data_path: str = ""
+    real_weight: int = 1
     # Add shape-variant duplicates of document states (flattened /
     # marker-stripped, same gold — states/shapes.py) to dynamic-head
     # training. The field-set head collapses to near-uniform logits on
@@ -114,6 +119,22 @@ class WebConfig:
     port: int = 8000
     num_states: int = 8          # pre-generated states offered in the UI
     random_seed: int = 42
+    # Capture /api/decide-dynamic calls (opt-in per request via the
+    # X-Decision-Lab-Log header) for the real-data labeling pipeline.
+    log_traffic: bool = False
+
+
+@dataclass
+class RealConfig:
+    """Real-traffic dataset settings (capture → label → convert → train)."""
+
+    # Fraction of labeled items held out as test_real (never trained on).
+    holdout_fraction: float = 0.2
+    # OpenRouter model used by the UI's auto-label buttons.
+    teacher_model: str = "deepseek/deepseek-v4.1-flash"
+    # Train only on human labels (drop source == "auto") when True.
+    exclude_auto: bool = False
+    seed: int = 42
 
 
 @dataclass
@@ -127,6 +148,7 @@ class Config:
     prompt_lm: PromptLMConfig = field(default_factory=PromptLMConfig)
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
     web: WebConfig = field(default_factory=WebConfig)
+    real: RealConfig = field(default_factory=RealConfig)
 
 
 def load_config(path: str | Path = "configs/default.yaml") -> Config:
@@ -143,6 +165,7 @@ def load_config(path: str | Path = "configs/default.yaml") -> Config:
         prompt_lm=PromptLMConfig(**raw.get("prompt_lm", {})),
         benchmark=BenchmarkConfig(**raw.get("benchmark", {})),
         web=WebConfig(**raw.get("web", {})),
+        real=RealConfig(**raw.get("real", {})),
     )
 
     _validate(cfg)
@@ -166,3 +189,5 @@ def _validate(cfg: Config) -> None:
         raise ValueError(f"dropout {cfg.head.dropout} out of range")
     if not 0 < cfg.calibration.holdout_fraction < 0.5:
         raise ValueError(f"calibration.holdout_fraction {cfg.calibration.holdout_fraction} out of (0, 0.5)")
+    if not 0 <= cfg.real.holdout_fraction < 0.5:
+        raise ValueError(f"real.holdout_fraction {cfg.real.holdout_fraction} out of [0, 0.5)")

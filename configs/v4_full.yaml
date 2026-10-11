@@ -63,8 +63,22 @@ dynamic_head:
   max_fields: 16
   shape_augmentation: true
   checkpoint_filename: "head_dynamic_v4.pt"
+  # Real-traffic samples from `build-real` (data/real/samples.pt). Leave empty
+  # to train synthetic-only; set to a path to mix them into stage 2.
+  real_data_path: ""
+  real_weight: 1
 
 calibration:
   holdout_fraction: 0.1
   lr: 0.01
   max_iter: 1000
+
+# Web UI + real-traffic labeling (see docs/real-data-pipeline.md)
+web:
+  log_traffic: false
+
+real:
+  holdout_fraction: 0.2
+  teacher_model: "deepseek/deepseek-v4.1-flash"
+  exclude_auto: false
+  seed: 42

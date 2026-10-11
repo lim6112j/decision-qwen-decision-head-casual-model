@@ -124,3 +124,14 @@ web:
   port: 8000
   num_states: 8          # pre-generated states offered in the UI
   random_seed: 42
+  # Capture /api/decide-dynamic calls for the real-data labeling pipeline.
+  # Off by default; even when on, a request must also send the header
+  # `X-Decision-Lab-Log: 1` to be logged (see docs/real-data-pipeline.md).
+  log_traffic: false
+
+# Real-traffic dataset (capture → label in the UI → build-real → train)
+real:
+  holdout_fraction: 0.2                 # held out as test_real (never trained on)
+  teacher_model: "deepseek/deepseek-v4.1-flash"   # OpenRouter auto-label model
+  exclude_auto: false                   # true = train only on human labels
+  seed: 42

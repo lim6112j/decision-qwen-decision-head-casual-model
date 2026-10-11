@@ -137,10 +137,51 @@ def cmd_train_dynamic(args):
             shape_augmentation=dcfg.shape_augmentation,
             include_summary_field=dcfg.include_summary_field,
         )
+        samples += _load_real_samples(dcfg, args.data_dir)
         train_dynamic_head(
             samples, cfg, args.models_dir / dcfg.checkpoint_filename,
             anchor_fraction=dcfg.anchor_epochs / max(dcfg.max_epochs, 1),
         )
+
+
+def _load_real_samples(dcfg, data_dir: Path) -> list:
+    """Real-traffic samples from `build-real`, oversampled by real_weight.
+
+    They join stage 2 (is_variant=True is set by the converter), so the
+    canonical anchor phase is untouched. Empty path → no real data (opt-in).
+    """
+    if not dcfg.real_data_path:
+        return []
+    from decision_lab.real.build_dataset import load_samples
+
+    path = Path(dcfg.real_data_path).expanduser()
+    samples = load_samples(path)
+    if not samples:
+        print(f"  warning: real_data_path {path} not found or empty — skipping real mix")
+        return []
+    weight = max(1, dcfg.real_weight)
+    print(f"  mixed in {len(samples)} real samples × weight {weight}")
+    return samples * weight
+
+
+def cmd_build_real(args):
+    """Convert labeled real-traffic items into training samples (samples.pt)."""
+    from decision_lab.backbone.llama_server import LlamaServer
+    from decision_lab.real.build_dataset import convert_labels
+
+    cfg = load_config(args.config)
+    gguf = Path(cfg.model.gguf_path).expanduser().resolve()
+
+    with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
+        try:
+            summary = convert_labels(cfg, server, args.data_dir)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+
+    print(f"Built real dataset: {summary['samples']} train samples from "
+          f"{summary['train']} labeled items; held out {summary['test']} as test_real.jsonl")
+    print(f"  → {args.data_dir / 'real' / 'samples.pt'}")
 
 
 def cmd_eval(args):
@@ -180,9 +221,15 @@ def cmd_report(args):
 
 def cmd_ui(args):
     """Start the web UI."""
+    import os
+
     import uvicorn
 
     cfg = load_config(args.config)
+    # uvicorn imports the app module itself; pass the config path through the
+    # environment so the app's lifespan loads the same file (not just
+    # configs/default.yaml).
+    os.environ["DECISION_LAB_CONFIG"] = str(Path(args.config).resolve())
     print(f"Starting web UI at http://{cfg.web.host}:{cfg.web.port} "
           f"(llama-server on port {cfg.model.server_port})")
     uvicorn.run(
@@ -245,6 +292,7 @@ def main():
         ("extract", cmd_extract),
         ("train", cmd_train),
         ("train-dynamic", cmd_train_dynamic),
+        ("build-real", cmd_build_real),
         ("eval", cmd_eval),
         ("report", cmd_report),
         ("all", cmd_all),

@@ -2,13 +2,16 @@
 
 import asyncio
 import json
+import os
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from random import Random
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -17,12 +20,31 @@ from decision_lab import CONFIG_DIR, DATA_DIR, PROJECT_ROOT
 from decision_lab.backbone.llama_server import LlamaServer
 from decision_lab.config import Config, load_config
 from decision_lab.head.model import build_question_spec
+from decision_lab.real.labels import (
+    SOURCE_ACCEPTED,
+    SOURCE_AUTO,
+    SOURCE_OVERRIDDEN,
+    LabelItem,
+    append_label,
+    build_queue,
+    load_labels,
+    stats as label_stats,
+)
+from decision_lab.real.teacher import LabelingError, OpenRouterLabeler
 from decision_lab.states.dataset import TextState, load_dataset
 from decision_lab.webapp.agents import AGENT_INFOS, DynamicHeadAgent, build_agents
 from decision_lab.webapp.simulator import evaluate_agent
+from decision_lab.webapp.traffic_log import TrafficLogger
 
 STATIC_DIR = PROJECT_ROOT / "web" / "static"
 TEXT_PREVIEW_CHARS = 160
+TRAFFIC_DIR = DATA_DIR / "traffic"
+REAL_DIR = DATA_DIR / "real"
+LABELS_PATH = REAL_DIR / "labels.jsonl"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class WebAppState:
@@ -35,6 +57,7 @@ class WebAppState:
         self.states: list[TextState] = []
         self.question_spec: dict = {}
         self.run_lock = asyncio.Lock()
+        self.traffic = TrafficLogger(TRAFFIC_DIR, enabled=cfg.web.log_traffic)
 
     def start(self) -> None:
         gguf = Path(self.cfg.model.gguf_path).expanduser().resolve()
@@ -72,7 +95,10 @@ state: Optional[WebAppState] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global state
-    cfg = load_config(CONFIG_DIR / "default.yaml")
+    # Honor the config selected by `python -m decision_lab --config … ui`
+    # (cmd_ui exports DECISION_LAB_CONFIG); default config otherwise.
+    cfg_path = os.environ.get("DECISION_LAB_CONFIG", str(CONFIG_DIR / "default.yaml"))
+    cfg = load_config(cfg_path)
     state = WebAppState(cfg)
     state.start()
     yield
@@ -212,11 +238,15 @@ async def compare(req: RunRequest):
 
 
 @app.post("/api/decide-dynamic")
-async def decide_dynamic(req: DynamicDecideRequest):
+async def decide_dynamic(req: DynamicDecideRequest, request: Request):
     """Evaluate a state against fully dynamic question configs.
 
     Uses the trained dynamic head agent. Returns decoded answers for each
     question in the request — option/level labels determine the output space.
+
+    Opt-in capture: when ``web.log_traffic`` is enabled and the caller sends
+    ``X-Decision-Lab-Log: 1``, the call is written to data/traffic/ for the
+    real-data labeling pipeline (see src/decision_lab/real/).
     """
     if state is None:
         raise HTTPException(status_code=503, detail="server not ready")
@@ -246,11 +276,31 @@ async def decide_dynamic(req: DynamicDecideRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"dynamic decision failed: {exc}") from exc
 
+    _maybe_log_traffic(request, s, req, answers, latency_ms)
+
     return {
         "state": _state_payload(s),
         "answers": answers,
         "latency_ms": round(latency_ms, 1),
     }
+
+
+def _maybe_log_traffic(request: Request, s: TextState, req: DynamicDecideRequest,
+                       answers: list, latency_ms: float) -> None:
+    """Write the call to the traffic log iff capture is enabled and opted in."""
+    if state is None or not state.traffic.should_log(request.headers):
+        return
+    state.traffic.record({
+        "ts": _now_iso(),
+        "call_id": uuid.uuid4().hex,
+        "text": s.text,
+        "fields": req.custom_fields,
+        "doc_id": s.doc_id,
+        "state_type": s.state_type,
+        "questions": req.questions,
+        "answers": answers,
+        "latency_ms": round(latency_ms, 1),
+    })
 
 
 def _resolve_state_dynamic(req: DynamicDecideRequest) -> "TextState":
@@ -291,6 +341,149 @@ def _validate_dynamic_questions(questions: list[dict]) -> None:
                 status_code=400,
                 detail=f"{where} is type=score but has no non-empty 'levels' list",
             )
+
+
+# ---------------------------------------------------------------------------
+# Real-traffic labeling
+# ---------------------------------------------------------------------------
+
+
+class LabelRequest(BaseModel):
+    item_id: str = Field(min_length=1)
+    gold_idx: int = Field(ge=0)
+    source: str
+
+
+class AutoLabelRequest(BaseModel):
+    item_id: Optional[str] = None   # None → the first pending item
+
+
+def _teacher_model() -> str:
+    if state is not None:
+        return state.cfg.real.teacher_model
+    return load_config(CONFIG_DIR / "default.yaml").real.teacher_model
+
+
+def _label_item_payload(item: LabelItem) -> dict:
+    return {
+        "item_id": item.item_id,
+        "call_id": item.call_id,
+        "text": item.text,
+        "fields": item.fields,
+        "state_type": item.state_type,
+        "question": item.question,
+        "kind": item.kind,
+        "options": item.options,
+        "predicted_idx": item.predicted_idx,
+        "gold_idx": item.gold_idx,
+        "gold_label": item.gold_label(),
+        "source": item.source,
+        "labeled_by": item.labeled_by,
+    }
+
+
+def _find_pending(item_id: str) -> LabelItem:
+    for item in build_queue(TRAFFIC_DIR, LABELS_PATH):
+        if item.item_id == item_id:
+            return item
+    raise HTTPException(status_code=404, detail=f"pending item {item_id} not found")
+
+
+@app.get("/api/label/queue")
+def label_queue():
+    """Every pending (unlabeled) item, pre-filled with the head's prediction."""
+    return {"items": [_label_item_payload(i) for i in build_queue(TRAFFIC_DIR, LABELS_PATH)]}
+
+
+@app.get("/api/label/stats")
+def label_stats_endpoint():
+    return label_stats(TRAFFIC_DIR, LABELS_PATH)
+
+
+@app.post("/api/label")
+def submit_label(req: LabelRequest):
+    """Record a manual label (accept the pre-fill or override it)."""
+    if req.source not in (SOURCE_ACCEPTED, SOURCE_OVERRIDDEN):
+        raise HTTPException(
+            status_code=400,
+            detail=f"source must be '{SOURCE_ACCEPTED}' or '{SOURCE_OVERRIDDEN}'",
+        )
+    # Idempotent: re-labeling an already-labeled item is a no-op, not a 404.
+    already = load_labels(LABELS_PATH)
+    if req.item_id in already:
+        return {"written": False, "item": _label_item_payload(already[req.item_id])}
+    item = _find_pending(req.item_id)
+    if req.gold_idx >= len(item.options):
+        raise HTTPException(
+            status_code=400,
+            detail=f"gold_idx {req.gold_idx} out of range for {len(item.options)} options",
+        )
+    item.gold_idx = req.gold_idx
+    item.source = req.source
+    item.labeled_by = "human"
+    written = append_label(item, LABELS_PATH)
+    return {"written": written, "item": _label_item_payload(item)}
+
+
+def _auto_label(item: LabelItem) -> LabelItem:
+    """Label one item with OpenRouter; raises LabelingError on failure."""
+    labeler = OpenRouterLabeler(model=_teacher_model())
+    item.gold_idx = labeler.label(item)
+    item.source = SOURCE_AUTO
+    item.labeled_by = f"openrouter:{labeler.model}"
+    append_label(item, LABELS_PATH)
+    return item
+
+
+@app.post("/api/label/auto")
+def auto_label_one(req: AutoLabelRequest):
+    """Label one pending item with the OpenRouter model."""
+    if req.item_id:
+        item = _find_pending(req.item_id)
+    else:
+        queue = build_queue(TRAFFIC_DIR, LABELS_PATH)
+        if not queue:
+            raise HTTPException(status_code=404, detail="no pending items to label")
+        item = queue[0]
+    try:
+        _auto_label(item)
+    except LabelingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"item": _label_item_payload(item)}
+
+
+@app.post("/api/label/auto-all")
+async def auto_label_all():
+    """Stream-label every pending item via OpenRouter (SSE).
+
+    Emits one ``progress`` event per item (``ok`` with the labeled item, or
+    ``error``) and a final ``done`` summary. Per-item failures are skipped
+    and counted — one bad response never aborts the batch.
+    """
+    async def generate():
+        try:
+            labeler = OpenRouterLabeler(model=_teacher_model())
+        except LabelingError as exc:
+            yield _sse("fatal", {"detail": str(exc)})
+            return
+
+        queue = build_queue(TRAFFIC_DIR, LABELS_PATH)
+        labeled = failed = 0
+        for item in queue:
+            try:
+                item.gold_idx = labeler.label(item)
+                item.source = SOURCE_AUTO
+                item.labeled_by = f"openrouter:{labeler.model}"
+                append_label(item, LABELS_PATH)
+                labeled += 1
+                yield _sse("progress", {"ok": True, "item": _label_item_payload(item)})
+            except LabelingError as exc:
+                failed += 1
+                yield _sse("progress", {"ok": False, "item_id": item.item_id, "detail": str(exc)})
+        yield _sse("done", {"labeled": labeled, "failed": failed,
+                            "remaining": len(queue) - labeled})
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @app.get("/")
