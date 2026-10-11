@@ -544,3 +544,13 @@ a different backend, and a cache extracted from one backend is never reused
 for another — the stale-cache failure class this repo was bitten by in v3.
 The head prints a warning if a checkpoint's recorded backbone does not match
 the running server.
+
+### Alternative: a fine-tuned backbone (Kev-0.8B)
+
+A different point on the same axis — **fine-tune the backbone instead of
+freezing it** — is [Kev-0.8B](https://huggingface.co/jaredpalmer/kev-0.8b), a
+LoRA adapter + pointer head on `Qwen/Qwen3.5-0.8B-Base` (the same base model
+this repo freezes). The head-to-head, why bge already makes backbone LoRA
+redundant for the geometry problem, and the three cases where LoRA on the Qwen
+backbone *would* add a capability the frozen pipeline lacks are written up in
+[docs/kev-0.8b-comparison.md](docs/kev-0.8b-comparison.md).
