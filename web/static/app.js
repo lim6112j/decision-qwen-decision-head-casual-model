@@ -661,6 +661,7 @@ els.labelStats = document.getElementById("label-stats");
 els.labelSummary = document.getElementById("label-summary");
 els.autoOneBtn = document.getElementById("auto-one-btn");
 els.autoAllBtn = document.getElementById("auto-all-btn");
+els.discardAllBtn = document.getElementById("discard-all-btn");
 
 const labelState = { count: 0 };
 
@@ -823,6 +824,28 @@ async function autoLabelOne() {
   }
 }
 
+async function discardAll() {
+  if (!confirm("Remove all pending items without labeling? They will not be used for training.")) {
+    return;
+  }
+  els.discardAllBtn.disabled = true;
+  try {
+    const res = await fetch(`${API_BASE}/api/label/discard-all`, { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const body = await res.json();
+    els.labelList.innerHTML = `<p class="loading">No pending items.</p>`;
+    labelSummary("success", `Removed <strong>${body.discarded}</strong> item(s) without labeling.`);
+    loadLabelStats();
+  } catch (err) {
+    labelSummary("failure", `<strong>Error:</strong> ${escapeHtml(err.message)}`);
+  } finally {
+    els.discardAllBtn.disabled = false;
+  }
+}
+
 async function autoLabelAll() {
   els.autoAllBtn.disabled = true;
   els.autoOneBtn.disabled = true;
@@ -857,3 +880,4 @@ async function autoLabelAll() {
 
 els.autoOneBtn.addEventListener("click", autoLabelOne);
 els.autoAllBtn.addEventListener("click", autoLabelAll);
+els.discardAllBtn.addEventListener("click", discardAll);

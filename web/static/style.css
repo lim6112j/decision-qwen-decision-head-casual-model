@@ -398,6 +398,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .label-toolbar .button-row { margin-left: auto; flex: 0 0 auto; }
 .label-toolbar button { flex: 0 0 auto; }
 #auto-one-btn { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+#discard-all-btn { background: transparent; color: var(--bad); border: 1px solid var(--bad); }
 .label-stats { color: var(--muted); font-size: 13px; }
 .label-note { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0 0 14px; }
 .warn-inline { color: var(--warn); }

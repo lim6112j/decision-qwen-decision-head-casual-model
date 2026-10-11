@@ -417,6 +417,14 @@ def discard_label(req: DiscardRequest):
     return {"discarded": discard_item(req.item_id, DISCARDED_PATH)}
 
 
+@app.post("/api/label/discard-all")
+def discard_all_labels():
+    """Remove every pending item from the queue without labeling it."""
+    queue = _pending_queue()
+    n = sum(1 for item in queue if discard_item(item.item_id, DISCARDED_PATH))
+    return {"discarded": n, "remaining": len(queue) - n}
+
+
 @app.post("/api/label")
 def submit_label(req: LabelRequest):
     """Record a manual label (accept the pre-fill or override it)."""

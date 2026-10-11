@@ -125,3 +125,11 @@ def test_discard_removes_item_without_labeling(client):
     assert client.post("/api/label/discard", json={"item_id": item["item_id"]}).json()["discarded"] is False
     assert len(client.get("/api/label/queue").json()["items"]) == 1
     assert client.get("/api/label/stats").json()["discarded"] == 1
+
+
+def test_discard_all_clears_queue(client):
+    assert client.post("/api/label/discard-all").json() == {"discarded": 2, "remaining": 0}
+    assert client.get("/api/label/queue").json()["items"] == []
+    assert client.post("/api/label/discard-all").json() == {"discarded": 0, "remaining": 0}
+    assert client.get("/api/label/stats").json() == {
+        "total": 2, "labeled": 0, "discarded": 2, "remaining": 0}
