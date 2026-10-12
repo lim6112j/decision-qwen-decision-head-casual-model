@@ -58,6 +58,25 @@ def doc_state_calm() -> TextState:
     )
 
 
+@pytest.fixture(scope="module")
+def doc_state_toxic() -> TextState:
+    """A document state that carries the new `toxic` gold (real-traffic shape)."""
+    return TextState(
+        doc_id=2,
+        state_type="custom",
+        text="You are worthless and everyone hates you — delete your account, loser.",
+        labels={
+            "sentiment": "negative",
+            "urgency": "low",
+            "quality": 0,
+            "is_actionable": False,
+            "contains_pii": False,
+            "is_urgent": False,
+            "toxic": True,
+        },
+    )
+
+
 def _breakout_state(side: str, vx: int, vy: int, doc_id: int = 0) -> TextState:
     """Hand-built breakout state with controlled latents."""
     lat_labels = {
@@ -129,6 +148,8 @@ class TestPhrasings:
             "is_actionable": "Does this state require a response or action?",
             "contains_pii": "Does this state contain personally identifiable information?",
             "is_urgent": "Is this state time-sensitive?",
+            "toxic": "Is this text toxic?",
+            "not_toxic": "Is this text NOT toxic?",
         }
         for qid, text in canonicals.items():
             e = next(e for e in bank if e.qid == qid)
@@ -201,6 +222,11 @@ class TestGoldExactness:
         assert by_qid["pii_presence"].gold(doc_state) == "present"
         assert by_qid["pii_presence"].gold(doc_state_calm) == "absent"
 
+    def test_toxic_gold_and_inversion(self, bank, doc_state_toxic):
+        by_qid = {e.qid: e for e in bank}
+        assert by_qid["toxic"].gold(doc_state_toxic) is True
+        assert by_qid["not_toxic"].gold(doc_state_toxic) is False
+
     def test_breakout_gold_matches_labels(self, bank):
         by_qid = {e.qid: e for e in bank}
         st_left = _breakout_state("left", vx=-2, vy=1)
@@ -226,6 +252,17 @@ class TestGoldExactness:
 
 
 class TestApplicability:
+    def test_toxic_gated_on_label_key(self, bank, doc_state, doc_state_toxic):
+        """A doc state without a `toxic` label must NOT match the toxic qids
+        (else the synthetic emit loop KeyErrors); one that carries the label must."""
+        by_qid = {e.qid: e for e in bank}
+        assert not by_qid["toxic"].applicable(doc_state)
+        assert not by_qid["not_toxic"].applicable(doc_state)
+        assert by_qid["toxic"].applicable(doc_state_toxic)
+        assert by_qid["not_toxic"].applicable(doc_state_toxic)
+        # still a doc qid — never asked of a breakout state
+        assert not by_qid["toxic"].applicable(_breakout_state("left", -1, 0))
+
     def test_doc_entries_reject_breakout_state(self, bank, doc_state):
         for e in bank:
             if e.applicable(doc_state):

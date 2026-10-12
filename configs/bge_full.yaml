@@ -71,6 +71,9 @@ dynamic_head:
   shape_augmentation: true
   # Side-by-side with head_dynamic_v4.pt — the Qwen head is never touched.
   checkpoint_filename: "head_dynamic_bge.pt"
+  # Real-traffic mix OFF by default: enabling it (see docs/toxic-question-regression.md)
+  # trains the `toxic` qid but regresses the `quality` rubric 93%→53% on held-out.
+  # Parked — set to "data_bge/real/samples.pt" + weight 3 only to reproduce that run.
   real_data_path: ""
   real_weight: 1
 

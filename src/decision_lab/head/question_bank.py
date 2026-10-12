@@ -177,7 +177,40 @@ DOC_CORES: dict[str, list[str]] = {
         "Any contact details written down?",
         "Are reachable identities mentioned?",
     ],
+    # Toxicity — a NEW latent that the synthetic generator does not emit, so
+    # (unlike the qids above) its gold is not present on generated states.
+    # These entries are therefore label-key gated (see DOC_LABEL_GATED below)
+    # and draw their training signal from the real-traffic pipeline, whose
+    # LabelItems carry their own question text + gold. Kept in the bank for
+    # canonical-phrasing identity and a future synthetic hook.
+    "toxic": [
+        "Is this text toxic?",
+        "toxic?",
+        "Does this message contain harassment or abuse?",
+        "Is this post hateful or abusive?",
+        "Is the language here toxic or harmful?",
+        "Would this text be flagged as toxic?",
+        "Does this text attack or demean someone?",
+        "Is this content abusive toward a person?",
+        "Should this message be removed as toxic?",
+        "Is there toxicity in this text?",
+    ],
+    "not_toxic": [
+        "Is this text NOT toxic?",
+        "not toxic?",
+        "Is this message free of harassment or abuse?",
+        "Is this text respectful rather than toxic?",
+        "Does this text avoid abusive language?",
+        "Is this message non-toxic?",
+        "Is the language here civil rather than toxic?",
+        "Does this text contain no harassment?",
+    ],
 }
+
+# Doc qids whose gold key is absent from synthetic states: applicable only when
+# the state actually carries the label (mirrors the breakout `ball_rising`
+# gate — a bare _is_doc gate would KeyError in the generator's emit loop).
+DOC_LABEL_GATED: frozenset[str] = frozenset({"toxic", "not_toxic"})
 
 BREAKOUT_CORES: dict[str, list[str]] = {
     PADDLE_QID: [
@@ -337,14 +370,22 @@ def build_question_bank() -> tuple[QuestionBankEntry, ...]:
         ("pii_presence", "choice", ("present", "absent"),
          lambda s: "present" if bool(_doc_labels(s)["contains_pii"]) else "absent"),
         ("contact_mentioned", "noul", None, lambda s: bool(_doc_labels(s)["contains_pii"])),
+        # Toxicity — new latent, absent from synthetic states; label-key gated
+        # (see DOC_LABEL_GATED). Gold is read straight from state.labels, so
+        # only states that carry a `toxic` gold (real-traffic items) match.
+        ("toxic", "noul", None, lambda s: bool(_doc_labels(s)["toxic"])),
+        ("not_toxic", "noul", None, lambda s: not bool(_doc_labels(s)["toxic"])),
     ]
     for qid, kind, options, gold in doc_specs:
+        needs_key = qid in DOC_LABEL_GATED
+        def applicable(s, _needs=needs_key):
+            return _is_doc(s) and (not _needs or "toxic" in s.labels)
         entries.append(QuestionBankEntry(
             qid=qid,
             kind=kind,
             options=options if kind != "noul" else _noul_options(),
             phrasings=_compose_phrasings(DOC_CORES[qid], PREFIXES),
-            applicable=_is_doc,
+            applicable=applicable,
             gold=gold,
         ))
 
