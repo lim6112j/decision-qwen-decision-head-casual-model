@@ -90,7 +90,13 @@ def main() -> None:
     ap.add_argument("--out", default="models/head_dynamic_bge_ft.pt")
     args = ap.parse_args()
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"device: {device}")
     tok = AutoTokenizer.from_pretrained(args.model)
     encoder = AutoModel.from_pretrained(args.model).to(device)
     encoder.config.use_cache = False

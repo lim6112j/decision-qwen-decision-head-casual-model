@@ -98,6 +98,43 @@ cannot take. It **runs**, but is **impractical on this machine (MPS)**:
 unexplained; testing it needs a GPU (or a much smaller encoder + reduced
 fields). The script is left in place, documented as GPU-required.
 
+## Running on a GPU server (fresh clone)
+
+The backbone-adaptation experiment is self-contained (only HF downloads needed):
+
+```bash
+pip install -e ".[dev]" && pip install transformers peft pyarrow
+
+# 1. data: parquet → our JSONL (+ labels.jsonl)
+mkdir -p /tmp/typed-decisions
+cd /tmp/typed-decisions
+for s in train test; do
+  curl -sL "https://huggingface.co/datasets/LocalLLaMA/typed-decisions/resolve/refs%2Fconvert%2Fparquet/all/$s/0000.parquet" -o "all_$s.parquet"
+done
+cd -        # back to the repo
+python scripts/convert_typed_decisions.py /tmp/typed-decisions/all_train.parquet \
+    --labels-out data_bge/real/labels.jsonl -o /tmp/td_train.jsonl
+python scripts/convert_typed_decisions.py /tmp/typed-decisions/all_test.parquet \
+    -o /tmp/td_test.jsonl
+
+# 2. backbone adaptation (GPU): LoRA bge-m3 encoder + head, end-to-end
+python scripts/finetune_backbone.py \
+    --model BAAI/bge-m3 --train /tmp/td_train.jsonl --test /tmp/td_test.jsonl \
+    --epochs 4 --batch 32 --max-len 256      # drop --freeze-below/--amp on a big GPU
+```
+
+Notes:
+- **On a GPU, drop `--freeze-below`** (the full backward fits in VRAM) and
+  `--amp` if you have headroom; a larger batch is much faster. The script picks
+  cuda > mps > cpu.
+- `--frozen-encoder` runs the **frozen baseline for the same encoder**
+  (head-only), so you can A/B adapt-vs-frozen on bge-m3 itself.
+- The `66.3%` frozen baseline in the table above was produced by the **local
+  llama-server pipeline** (`build-real` + `train-dynamic` real_only), which
+  needs `models/bge-m3-Q8_0.gguf` + llama.cpp — both gitignored, so reproduce
+  those numbers only if you also fetch the GGUF. The `finetune_backbone.py`
+  route needs neither.
+
 ## Next
 
 1. Backbone adaptation (above) — needs a GPU.
