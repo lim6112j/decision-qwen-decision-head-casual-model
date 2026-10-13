@@ -77,12 +77,31 @@ added to the config and LlamaServer to raise `--batch-size`/`--ubatch-size`.
 - The 0.766 is the model card's number on the official split, not re-measured
   here.
 
+## Backbone adaptation — attempted, blocked on local hardware (2026-10-13)
+
+`scripts/finetune_backbone.py` trains the bge-m3 encoder (LoRA) + the head
+end-to-end on this data — the Laya-style route the frozen llama-server pipeline
+cannot take. It **runs**, but is **impractical on this machine (MPS)**:
+
+- **Memory.** A full backward through the 568M encoder does not fit MPS's
+  ~20 GB cap. It required `--freeze-below K` (detach the hidden state after
+  layer K-1 so only the top layers backprop) plus fp16 autocast. Full fine-tune
+  OOMs at any usable batch.
+- **Speed.** The typed-decisions JSON states split into **~10 fields** →
+  **~15 texts per sample**. Encoding that every step dominates: measured
+  **~1 s/sample** (batch 1, len 128) to **~3.4 s/sample** (batch 8, len 256) —
+  i.e. **80 min to 4.5 h per epoch** over 4,800 samples.
+- **Why Laya's 5 min is not comparable:** 2×T4 GPUs, a 395M model, 6,000
+  decisions, and one sequence per sample — not MPS with 15 texts/sample.
+
+**Decision: parked.** The ~10pp gap to Laya (66.3% frozen vs 76.6%) remains
+unexplained; testing it needs a GPU (or a much smaller encoder + reduced
+fields). The script is left in place, documented as GPU-required.
+
 ## Next
 
-1. Test whether **backbone adaptation** (LoRA / full FT on bge, Laya-style)
-   closes the ~10pp — needs a PyTorch backbone path (llama-server is
-   forward-only GGUF).
+1. Backbone adaptation (above) — needs a GPU.
 2. Test **joint state+question encoding** (one sequence) vs our separate
-   embeddings.
+   embeddings — cheap, still open.
 3. Adopt this real-only + typed-decisions setup as the standard experiment
    harness (52 s per run).
