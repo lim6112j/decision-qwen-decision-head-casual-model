@@ -83,6 +83,26 @@ import torch.nn.functional as F
 D_K = 128
 DEFAULT_TEMPERATURE = 1.0
 
+# v5: question-type conditioning. The head learns a discrete signal for the
+# answer FORMAT (choice / score / noul) — fed in explicitly rather than left to
+# be inferred from question-text similarity alone. This is the fix for
+# cross-type interference (a new noul question pulling the shared trunk away
+# from the `quality` score rubric): two questions of different types can no
+# longer collide, because the type is a first-class input to the head.
+QUESTION_TYPE_IDS: dict[str, int] = {"choice": 0, "score": 1, "noul": 2}
+N_QUESTION_TYPES = len(QUESTION_TYPE_IDS)
+
+
+def question_type_id(kind: str) -> int:
+    """Map a question type string to its v5 conditioning id."""
+    try:
+        return QUESTION_TYPE_IDS[kind]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown question type {kind!r}; expected one of "
+            f"{sorted(QUESTION_TYPE_IDS)}"
+        ) from exc
+
 # (trained_on, serving) backbone pairs already warned about — a benchmark
 # run loads the same head once per pass and should not repeat itself.
 _WARNED_BACKBONE_MISMATCH: set[tuple[str, str]] = set()
@@ -181,12 +201,16 @@ class DynamicDecisionHead(nn.Module):
         d_k: int = D_K,
         dropout: float = 0.1,
         state_set: bool = False,
+        type_conditioned: bool = False,
+        expert_separation: bool = False,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.d_k = d_k
         self.state_set = state_set
+        self.type_conditioned = type_conditioned
+        self.expert_separation = expert_separation
 
         if state_set:
             # v2 field-set cross-attention (shared option path)
@@ -244,13 +268,41 @@ class DynamicDecisionHead(nn.Module):
             # read-out into the linear score_head, the question component
             # v·W2·z_q is constant across options and cancels in the softmax
             # over options — the question could never flip an argmax.
+            # v5 question-type conditioning — OUTPUT-ONLY. The answer FORMAT is
+            # fed into the read-out, never into the question vector or the
+            # option query: those carry CONTENT (which fields the question
+            # points at; which field each option matches). A first v5 attempt
+            # injected the type into the question vector and contaminated field
+            # selection, breaking content-dependent questions with no data
+            # change (is_actionable 0.979→0.604; experiment A). Here the type
+            # only widens the read-out input by one vector, so field selection
+            # and option matching stay identical to v4.
+            readout_in = (3 * hidden_dim) if type_conditioned else (2 * hidden_dim)
             self.qz_readout = nn.Sequential(
-                nn.Linear(2 * hidden_dim, hidden_dim),
+                nn.Linear(readout_in, hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, hidden_dim),
             )
             nn.init.zeros_(self.qz_readout[2].weight)
             nn.init.zeros_(self.qz_readout[2].bias)
+            if type_conditioned:
+                self.type_emb = nn.Embedding(N_QUESTION_TYPES, hidden_dim)
+            # Expert separation: a NEW question domain (e.g. `toxic`) gets its
+            # own parameter block so its gradients never touch the base head —
+            # the base questions stay byte-identical to a toxic-free baseline.
+            # `self` (this head) is the GENERAL expert; `toxic_expert` is a
+            # full sibling head; `router` picks between them from the question
+            # embedding at serving time.
+            if expert_separation:
+                self.toxic_expert = DynamicDecisionHead(
+                    input_dim=input_dim, hidden_dim=hidden_dim, d_k=d_k,
+                    dropout=dropout, state_set=True,
+                )
+                self.router = nn.Sequential(
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, 2),
+                )
         else:
             # v1: pooled-state attention (legacy, kept for checkpoint compat)
             self.trunk = nn.Sequential(
@@ -275,12 +327,29 @@ class DynamicDecisionHead(nn.Module):
             return state_embedding.unsqueeze(0), 1                # (M, D) unbatched
         return state_embedding, state_embedding.shape[0]
 
+    def _as_type_ids(
+        self, question_type, batch_size: int, device: torch.device,
+    ) -> torch.Tensor:
+        """Normalize a v5 question-type input to a (B,) long tensor.
+
+        Accepts an int (broadcast to the batch), a str kind, or a (B,) tensor.
+        """
+        if isinstance(question_type, str):
+            question_type = question_type_id(question_type)
+        if isinstance(question_type, int):
+            return torch.full((batch_size,), question_type, dtype=torch.long, device=device)
+        ids = torch.as_tensor(question_type, dtype=torch.long, device=device)
+        if ids.dim() == 0:
+            ids = ids.expand(batch_size)
+        return ids
+
     def _forward_attention_set(
         self,
         state_embedding: torch.Tensor,
         option_embeddings: torch.Tensor,
         state_mask: torch.Tensor | None = None,
         question_emb: torch.Tensor | None = None,
+        question_type=None,
     ) -> torch.Tensor:
         """v4 core: options read the field set; the question reads it too → (B, N).
 
@@ -312,6 +381,12 @@ class DynamicDecisionHead(nn.Module):
             )
         elif question_emb.dim() == 1:
             question_emb = question_emb.unsqueeze(0).expand(batch_size, -1)
+
+        # v5: the answer-format id is read at the READ-OUT only (see __init__)
+        # — it must NOT enter the question vector, which drives field selection.
+        type_ids = None
+        if self.type_conditioned and question_type is not None:
+            type_ids = self._as_type_ids(question_type, batch_size, state.device)
 
         field_repr = self.field_enc(state)                        # (B, M, H)
         K = F.normalize(self.field_key(field_repr), dim=-1)       # (B, M, d_k)
@@ -349,7 +424,15 @@ class DynamicDecisionHead(nn.Module):
         # Concat form is load-bearing: a plain additive z + g·W·z_q would be
         # constant across options and cancel in the softmax over options.
         z_q_exp = z_q.unsqueeze(1).expand(-1, z.size(1), -1)      # (B, N, H)
-        z = z + self.qz_readout(torch.cat([z, z_q_exp], dim=-1))  # (B, N, H)
+        readout_parts = [z, z_q_exp]
+        if type_ids is not None:
+            # OUTPUT-ONLY type signal: the same per-type vector for every
+            # option, but combined with the per-option z inside the (nonlinear)
+            # read-out, so it can still produce per-option differences. A bare
+            # additive logit bias would cancel in the softmax over options.
+            t_exp = self.type_emb(type_ids).unsqueeze(1).expand(-1, z.size(1), -1)
+            readout_parts.append(t_exp)
+        z = z + self.qz_readout(torch.cat(readout_parts, dim=-1)) # (B, N, H)
         return self.score_head(z).squeeze(-1)                     # (B, N)
 
     def _forward_attention(
@@ -392,21 +475,47 @@ class DynamicDecisionHead(nn.Module):
         scores = torch.bmm(K, q.unsqueeze(-1)).squeeze(-1)
         return scores / math.sqrt(self.d_k)
 
+    def route_expert(self, question_emb: torch.Tensor | None) -> torch.Tensor | None:
+        """v6: pick the expert (0=general, 1=toxic) from the question embedding."""
+        if not self.expert_separation or question_emb is None:
+            return None
+        q = question_emb.unsqueeze(0) if question_emb.dim() == 1 else question_emb
+        return self.router(q).argmax(dim=-1)
+
+    def _use_toxic_expert(self, question_emb, expert) -> bool:
+        """True → run the dedicated toxic expert instead of the general head."""
+        if not self.expert_separation:
+            return False
+        if expert is not None:
+            return int(expert) == 1
+        r = self.route_expert(question_emb)
+        return r is not None and bool((r == 1).all())
+
     def forward_choice(
         self,
         state_embedding: torch.Tensor,
         option_embeddings: torch.Tensor,
         state_mask: torch.Tensor | None = None,
         question_emb: torch.Tensor | None = None,
+        question_type=None,
+        expert: int | None = None,
     ) -> torch.Tensor:
         """Score state against choice options → (batch, n_opts) logits.
 
         question_emb (v4 heads) is a field-selection query over the field
-        set; ignored by v1 heads.
+        set; ignored by v1 heads. question_type (v5 heads) is the answer-format
+        id. expert (v6 heads): 0 forces the general head, 1 the dedicated
+        toxic expert, None routes via ``router`` — ignored by earlier heads.
         """
         if self.state_set:
+            if self._use_toxic_expert(question_emb, expert):
+                return self.toxic_expert._forward_attention_set(
+                    state_embedding, option_embeddings, state_mask, question_emb,
+                    question_type,
+                )
             return self._forward_attention_set(
                 state_embedding, option_embeddings, state_mask, question_emb,
+                question_type,
             )
         return self._forward_attention(state_embedding, option_embeddings)
 
@@ -416,15 +525,24 @@ class DynamicDecisionHead(nn.Module):
         level_embeddings: torch.Tensor,
         state_mask: torch.Tensor | None = None,
         question_emb: torch.Tensor | None = None,
+        question_type=None,
+        expert: int | None = None,
     ) -> torch.Tensor:
         """Score state against rubric levels → (batch, n_levels) logits.
 
         question_emb (v4 heads) is a field-selection query over the field
-        set; ignored by v1 heads.
+        set; ignored by v1 heads. question_type (v5) / expert (v6) as in
+        forward_choice.
         """
         if self.state_set:
+            if self._use_toxic_expert(question_emb, expert):
+                return self.toxic_expert._forward_attention_set(
+                    state_embedding, level_embeddings, state_mask, question_emb,
+                    question_type,
+                )
             return self._forward_attention_set(
                 state_embedding, level_embeddings, state_mask, question_emb,
+                question_type,
             )
         return self._forward_attention(state_embedding, level_embeddings)
 
@@ -559,6 +677,7 @@ def predict_dynamic(
             )
             scores = head.forward_choice(
                 state_embedding, opt_embs, question_emb=question_emb,
+                question_type=question_type_id(kind),
             )
             results[i] = decode_dynamic_answer(q, scores, temperature)
     return results
@@ -611,7 +730,13 @@ def save_dynamic_head(
             "arch": {
                 "type": "dynamic",
                 "state_set": model.state_set,
-                "arch_version": 4,
+                # v5 = v4 + explicit question-type conditioning.
+                # v6 = v4 + a dedicated toxic expert + router.
+                "arch_version": 6 if model.expert_separation
+                                 else (5 if model.type_conditioned else 4),
+                "type_conditioned": model.type_conditioned,
+                "expert_separation": model.expert_separation,
+                "n_question_types": N_QUESTION_TYPES if model.type_conditioned else 0,
                 "input_dim": model.input_dim,
                 "hidden_dim": model.hidden_dim,
                 "d_k": model.d_k,
@@ -644,7 +769,7 @@ def load_dynamic_head(
     if arch_version < 4:
         raise ValueError(
             f"Checkpoint at {path} is arch_version {arch_version}; this "
-            f"build only loads v4 question-attention heads. v1-v3 "
+            f"build only loads v4/v5 question-attention heads. v1-v3 "
             f"checkpoints are preserved (main checkout models/ + backups) "
             f"but require their own release to serve — no silent upgrade."
         )
@@ -653,11 +778,17 @@ def load_dynamic_head(
             f"Checkpoint at {path} is a v4 non-state_set head — v4 implies "
             f"state_set=True (question-field attention requires field sets)."
         )
+    # v5 adds explicit question-type conditioning; v4 checkpoints load without
+    # it (type_conditioned defaults False and the type inputs are ignored).
+    type_conditioned = bool(arch.get("type_conditioned", arch_version >= 5))
+    expert_separation = bool(arch.get("expert_separation", arch_version >= 6))
     model = DynamicDecisionHead(
         input_dim=arch.get("input_dim", 1024),
         hidden_dim=arch.get("hidden_dim", 256),
         d_k=arch.get("d_k", D_K),
         state_set=True,
+        type_conditioned=type_conditioned,
+        expert_separation=expert_separation,
     )
     model.load_state_dict(checkpoint["model_state"])
     if device is not None:

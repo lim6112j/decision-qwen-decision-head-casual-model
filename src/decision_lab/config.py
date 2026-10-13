@@ -46,6 +46,10 @@ class ModelConfig:
     # never be silently mixed.
     backbone: str = "qwen3.5-0.8b"
     embed_dim: int = 1024
+    # llama.cpp physical/ubatch size (tokens). 0 → llama.cpp default (512),
+    # which rejects any single input longer than 512 tokens. Raise for datasets
+    # with long fields (e.g. real JSON states).
+    batch_size: int = 0
 
 
 @dataclass
@@ -88,6 +92,18 @@ class DynamicHeadConfig:
     # (generalization) at integer weight `real_weight`.
     real_data_path: str = ""
     real_weight: int = 1
+    # Train ONLY on the real samples (skip the synthetic bank entirely). An
+    # architecture experiment: with a real dataset as the sole source there is
+    # no bank/domain interference, so the head can be compared head-to-head
+    # with a fine-tuned backbone model on the same data.
+    real_only: bool = False
+    # v5: feed the answer format (choice/score/noul) into the head as an
+    # explicit input (dynamic_model.py). Off by default — v5 injections were
+    # found to hurt (docs/toxic-question-regression.md).
+    type_conditioned: bool = False
+    # v6: give the new `toxic` question its own expert + router so it never
+    # shares gradients with the base questions (docs/toxic-question-regression.md).
+    expert_separation: bool = False
     # Add shape-variant duplicates of document states (flattened /
     # marker-stripped, same gold — states/shapes.py) to dynamic-head
     # training. The field-set head collapses to near-uniform logits on

@@ -184,6 +184,7 @@ def _run_dynamic_forward(
             ])  # (2, D)
             scores = head.forward_choice(
                 state_tensor, opt_embs, question_emb=option_emb_cache[question_text],
+                question_type=kind,
             )
             results[qid] = decode_dynamic_answer(
                 make_noul_question(question_text), scores, temperature,
@@ -196,6 +197,7 @@ def _run_dynamic_forward(
             )  # (n_opts, D)
             scores = head.forward_choice(
                 state_tensor, opt_embs, question_emb=option_emb_cache[question_text],
+                question_type=kind,
             )
             results[qid] = decode_dynamic_answer(
                 make_choice_question(option_texts, question_text), scores, temperature,
@@ -208,6 +210,7 @@ def _run_dynamic_forward(
             )  # (n_levels, D)
             scores = head.forward_score(
                 state_tensor, opt_embs, question_emb=option_emb_cache[question_text],
+                question_type=kind,
             )
             results[qid] = decode_dynamic_answer(
                 make_score_question(level_texts, question_text), scores, temperature,
@@ -500,8 +503,8 @@ def _benchmark_dynamic_real(
     with torch.no_grad():
         for start in range(0, len(samples), 64):
             chunk = samples[start : start + 64]
-            xb, mask, ob, qb, yb = collate_dynamic_batch(chunk, device)
-            scores = head.forward_choice(xb, ob, mask, qb)
+            xb, mask, ob, qb, qtb, yb = collate_dynamic_batch(chunk, device)
+            scores = head.forward_choice(xb, ob, mask, qb, qtb)
             correct += int((scores.argmax(dim=1) == yb).sum().item())
 
     acc = correct / len(samples)
@@ -596,6 +599,7 @@ def _benchmark_dynamic_phrasings(
                     with torch.no_grad():
                         scores = dynamic_head.forward_choice(
                             state_tensor, opt_embs, question_emb=q_emb,
+                            question_type=entry.kind,
                         )
                     decoded = decode_dynamic_answer(q, scores, dynamic_temp)
                     gold = entry.gold(state)
@@ -737,6 +741,7 @@ def _load_dynamic_for_benchmark(
             d_k=cfg.dynamic_head.d_k,
             dropout=cfg.dynamic_head.dropout,
             state_set=True,
+            type_conditioned=True,
         ).to(device)
         temperature = 1.0
     except (ValueError, RuntimeError) as exc:

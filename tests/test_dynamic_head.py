@@ -435,6 +435,89 @@ class TestFieldSetCheckpoint:
         assert isinstance(results[1]["predicted"], bool)
 
 
+class TestQuestionTypeConditioning:
+    """v5: the answer format (choice/score/noul) is an explicit head input."""
+
+    def _head(self):
+        h = DynamicDecisionHead(
+            input_dim=64, hidden_dim=32, d_k=16, dropout=0.0,
+            state_set=True, type_conditioned=True,
+        )
+        h.eval()
+        return h
+
+    def test_roundtrip_preserves_type_conditioning(self):
+        head = self._head()
+        state = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            orig = head.forward_choice(state, opt_embs, question_type="choice")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "v5.pt"
+            save_dynamic_head(head, path)
+            loaded = load_dynamic_head(path)
+            loaded.eval()
+            assert loaded.type_conditioned is True
+            with torch.no_grad():
+                assert torch.allclose(
+                    orig, loaded.forward_choice(state, opt_embs, question_type="choice"),
+                    atol=1e-6,
+                )
+
+    def test_type_reaches_readout_and_changes_the_score(self):
+        """Same state and options, different answer format → different logits,
+        once the (zero-init) read-out is off zero (that is when the type signal
+        can act — at init the head is byte-identical to v4, by design)."""
+        head = self._head()
+        state = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            # at init the read-out is zero → type is inert (== v4)
+            i0 = head.forward_choice(state, opt_embs, question_type="choice")
+            i1 = head.forward_choice(state, opt_embs, question_type="score")
+            assert torch.allclose(i0, i1)
+            # move the read-out off zero → the type signal now reaches logits
+            torch.nn.init.normal_(head.qz_readout[2].weight, std=0.1)
+            a = head.forward_choice(state, opt_embs, question_type="choice")
+            b = head.forward_choice(state, opt_embs, question_type="score")
+            c = head.forward_choice(state, opt_embs, question_type="noul")
+        assert not torch.allclose(a, b)
+        assert not torch.allclose(a, c)
+        assert not torch.allclose(b, c)
+
+    def test_legacy_v4_head_ignores_type(self):
+        """A pre-v5 head (type_conditioned=False) must ignore question_type —
+        backward compatibility for the served v4 checkpoints."""
+        head = DynamicDecisionHead(
+            input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True,
+        )
+        head.eval()
+        assert head.type_conditioned is False
+        state = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            base = head.forward_choice(state, opt_embs)
+            with_type = head.forward_choice(state, opt_embs, question_type="noul")
+        assert torch.allclose(base, with_type)
+
+    def test_unknown_type_raises(self):
+        head = self._head()
+        with torch.no_grad():
+            with pytest.raises(ValueError, match="unknown question type"):
+                head.forward_choice(torch.randn(2, 64), torch.randn(3, 64),
+                                    question_type="bogus")
+
+    def test_v4_checkpoint_loads_without_type_conditioning(self):
+        """arch_version 4 checkpoints still load (type_conditioned=False)."""
+        v4 = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16,
+                                 dropout=0.0, state_set=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "v4.pt"
+            save_dynamic_head(v4, path)
+            loaded = load_dynamic_head(path)
+            assert loaded.type_conditioned is False
+
+
 # ---------------------------------------------------------------------------
 # v4 question-field attention
 # ---------------------------------------------------------------------------

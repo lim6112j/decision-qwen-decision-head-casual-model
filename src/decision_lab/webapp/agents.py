@@ -190,11 +190,13 @@ class DynamicHeadAgent:
         state_tensor,
         option_texts: list[str],
         question_text: str = "",
+        question_type=None,
     ) -> torch.Tensor:
         """Embed options + question (cached) and score them → (1, n_opts).
 
         question_text provides the question-field attention query (v4);
         empty string → zero-vector modulation (learned null question).
+        question_type (v5) is the answer-format id ("choice"/"score"/"noul").
         """
         texts = list(option_texts)
         if question_text:
@@ -204,7 +206,8 @@ class DynamicHeadAgent:
         question_emb = cache[question_text] if question_text else None
         with torch.no_grad():
             return self._head.forward_choice(
-                state_tensor, opt_embs, question_emb=question_emb
+                state_tensor, opt_embs, question_emb=question_emb,
+                question_type=question_type,
             )
 
     def decide(self, state) -> tuple[dict, str, float]:
@@ -221,7 +224,7 @@ class DynamicHeadAgent:
                 kind = spec["type"]
                 if kind == "noul":
                     question_text = spec.get("question", qid)
-                    scores = self._score(state_tensor, ["false", "true"], question_text)
+                    scores = self._score(state_tensor, ["false", "true"], question_text, kind)
                     results[qid] = decode_dynamic_answer(
                         make_noul_question(question_text),
                         scores,
@@ -230,7 +233,7 @@ class DynamicHeadAgent:
                 elif kind == "choice":
                     option_texts = spec["options"]
                     question_text = default_question_text(qid)
-                    scores = self._score(state_tensor, option_texts, question_text)
+                    scores = self._score(state_tensor, option_texts, question_text, kind)
                     results[qid] = decode_dynamic_answer(
                         make_choice_question(option_texts, question_text),
                         scores,
@@ -239,7 +242,7 @@ class DynamicHeadAgent:
                 elif kind == "score":
                     level_texts = spec["levels"]
                     question_text = default_question_text(qid)
-                    scores = self._score(state_tensor, level_texts, question_text)
+                    scores = self._score(state_tensor, level_texts, question_text, kind)
                     results[qid] = decode_dynamic_answer(
                         make_score_question(level_texts, question_text),
                         scores,
@@ -274,7 +277,7 @@ class DynamicHeadAgent:
             for q in questions:
                 option_texts = question_option_texts(q)
                 question_text = (q.get("question") or "").strip()
-                scores = self._score(state_tensor, option_texts, question_text)
+                scores = self._score(state_tensor, option_texts, question_text, q["type"])
                 results.append(decode_dynamic_answer(q, scores, self._temperature))
 
         latency_ms = (time.perf_counter() - t0) * 1000
@@ -342,6 +345,7 @@ def _load_dynamic_agent(
             d_k=cfg.dynamic_head.d_k,
             dropout=cfg.dynamic_head.dropout,
             state_set=True,
+            type_conditioned=True,
         )
         temperature = 1.0
 

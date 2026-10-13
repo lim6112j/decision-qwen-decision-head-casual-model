@@ -129,13 +129,21 @@ def cmd_train_dynamic(args):
           f"shape_augmentation={dcfg.shape_augmentation}")
 
     with server_from_config(cfg) as server:
-        samples = generate_dynamic_training_data(
-            states, field_sets, question_spec, server,
-            num_variants_per_question=dcfg.variants_per_question,
-            shape_augmentation=dcfg.shape_augmentation,
-            include_summary_field=dcfg.include_summary_field,
-        )
-        samples += _load_real_samples(dcfg, args.data_dir)
+        if getattr(dcfg, "real_only", False):
+            samples = _load_real_samples(dcfg, args.data_dir)
+            if not samples:
+                print("real_only is set but no real samples were found "
+                      "(check dynamic_head.real_data_path)")
+                sys.exit(1)
+            print(f"  real_only: {len(samples)} real samples, synthetic bank skipped")
+        else:
+            samples = generate_dynamic_training_data(
+                states, field_sets, question_spec, server,
+                num_variants_per_question=dcfg.variants_per_question,
+                shape_augmentation=dcfg.shape_augmentation,
+                include_summary_field=dcfg.include_summary_field,
+            )
+            samples += _load_real_samples(dcfg, args.data_dir)
         train_dynamic_head(
             samples, cfg, args.models_dir / dcfg.checkpoint_filename,
             anchor_fraction=dcfg.anchor_epochs / max(dcfg.max_epochs, 1),

@@ -73,6 +73,7 @@ def build_samples(
             question_text=item.question,
             question_emb=emb[item.question] if item.question else None,
             is_variant=True,
+            is_toxic=True,   # v6: real-traffic samples train the toxic expert
         ))
     return samples
 

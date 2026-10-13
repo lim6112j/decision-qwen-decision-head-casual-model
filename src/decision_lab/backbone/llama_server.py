@@ -25,10 +25,17 @@ class LlamaServer:
         context_length: int = 2048,
         pooling: str = "last",
         embed_dim: int = 1024,
+        batch_size: int = 0,
     ):
         self.gguf_path = Path(gguf_path).expanduser().resolve()
         self.port = port
         self.context_length = context_length
+        # Physical/ubatch size. llama.cpp defaults to 512 tokens and rejects a
+        # single input longer than that with a 500 ("input is too large to
+        # process"). Long fields (e.g. real JSON states) exceed it, so allow
+        # raising it. Does not change the embeddings, so it is deliberately NOT
+        # part of `backend_id`.
+        self.batch_size = batch_size
         # Pooling must match the model family: causal LMs pool the last token,
         # XLM-R/BERT-family embedding models pool the CLS token.
         self.pooling = pooling
@@ -139,6 +146,9 @@ class LlamaServer:
             # stays diagnosable.
             "--verbosity", "1",
         ]
+        if self.batch_size:
+            cmd += ["--batch-size", str(self.batch_size),
+                    "--ubatch-size", str(self.batch_size)]
         # Log to a file rather than pipes: unbounded llama-server output on
         # PIPE buffers deadlocks the subprocess once the buffer fills.
         self._log_file = open(f"/tmp/llama-server-{self.port}.log", "w")
@@ -231,4 +241,5 @@ def server_from_config(cfg) -> LlamaServer:
         context_length=cfg.model.context_length,
         pooling=cfg.model.pooling,
         embed_dim=cfg.model.embed_dim,
+        batch_size=getattr(cfg.model, "batch_size", 0),
     )

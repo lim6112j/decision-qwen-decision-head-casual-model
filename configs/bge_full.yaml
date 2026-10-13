@@ -53,10 +53,18 @@ model:
   pooling: "cls"
   backbone: "bge-m3"
   embed_dim: 1024
+  # Long real JSON states exceed llama.cpp's default 512-token physical batch
+  # (→ HTTP 500 on embedding). Raise it for the typed-decisions experiment.
+  batch_size: 4096
 
 dynamic_head:
   hidden_dim: 256
   d_k: 128
+  # v5 type conditioning OFF; v6 expert separation ON — the `toxic` question
+  # gets its own expert + router so the base questions are never perturbed
+  # (docs/toxic-question-regression.md).
+  type_conditioned: false
+  expert_separation: false
   dropout: 0.1
   learning_rate: 0.001
   weight_decay: 0.00001
@@ -64,18 +72,18 @@ dynamic_head:
   max_epochs: 100
   patience: 20
   anchor_epochs: 30
-  variants_per_question: 3
-  breakout_weight: 3
+  variants_per_question: 1
+  breakout_weight: 1
   include_summary_field: true
   max_fields: 16
-  shape_augmentation: true
+  shape_augmentation: false
   # Side-by-side with head_dynamic_v4.pt — the Qwen head is never touched.
   checkpoint_filename: "head_dynamic_bge.pt"
-  # Real-traffic mix OFF by default: enabling it (see docs/toxic-question-regression.md)
-  # trains the `toxic` qid but regresses the `quality` rubric 93%→53% on held-out.
-  # Parked — set to "data_bge/real/samples.pt" + weight 3 only to reproduce that run.
-  real_data_path: ""
+  # Real-traffic mix (toxic seed). F: v5 type conditioning injected at the
+  # READ-OUT only (not the question vector) — see docs/toxic-question-regression.md.
+  real_data_path: "data_bge/real/samples.pt"
   real_weight: 1
+  real_only: true
 
 calibration:
   holdout_fraction: 0.1

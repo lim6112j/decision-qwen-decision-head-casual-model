@@ -17,6 +17,7 @@ old "(variant)" question-text marker for the curriculum split.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from random import Random
@@ -26,11 +27,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from decision_lab import MODELS_DIR
 from decision_lab.config import Config
 from decision_lab.head.dynamic_model import (
     DynamicDecisionHead,
     get_device,
     question_option_texts,
+    question_type_id,
     save_dynamic_head,
 )
 
@@ -60,6 +63,9 @@ class DynamicTrainingSample:
     gold_idx: int
     question_type: str
     question_text: str = ""
+    # v6: True → this sample trains the dedicated toxic EXPERT, not the general
+    # head. Set for the real-traffic (toxic-domain) samples in build_samples.
+    is_toxic: bool = False
     question_emb: np.ndarray | None = None
     is_variant: bool = False
 
@@ -68,13 +74,14 @@ def collate_dynamic_batch(
     samples: Sequence[DynamicTrainingSample],
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pad + stack a batch of samples → (states, state_mask, options, questions, golds).
+    """Pad + stack a batch of samples → (states, mask, options, questions, qtypes, golds).
 
     states:     (B, M_max, input_dim) — zero-padded
     state_mask: (B, M_max) bool — True where a real field exists
     options:    (B, N_max, input_dim) — zero-padded
     questions:  (B, input_dim) float32 — question embeddings, zero rows for
         the empty question (question_emb is None)
+    qtypes:     (B,) long — v5 question-type ids (choice/score/noul)
     golds:      (B,) long
     """
     batch = len(samples)
@@ -87,6 +94,10 @@ def collate_dynamic_batch(
     ob = torch.zeros(batch, max_n, dim, dtype=torch.float32)
     qb = torch.zeros(batch, dim, dtype=torch.float32)
     yb = torch.tensor([s.gold_idx for s in samples], dtype=torch.long)
+    # v5: explicit answer-format id per sample (choice/score/noul).
+    qtb = torch.tensor(
+        [question_type_id(s.question_type) for s in samples], dtype=torch.long,
+    )
 
     for i, s in enumerate(samples):
         m = s.state_fields_emb.shape[0]
@@ -97,7 +108,8 @@ def collate_dynamic_batch(
         if s.question_emb is not None:
             qb[i] = torch.from_numpy(np.asarray(s.question_emb, dtype=np.float32))
 
-    return xb.to(device), mask.to(device), ob.to(device), qb.to(device), yb.to(device)
+    return (xb.to(device), mask.to(device), ob.to(device), qb.to(device),
+            qtb.to(device), yb.to(device))
 
 
 # ---------------------------------------------------------------------------
@@ -339,18 +351,64 @@ def generate_dynamic_training_data(
     return samples
 
 
-def embed_texts(server, texts: list[str]) -> dict[str, np.ndarray]:
+def _embed_cache_path(server) -> Path:
+    """Per-backbone disk cache for text embeddings (backend_id → filename)."""
+    bid = getattr(server, "backend_id", "") or ""
+    h = hashlib.sha256(bid.encode("utf-8")).hexdigest()[:16]
+    return MODELS_DIR / ".cache" / f"embed_cache_{h}.npz"
+
+
+def _load_embed_cache(path: Path) -> dict[str, np.ndarray]:
+    if not path.exists():
+        return {}
+    try:
+        with np.load(path, allow_pickle=True) as z:
+            texts = z["texts"]
+            embs = z["embs"]
+        return {str(t): np.asarray(embs[i], dtype=np.float32) for i, t in enumerate(texts)}
+    except Exception:
+        return {}
+
+
+def _save_embed_cache(path: Path, cache: dict[str, np.ndarray]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    texts = np.array(list(cache.keys()), dtype=object)
+    embs = np.stack([cache[t] for t in cache]).astype(np.float32)
+    np.savez(path, texts=texts, embs=embs)
+
+
+def embed_texts(server, texts: list[str], use_cache: bool = True) -> dict[str, np.ndarray]:
     """Embed texts in fixed batches → {text: (input_dim,) float32}.
 
     Shared by synthetic training-data generation and the real-traffic
     converter (real/build_dataset.py).
+
+    Embeddings are deterministic given the backbone, so they are cached on disk
+    keyed by ``backend_id`` (models/.cache/embed_cache_<hash>.npz). Every
+    ``train-dynamic`` re-embeds ~24k option/question/shape-variant texts live
+    (~20 min); the cache makes that a one-time cost. Caching is skipped when the
+    server exposes no ``backend_id`` (e.g. test fakes).
     """
+    if not use_cache or not getattr(server, "backend_id", ""):
+        return _embed_uncached(server, texts)
+
+    path = _embed_cache_path(server)
+    cache = _load_embed_cache(path)
+    missing = list(dict.fromkeys(t for t in texts if t not in cache))
+    if missing:
+        for i in range(0, len(missing), 32):
+            batch = missing[i : i + 32]
+            for text, e in zip(batch, server.embed(batch)):
+                cache[text] = np.array(e, dtype=np.float32)
+        _save_embed_cache(path, cache)
+    return {t: cache[t] for t in texts}
+
+
+def _embed_uncached(server, texts: list[str]) -> dict[str, np.ndarray]:
     emb: dict[str, np.ndarray] = {}
-    batch_size = 32
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        embs = server.embed(batch)
-        for text, e in zip(batch, embs):
+    for i in range(0, len(texts), 32):
+        batch = texts[i : i + 32]
+        for text, e in zip(batch, server.embed(batch)):
             emb[text] = np.array(e, dtype=np.float32)
     return emb
 
@@ -410,6 +468,88 @@ def _variants_for_bank_entry(
 # ---------------------------------------------------------------------------
 
 
+def _toxic_batch_at(samples, positions, start, batch_size):
+    bpos = positions[start : start + batch_size]
+    return [samples[i] for i in bpos.tolist()]
+
+
+def _train_toxic_expert(model, samples, toxic_positions, hc, device) -> None:
+    """v6: train the dedicated toxic expert on the toxic pool only.
+
+    Runs after the general head is frozen, through `expert=1`, so only
+    ``model.toxic_expert`` parameters receive gradient.
+    """
+    rng = np.random.RandomState(hc.seed if hasattr(hc, "seed") else 0)
+    order = toxic_positions[rng.permutation(len(toxic_positions))]
+    split = max(1, int(len(order) * 0.8))
+    tr, va = order[:split], order[split:] if split < len(order) else order
+    opt = torch.optim.Adam(
+        model.toxic_expert.parameters(), lr=hc.learning_rate, weight_decay=hc.weight_decay,
+    )
+    best, best_state = -1.0, None
+    bs = hc.batch_size
+    for epoch in range(1, hc.max_epochs + 1):
+        model.toxic_expert.train()
+        for start in range(0, len(tr), bs):
+            xb, mask, ob, qb, qtb, yb = collate_dynamic_batch(
+                _toxic_batch_at(samples, tr, start, bs), device,
+            )
+            opt.zero_grad()
+            scores = model.forward_choice(xb, ob, mask, qb, qtb, expert=1)
+            F.cross_entropy(scores, yb).backward()
+            opt.step()
+        model.toxic_expert.eval()
+        correct = total = 0
+        with torch.no_grad():
+            for start in range(0, len(va), bs):
+                xb, mask, ob, qb, qtb, yb = collate_dynamic_batch(
+                    _toxic_batch_at(samples, va, start, bs), device,
+                )
+                pred = model.forward_choice(xb, ob, mask, qb, qtb, expert=1).argmax(dim=1)
+                correct += int((pred == yb).sum().item())
+                total += len(yb)
+        acc = correct / total if total else 0.0
+        if acc > best:
+            best = acc
+            best_state = {k: v.cpu().clone() for k, v in model.toxic_expert.state_dict().items()}
+    if best_state is not None:
+        model.toxic_expert.load_state_dict(best_state)
+    print(f"  toxic expert: {len(tr)} train / {len(va)} val samples, best val_acc={best:.3f}")
+
+
+def _fit_router(model, samples, device) -> None:
+    """v6: fit the question-embedding router (general vs toxic expert).
+
+    Supervised: a sample whose ``is_toxic`` is set is a toxic-question example,
+    everything else is a general-question example. A few hundred epochs over
+    the (tiny) set of unique question embeddings is enough.
+    """
+    embs, targets = [], []
+    seen: set[int] = set()
+    for s in samples:
+        if s.question_emb is None:
+            continue
+        key = id(s.question_emb)
+        if key in seen:
+            continue
+        seen.add(key)
+        embs.append(np.asarray(s.question_emb, dtype=np.float32))
+        targets.append(1 if getattr(s, "is_toxic", False) else 0)
+    if len(set(targets)) < 2:
+        print("  router: only one class present — skipping (no toxic questions?)")
+        return
+    X = torch.from_numpy(np.stack(embs)).to(device)
+    y = torch.tensor(targets, dtype=torch.long, device=device)
+    opt = torch.optim.Adam(model.router.parameters(), lr=1e-3, weight_decay=1e-5)
+    for _ in range(300):
+        opt.zero_grad()
+        F.cross_entropy(model.router(X), y).backward()
+        opt.step()
+    with torch.no_grad():
+        acc = (model.router(X).argmax(dim=1) == y).float().mean().item()
+    print(f"  router: {len(targets)} question embeddings ({sum(targets)} toxic), fit_acc={acc:.3f}")
+
+
 def train_dynamic_head(
     samples: Sequence[DynamicTrainingSample],
     cfg: Config,
@@ -465,17 +605,35 @@ def train_dynamic_head(
         np.where(~stage2_arr & in_train)[0], dtype=torch.long,
     )
 
-    print(f"  train: {len(train_positions)}, val: {len(val_positions)}, "
-          f"calibration holdout: {calib_n} "
-          f"(stage-1 pool: {len(stage1_pool)})")
+    # v6 expert separation: the real (toxic-domain) samples train a DEDICATED
+    # expert. Keep them out of every general pool so the base head never sees a
+    # toxic gradient — the base questions stay identical to a toxic-free run.
+    sep = getattr(hc, "expert_separation", False)
+    is_toxic_arr = np.array([getattr(s, "is_toxic", False) for s in samples], dtype=bool)
+    toxic_positions = torch.tensor(np.where(is_toxic_arr)[0], dtype=torch.long)
+    if sep and len(toxic_positions) > 0:
+        def _drop_toxic(pos: torch.Tensor) -> torch.Tensor:
+            return torch.tensor(
+                [i for i in pos.tolist() if not is_toxic_arr[i]], dtype=torch.long,
+            )
+        train_positions = _drop_toxic(train_positions)
+        val_positions = _drop_toxic(val_positions)
+        stage1_pool = _drop_toxic(stage1_pool)
+        calib_idx_set = {i for i in calib_idx_set if not is_toxic_arr[i]}
 
-    # Model — v4 question-field attention architecture
+    print(f"  train: {len(train_positions)}, val: {len(val_positions)}, "
+          f"calibration holdout: {len(calib_idx_set)} "
+          f"(stage-1 pool: {len(stage1_pool)}, toxic pool: {len(toxic_positions)})")
+
+    # Model — v4 question-field attention (+ optional v5 type / v6 expert)
     model = DynamicDecisionHead(
         input_dim=1024,
         hidden_dim=hc.hidden_dim,
         d_k=hc.d_k,
         dropout=hc.dropout,
         state_set=True,
+        type_conditioned=getattr(hc, "type_conditioned", False),
+        expert_separation=sep,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=hc.learning_rate, weight_decay=hc.weight_decay)
@@ -507,12 +665,12 @@ def train_dynamic_head(
         order = pool[torch.randperm(len(pool))]
 
         for start in range(0, len(order), batch_size):
-            xb, mask, ob, qb, yb = collate_dynamic_batch(
+            xb, mask, ob, qb, qtb, yb = collate_dynamic_batch(
                 batch_at(order, start, batch_size), device,
             )
 
             optimizer.zero_grad()
-            scores = model.forward_choice(xb, ob, mask, qb)      # (B, N)
+            scores = model.forward_choice(xb, ob, mask, qb, qtb, expert=0)  # (B, N)
             loss = F.cross_entropy(scores, yb)
             loss.backward()
             optimizer.step()
@@ -529,8 +687,8 @@ def train_dynamic_head(
         with torch.no_grad():
             for start in range(0, len(val_positions), batch_size):
                 batch = batch_at(val_positions, start, batch_size)
-                xb, mask, ob, qb, yb = collate_dynamic_batch(batch, device)
-                scores = model.forward_choice(xb, ob, mask, qb)
+                xb, mask, ob, qb, qtb, yb = collate_dynamic_batch(batch, device)
+                scores = model.forward_choice(xb, ob, mask, qb, qtb, expert=0)
                 pred = scores.argmax(dim=1)
                 val_correct += int((pred == yb).sum().item())
                 val_total += len(yb)
@@ -576,6 +734,14 @@ def train_dynamic_head(
     model.load_state_dict(best_state)
     model.eval()
 
+    # v6: train the dedicated toxic expert + the router. Both run AFTER the
+    # general head has settled and touch only their own parameters, so the
+    # general head (and every base question) is byte-identical to a run with
+    # no toxic data at all.
+    if sep and len(toxic_positions) > 0:
+        _train_toxic_expert(model, samples, toxic_positions, hc, device)
+        _fit_router(model, samples, device)
+
     # Global temperature calibration (single scalar, not per-question)
     temperature = _fit_global_temperature(model, samples, calib_idx_set, device)
 
@@ -610,8 +776,8 @@ def _fit_global_temperature(
     with torch.no_grad():
         for start in range(0, len(calib_samples), batch_size):
             chunk = calib_samples[start : start + batch_size]
-            xb, mask, ob, qb, yb = collate_dynamic_batch(chunk, device)
-            logits = model.forward_choice(xb, ob, mask, qb)
+            xb, mask, ob, qb, qtb, yb = collate_dynamic_batch(chunk, device)
+            logits = model.forward_choice(xb, ob, mask, qb, qtb)
             batch_logits.append((logits.cpu().detach(), yb.cpu().detach(), len(chunk)))
 
     log_t = torch.zeros(1, requires_grad=True)
