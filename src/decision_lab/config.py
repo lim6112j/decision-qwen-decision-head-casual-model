@@ -17,6 +17,11 @@ class GeneratorConfig:
     # dynamic-head training only — never into typed-head training.
     num_breakout_train: int = 4000
     num_breakout_test: int = 500
+    # Cover every (latent, template) pair ONCE instead of sampling num_* random
+    # draws. The random bank is ~52 renderings of each of 192 label vectors
+    # (~12% exact-duplicate texts); the grid is ~6x smaller with full coverage.
+    # train/test_indist = 192 x len(templates), test_heldout = 192 x held-out.
+    systematic: bool = False
 
 
 @dataclass
@@ -38,7 +43,14 @@ class ModelConfig:
     gguf_path: str = "models/Qwen3.5-0.8B-UD-Q4_K_XL.gguf"
     context_length: int = 2048
     server_port: int = 8080
+    # "last"/"mean" suit causal LMs; "cls" suits BERT/XLM-R embedding models
+    # (e.g. bge-m3). Must match the served model family or embeddings are junk.
     pooling: str = "last"
+    # Identity label for the backbone — recorded in head checkpoints and
+    # feature-cache fingerprints so embeddings from different backbones can
+    # never be silently mixed.
+    backbone: str = "qwen3.5-0.8b"
+    embed_dim: int = 1024
 
 
 @dataclass
@@ -61,6 +73,10 @@ class DynamicHeadConfig:
     weight_decay: float = 1e-5
     batch_size: int = 128
     max_epochs: int = 100
+    # v3: question-conditioned FiLM instead of v4's question-field attention.
+    # Optimal for a SINGLE fixed problem (v3 = 98.0 on breakout vs v4's 94.0);
+    # v4 is for unseen-question generalization. Off by default (= v4).
+    film: bool = False
     patience: int = 10
     # Curriculum: epochs before introducing varied option sets
     anchor_epochs: int = 30
@@ -81,6 +97,9 @@ class DynamicHeadConfig:
     # (generalization) at integer weight `real_weight`.
     real_data_path: str = ""
     real_weight: int = 1
+    # Train ONLY on the real samples (skip the synthetic bank). A sub-path
+    # experiment: a separate head per problem, with no shared-bank interference.
+    real_only: bool = False
     # Add shape-variant duplicates of document states (flattened /
     # marker-stripped, same gold — states/shapes.py) to dynamic-head
     # training. The field-set head collapses to near-uniform logits on
@@ -111,6 +130,10 @@ class BenchmarkConfig:
     timed_runs: int = 50
     max_test_states: int = 0        # 0 = use the full test set
     latency_sample_size: int = 50   # states used for warmup/timed latency runs
+    # Agents to leave out of run_benchmark. Needed when the backbone is an
+    # embeddings-only model: head_trained/head_random need the pooled feature
+    # cache and prompt_lm_zero_shot needs chat(), which such models lack.
+    skip_agents: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -122,6 +145,12 @@ class WebConfig:
     # Capture /api/decide-dynamic calls (opt-in per request via the
     # X-Decision-Lab-Log header) for the real-data labeling pipeline.
     log_traffic: bool = False
+    # Sub-paths: name → dynamic-head checkpoint filename, sharing one backbone.
+    # The caller selects one per /api/decide-dynamic request with the `path`
+    # field — explicit routing, so no learned router and no misrouting. Empty →
+    # the single `dynamic_head.checkpoint_filename` (backwards compatible).
+    paths: dict[str, str] = field(default_factory=dict)
+    default_path: str = ""
 
 
 @dataclass
@@ -183,8 +212,12 @@ def _validate(cfg: Config) -> None:
     for qid, spec in q.score.items():
         if len(spec.get("levels", [])) < 2:
             raise ValueError(f"score question '{qid}' needs >= 2 rubric levels")
-    if cfg.model.pooling not in ("last", "mean"):
-        raise ValueError(f"pooling must be 'last' or 'mean', got {cfg.model.pooling}")
+    if cfg.model.pooling not in ("last", "mean", "cls"):
+        raise ValueError(
+            f"pooling must be 'last', 'mean' or 'cls', got {cfg.model.pooling}"
+        )
+    if cfg.model.embed_dim <= 0:
+        raise ValueError(f"embed_dim must be positive, got {cfg.model.embed_dim}")
     if cfg.head.dropout < 0 or cfg.head.dropout > 0.9:
         raise ValueError(f"dropout {cfg.head.dropout} out of range")
     if not 0 < cfg.calibration.holdout_fraction < 0.5:

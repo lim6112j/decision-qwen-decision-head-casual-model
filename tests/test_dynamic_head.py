@@ -14,6 +14,7 @@ from decision_lab.head.dynamic_model import (
     D_K,
     DEFAULT_TEMPERATURE,
     DynamicDecisionHead,
+    check_backbone_match,
     create_random_dynamic_head,
     decode_dynamic_answer,
     dynamic_probabilities,
@@ -750,21 +751,53 @@ class TestQuestionAttentionCheckpoint:
                     atol=1e-6,
                 )
 
-    def test_v3_checkpoint_refused(self, capsys):
-        """Clean break: a hand-built v3-style checkpoint (FiLM keys) raises
-        ValueError — no silent fallback, the v3 checkpoint stays preserved
-        in the main checkout."""
-        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
+    def test_v3_film_head_roundtrips(self):
+        """v3 (question-conditioned FiLM) heads now load: arch_version 3 →
+        film=True, and the forward round-trips."""
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16,
+                                   dropout=0.0, state_set=True, film=True)
+        head.eval()
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        q = torch.randn(64)
+        with torch.no_grad():
+            orig = head.forward_choice(fields, opt_embs, question_emb=q)
         with tempfile.TemporaryDirectory() as tmp:
-            v4_path = Path(tmp) / "v4.pt"
-            save_dynamic_head(head, v4_path)
-            checkpoint = torch.load(str(v4_path), map_location="cpu")
-            checkpoint["arch"]["arch_version"] = 3
             path = Path(tmp) / "v3.pt"
-            torch.save(checkpoint, str(path))
+            save_dynamic_head(head, path)
+            loaded = load_dynamic_head(path)
+            loaded.eval()
+            assert loaded.film is True
+            with torch.no_grad():
+                assert torch.allclose(
+                    orig, loaded.forward_choice(fields, opt_embs, question_emb=q),
+                    atol=1e-6,
+                )
 
+    def test_v3_film_identity_at_init(self):
+        """Zero-init FiLM → a fresh film head ignores the question (starts as
+        v2); this is what makes v3 trainable at all."""
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16,
+                                   dropout=0.0, state_set=True, film=True).eval()
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            a = head.forward_choice(fields, opt_embs, question_emb=torch.randn(64))
+            b = head.forward_choice(fields, opt_embs, question_emb=None)
+        assert torch.allclose(a, b)
+
+    def test_v2_arch_version_refused(self):
+        """v1/v2 (arch_version < 3) are still refused — no silent upgrade."""
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16,
+                                   dropout=0.0, state_set=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "v2.pt"
+            save_dynamic_head(head, p)
+            checkpoint = torch.load(str(p), map_location="cpu")
+            checkpoint["arch"]["arch_version"] = 2
+            torch.save(checkpoint, str(p))
             with pytest.raises(ValueError, match="arch_version"):
-                load_dynamic_head(path)
+                load_dynamic_head(p)
 
 
 class TestPredictDynamicQuestionCache:
@@ -962,3 +995,92 @@ class TestPaddleDirectionVariants:
         for v in variants:
             # gold_map values must be a permutation of the option set
             assert sorted(v["gold_map"].values()) == sorted(v["options"])
+
+# ---------------------------------------------------------------------------
+# Backbone identity
+# ---------------------------------------------------------------------------
+
+
+class _StubServer:
+    def __init__(self, backend_id: str):
+        self.backend_id = backend_id
+
+
+class TestBackboneIdentity:
+    """A head trained against one embedding backend is meaningless against
+    another — same vector shape, different space. The checkpoint records
+    which backend it was trained on so the mismatch is visible."""
+
+    def _head(self):
+        return DynamicDecisionHead(
+            input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True,
+        )
+
+    def test_backbone_id_survives_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "head.pt"
+            save_dynamic_head(self._head(), path, backbone_id="bge-m3|pooling=cls")
+            loaded = load_dynamic_head(path)
+        assert loaded.backbone_id == "bge-m3|pooling=cls"
+
+    def test_checkpoint_without_backbone_id_loads_as_none(self):
+        """Checkpoints predating the field must keep loading (v4 no-retrain
+        requirement) and must not trigger the guard."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "head.pt"
+            save_dynamic_head(self._head(), path)   # no backbone_id
+            loaded = load_dynamic_head(path)
+        assert loaded.backbone_id is None
+        check_backbone_match(loaded, _StubServer("anything"))   # no raise
+
+    def test_matching_backbone_is_silent(self, capsys):
+        head = self._head()
+        head.backbone_id = "qwen|pooling=last"
+        check_backbone_match(head, _StubServer("qwen|pooling=last"))
+        assert "warning" not in capsys.readouterr().out
+
+    def test_mismatched_backbone_warns(self, capsys):
+        # Unique ids: the warn-once cache is module-level and shared.
+        head = self._head()
+        head.backbone_id = "warn-test-trained|pooling=last"
+        check_backbone_match(head, _StubServer("warn-test-serving|pooling=cls"))
+        out = capsys.readouterr().out
+        assert "warning" in out
+        assert "warn-test-trained|pooling=last" in out
+        assert "warn-test-serving|pooling=cls" in out
+
+    def test_repeated_mismatch_warns_once(self, capsys):
+        """run_benchmark loads the same head once per pass — one warning."""
+        head = self._head()
+        head.backbone_id = "unique-a|pooling=last"
+        server = _StubServer("unique-b|pooling=cls")
+        check_backbone_match(head, server)
+        check_backbone_match(head, server)
+        assert capsys.readouterr().out.count("warning") == 1
+
+    def test_untrained_head_never_warns(self, capsys):
+        check_backbone_match(self._head(), _StubServer("bge-m3"))
+        assert "warning" not in capsys.readouterr().out
+
+    def test_server_without_backend_id_never_warns(self, capsys):
+        """Duck-typed test servers expose only embed()."""
+        head = self._head()
+        head.backbone_id = "qwen|pooling=last"
+        check_backbone_match(head, object())
+        assert "warning" not in capsys.readouterr().out
+
+
+class TestEarlyStopVsEscapeGuard:
+    """Regression: patience must not early-stop BEFORE the escape guard — a
+    run stuck at the stage-1 plateau would otherwise stop and save a near-chance
+    model that looks like a success (observed 2026-10-14: a grid run early-stopped
+    at epoch 24 with best_val_acc 0.484; a retrain gave 0.973)."""
+
+    def test_patience_cannot_fire_before_guard(self):
+        from decision_lab.head.dynamic_train import _early_stop_due
+        assert _early_stop_due(epoch=24, patience_counter=20, patience=20,
+                               guard_epoch=40) is False
+        assert _early_stop_due(epoch=40, patience_counter=20, patience=20,
+                               guard_epoch=40) is True
+        assert _early_stop_due(epoch=50, patience_counter=3, patience=20,
+                               guard_epoch=40) is False

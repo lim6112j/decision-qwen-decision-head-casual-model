@@ -18,6 +18,15 @@ import numpy as np
 from decision_lab.config import Config
 
 
+def _server_backend(server) -> tuple[str, int]:
+    """(backend_id, embed_dim) for a server, tolerating duck-typed mocks.
+
+    Tests pass servers exposing only ``embed``; those fingerprint as the
+    empty backend, which is stable within a test run.
+    """
+    return getattr(server, "backend_id", ""), getattr(server, "embed_dim", 0)
+
+
 def extract_features(
     data_path: Path,
     cache_path: Path,
@@ -34,7 +43,13 @@ def extract_features(
     """
     from decision_lab.states.dataset import load_dataset
 
-    fingerprint = _cache_fingerprint(data_path, include_summary_field=False)
+    backend_id, embed_dim = _server_backend(server)
+    fingerprint = _cache_fingerprint(
+        data_path,
+        include_summary_field=False,
+        backend_id=backend_id,
+        embed_dim=embed_dim,
+    )
     if cache_path.exists():
         data = np.load(cache_path)
         stored = str(data["fingerprint"]) if "fingerprint" in data else ""
@@ -57,7 +72,12 @@ def extract_features(
     return features
 
 
-def _cache_fingerprint(data_path: Path, include_summary_field: bool) -> str:
+def _cache_fingerprint(
+    data_path: Path,
+    include_summary_field: bool,
+    backend_id: str = "",
+    embed_dim: int = 0,
+) -> str:
     """Fingerprint tying a feature cache to its source dataset + settings.
 
     A stale cache silently returning embeddings for a DIFFERENT dataset is
@@ -66,6 +86,12 @@ def _cache_fingerprint(data_path: Path, include_summary_field: bool) -> str:
     the source file bytes plus every setting that changes the output —
     including the field splitter version, since its chunking decides which
     texts get embedded.
+
+    ``backend_id`` covers the other half of the same failure: embeddings
+    depend on the served model, quantization and pooling, so a cache
+    extracted from one backend must never be reused for another. The
+    defaults keep duck-typed test servers (which expose only ``embed``)
+    working; real callers pass ``server.backend_id``.
     """
     import hashlib
 
@@ -75,6 +101,8 @@ def _cache_fingerprint(data_path: Path, include_summary_field: bool) -> str:
     h.update(data_path.read_bytes())
     h.update(f"|include_summary_field={include_summary_field}".encode())
     h.update(f"|splitter_version={SPLITTER_VERSION}".encode())
+    h.update(f"|backend={backend_id}".encode())
+    h.update(f"|embed_dim={embed_dim}".encode())
     return h.hexdigest()
 
 
@@ -103,7 +131,13 @@ def extract_field_features(
     from decision_lab.states.dataset import load_dataset
     from decision_lab.states.fields import state_field_set
 
-    fingerprint = _cache_fingerprint(data_path, include_summary_field)
+    backend_id, embed_dim = _server_backend(server)
+    fingerprint = _cache_fingerprint(
+        data_path,
+        include_summary_field,
+        backend_id=backend_id,
+        embed_dim=embed_dim,
+    )
     if cache_path.exists():
         data = np.load(cache_path)
         stored = str(data["fingerprint"]) if "fingerprint" in data else ""

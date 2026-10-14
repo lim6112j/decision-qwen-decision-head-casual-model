@@ -13,3 +13,6 @@ models/
 
 # Local tooling
 .playwright-mcp/
+# Per-backbone dataset trees and their results (bge-m3 experiment)
+data_*/
+results_*/

@@ -116,3 +116,90 @@ class TestExtractFieldFeatures:
         assert mask.tolist() == [[True, True], [True, False]]
         assert xb[1, 1].sum().item() == 0.0  # padded rows are zeros
         assert torch.equal(xb[1, 0], torch.full((4,), 2.0))
+
+class TestBackboneFingerprint:
+    """A cache extracted from one embedding backend must never be reused by
+    another. Before the backend was folded into the fingerprint, swapping the
+    served model (or its pooling) silently returned embeddings from the old
+    one — the same failure class as the stale-source-cache incident."""
+
+    class BackendServer:
+        def __init__(self, backend_id: str, embed_dim: int = 1024, tag: float = 1.0):
+            self.backend_id = backend_id
+            self.embed_dim = embed_dim
+            self.tag = tag
+            self.n_calls = 0
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            self.n_calls += len(texts)
+            return [[self.tag] * self.embed_dim for _ in texts]
+
+    def _write(self, tmp_dir: Path) -> Path:
+        data_path = tmp_dir / "test_indist.jsonl"
+        data_path.write_text("\n".join(_state_rows(3)))
+        return data_path
+
+    def test_same_backend_reuses_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            data_path = self._write(tmp_dir)
+            cache = tmp_dir / "features_test.npz"
+
+            first = self.BackendServer("bge-m3|pooling=cls|dim=1024")
+            extract_features(data_path, cache, first)
+            second = self.BackendServer("bge-m3|pooling=cls|dim=1024")
+            extract_features(data_path, cache, second)
+
+        assert second.n_calls == 0, "identical backend must reuse the cache"
+
+    def test_different_backend_forces_reextraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            data_path = self._write(tmp_dir)
+            cache = tmp_dir / "features_test.npz"
+
+            qwen = self.BackendServer("qwen3.5-0.8b|pooling=last|dim=1024", tag=1.0)
+            extract_features(data_path, cache, qwen)
+
+            bge = self.BackendServer("bge-m3|pooling=cls|dim=1024", tag=2.0)
+            feats = extract_features(data_path, cache, bge)
+
+        assert bge.n_calls == 3, "a different backbone must not reuse the cache"
+        assert feats[0][0] == 2.0, "cache must hold the new backend's vectors"
+
+    def test_pooling_change_forces_reextraction(self):
+        """Same model, different pooling → different vectors → new cache."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            data_path = self._write(tmp_dir)
+            cache = tmp_dir / "features_test.npz"
+
+            extract_features(data_path, cache, self.BackendServer("m|pooling=last"))
+            mean = self.BackendServer("m|pooling=mean")
+            extract_features(data_path, cache, mean)
+
+        assert mean.n_calls == 3
+
+    def test_dim_change_forces_reextraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            data_path = self._write(tmp_dir)
+            cache = tmp_dir / "features_test.npz"
+
+            extract_features(data_path, cache, self.BackendServer("m", embed_dim=1024))
+            smaller = self.BackendServer("m", embed_dim=768)
+            extract_features(data_path, cache, smaller)
+
+        assert smaller.n_calls == 3
+
+    def test_duck_typed_server_still_works(self):
+        """Test doubles exposing only embed() must keep caching normally."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            data_path = self._write(tmp_dir)
+            cache = tmp_dir / "features_test.npz"
+
+            extract_features(data_path, cache, MockServer())
+            feats = extract_features(data_path, cache, MockServer())
+
+        assert feats.shape == (3, 1024)

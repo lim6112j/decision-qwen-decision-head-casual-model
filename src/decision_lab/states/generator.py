@@ -61,10 +61,13 @@ def generate_dataset(cfg: Config, data_dir: Path) -> None:
 
     doc_id = 0
     for name, count, templates in splits:
-        states = []
-        for _ in range(count):
-            states.append(_make_state(doc_id, rng, templates))
-            doc_id += 1
+        if cfg.generator.systematic:
+            states, doc_id = _systematic_states(templates, rng, doc_id)
+        else:
+            states = []
+            for _ in range(count):
+                states.append(_make_state(doc_id, rng, templates))
+                doc_id += 1
         path = data_dir / f"{name}.jsonl"
         save_dataset(states, path)
         print(f"  {name}: {len(states)} states → {path}")
@@ -74,6 +77,33 @@ def generate_dataset(cfg: Config, data_dir: Path) -> None:
     if cfg.generator.num_breakout_train > 0:
         from decision_lab.states.breakout import generate_breakout_dataset
         generate_breakout_dataset(cfg, data_dir, Random(cfg.generator.seed + 1))
+
+
+def _systematic_states(
+    templates: tuple[str, ...], rng: Random, doc_id: int,
+) -> tuple[list[TextState], int]:
+    """Full grid over the 192 latent combinations × ``templates``.
+
+    The random path draws ~10k states from a 192-vector label space (~52
+    renderings each, ~12% exact-duplicate texts). The grid covers every
+    (latent, template) pair exactly ONCE → ~6x smaller with 100% coverage.
+    The rendering still uses ``rng``, so a split's surface text varies.
+    """
+    states: list[TextState] = []
+    for sentiment in SENTIMENTS:
+        for urgency in URGENCIES:
+            for quality in range(MAX_QUALITY + 1):
+                for actionable in (True, False):
+                    for pii in (True, False):
+                        latents = Latents(sentiment, urgency, quality, actionable, pii)
+                        for tmpl in templates:
+                            states.append(TextState(
+                                doc_id=doc_id, state_type=tmpl,
+                                text=_RENDERERS[tmpl](rng, latents),
+                                labels=latents.labels(),
+                            ))
+                            doc_id += 1
+    return states, doc_id
 
 
 def _make_state(doc_id: int, rng: Random, templates: tuple[str, ...]) -> TextState:
@@ -154,12 +184,16 @@ def _contact_line(rng: Random, pii: bool) -> str:
 # --------------------------------------------------------------------------
 
 def _render_email(rng: Random, lat: Latents) -> str:
-    subject = {
-        "low": f"Update: weekly digest ({_urgency_words(lat.urgency)})",
-        "medium": f"Follow-up: pending request ({_urgency_words(lat.urgency)})",
-        "high": f"Action required: pending approval ({_urgency_words(lat.urgency)})",
-        "critical": f"URGENT: outage escalation ({_urgency_words(lat.urgency)})",
-    }[lat.urgency]
+    # The action cue must track `actionable`, NOT urgency. The old
+    # `"high" -> "Action required"` subject contradicted the gold on 155 train
+    # emails (44 of them quality=0, where it was the ONLY action cue → the
+    # label was unlearnable). Now the subject carries a *correct* action cue,
+    # so `is_actionable` is decidable from the subject alone.
+    _noun = {"low": "weekly digest", "medium": "pending request",
+             "high": "pending approval", "critical": "outage escalation"}[lat.urgency]
+    _urg = "URGENT: " if lat.urgency == "critical" else ""
+    _act = "Action required: " if lat.actionable else ""
+    subject = f"{_urg}{_act}{_noun} ({_urgency_words(lat.urgency)})"
 
     greeting = f"Hi team,\n\n" if lat.quality >= 1 else ""
     body = _sentiment_phrase(rng, lat.sentiment)
@@ -358,7 +392,8 @@ def _render_markdown(rng: Random, lat: Latents) -> str:
         f"{sentiment}",
         f"",
         f"## Action Items",
-        f"- {action_check} Follow-up required",
+        f"- {action_check} "
+        f"{'Follow-up required' if lat.actionable else 'No follow-up required'}",
     ]
     if lat.quality >= 2:
         lines.append(f"- [x] Documentation updated")

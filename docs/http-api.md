@@ -35,6 +35,7 @@ request — no retraining or server restart for new question types.
 
 ```json
 {
+  "path": "doc",
   "custom_text": "URGENT: prod server is down, need someone now",
   "questions": [
     {"type": "noul",   "question": "Is this actionable?"},
@@ -44,6 +45,8 @@ request — no retraining or server restart for new question types.
 }
 ```
 
+- `path` (string, optional) — which **sub-path** answers this call (see
+  [Sub-paths](#sub-paths-path) below). Omitted → the server's default path.
 - `custom_text` (string) — raw text to evaluate. Wins over `doc_id` when both
   are given.
 - `custom_fields` (list of strings, optional) — caller-controlled field
@@ -75,6 +78,47 @@ was trained on natural questions, not bare identifiers. A raw qid like
 predictions (no error is raised; verified 2026-10-10: breakout
 `ball_motion` flipped from 8/8 correct to 3/8 with `"ball_motion"` as the
 question string).
+
+### Sub-paths (`path`)
+
+The server can offer **several dynamic heads off one backbone**, one per
+problem — a *sub-path*. This matters because a **shared** head degrades when a
+new domain is added: measured, mixing the `typed-decisions` domain into the doc
+bank dropped the doc held-out **0.916 → 0.765**. A sub-path isolates each
+problem's head, so domains cannot interfere.
+
+```yaml
+# configs/<name>.yaml
+web:
+  paths:
+    doc:   "head_dynamic_grid_v3.pt"     # e.g. the document/breakout bank
+    typed: "head_dynamic_typed_v3.pt"    # e.g. LocalLLaMA/typed-decisions
+  default_path: "doc"
+```
+
+List what a server offers:
+
+```bash
+curl -s http://127.0.0.1:8000/api/paths
+# {"paths":["doc","typed"],"default":"doc",
+#  "backbone":"served=.../bge-m3-Q8_0.gguf|pooling=cls|ctx=2048|dim=1024"}
+```
+
+Then select one per request: `{"path": "typed", "custom_text": ...,
+"questions": [...]}`.
+
+- **Routing is explicit** — the caller names the path. There is no learned
+  router, so nothing can misroute and there is no unseen-question failure mode;
+  you always get the head you asked for.
+- `path` omitted → `web.default_path` (or the sole path when there is only one).
+- **Unknown `path` → 400** listing the available paths — never a silent fallback
+  to a different head.
+- All paths **share one backbone** (one `llama-server`); only the head
+  (checkpoint) differs, so a path costs ~3 MB + one load at startup. Paths
+  needing *different backbones* would need separate servers.
+- Each path is trained independently on its own problem's data. With
+  `dynamic_head.real_only: true` a path trains on just its real samples (the
+  typed-decisions path trains in ~40 s).
 
 ### Supported question domains
 
@@ -167,7 +211,7 @@ capture → label → train flow.
 | Status | Meaning |
 |---|---|
 | 503 | server still loading (check `/api/status`) |
-| 400 | dynamic head not trained (`models/head_dynamic.pt` missing); malformed request — missing `custom_text`/`doc_id`, or a question entry with unknown `type` or a missing/empty `options`/`levels` list |
+| 400 | dynamic head not trained (`models/head_dynamic.pt` missing); **unknown `path`** (the `detail` lists the available paths); malformed request — missing `custom_text`/`doc_id`, or a question entry with unknown `type` or a missing/empty `options`/`levels` list |
 | 404 | unknown `doc_id` |
 | 422 | body does not match the request schema (e.g. no `questions` list) — the response `detail` names the offending field |
 | 500 | decision failed (see `detail`) |

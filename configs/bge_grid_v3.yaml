@@ -1,0 +1,154 @@
+# Synthetic state generator
+generator:
+  num_train: 10000
+  num_test_indist: 1000
+  num_test_heldout: 1000
+  seed: 42
+  # Full grid over (192 latents x templates) instead of random draws.
+  systematic: true
+  heldout_templates: ["report", "config_file"]
+  # Breakout paddle-control states (gold from geometry). Used by dynamic-head
+  # training only. Mixing math: 4000 states × 4 samples × breakout_weight 3
+  # ≈ 48k breakout samples vs 150k document samples (~24% share).
+  num_breakout_train: 4000
+  num_breakout_test: 500
+
+# Fixed question bank (single forward pass evaluates all questions per state)
+questions:
+  choice:
+    sentiment:
+      options:
+        positive: "Positive sentiment"
+        negative: "Negative sentiment"
+        neutral: "Neutral sentiment"
+    urgency:
+      options:
+        low: "Low priority"
+        medium: "Medium priority"
+        high: "High priority"
+        critical: "Requires immediate attention"
+  score:
+    quality:
+      levels: ["Poor", "Fair", "Good", "Excellent"]   # rubric levels 0..3
+  noul:
+    is_actionable: "Does this state require a response or action?"
+    contains_pii: "Does this state contain personally identifiable information?"
+    is_urgent: "Is this state time-sensitive?"
+
+# Backbone (llama-server)
+model:
+  gguf_path: "models/bge-m3-Q8_0.gguf"
+  context_length: 2048
+  server_port: 8091
+  # bge-m3 is XLM-RoBERTa-based: CLS pooling, not last-token.
+  pooling: "cls"
+  backbone: "bge-m3"
+  embed_dim: 1024
+
+# Typed Decision Head
+head:
+  hidden_dim: 256
+  dropout: 0.1
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  batch_size: 64
+  max_epochs: 100
+  patience: 10
+
+# Dynamic Decision Head (v4: question-field attention)
+dynamic_head:
+  hidden_dim: 256
+  d_k: 128
+  dropout: 0.1
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  batch_size: 128
+  max_epochs: 100
+  # The anchor phase plateaus (its val set already contains stage-2 samples
+  # the anchor-only model can't answer), so patience must outlast it —
+  # patience 10 occasionally stopped mid-anchor before the stage-2 jump.
+  patience: 20
+  anchor_epochs: 30
+  variants_per_question: 1
+  breakout_weight: 1   # oversample factor for breakout states
+  # v2 field-set attention: full-text summary embedding prepended as field 0.
+  # Must stay in sync between feature extraction and inference (same config).
+  include_summary_field: true
+  max_fields: 16
+  # Shape augmentation: variant duplicates of document states (flattened /
+  # marker-stripped, same gold) so the head survives caller-side re-shaping
+  # (browsers joining {subject, body} values into one line, etc.).
+  shape_augmentation: false
+  # v4: separate checkpoint filename — the preserved v3 head_dynamic.pt is
+  # never overwritten by a v4 retrain (this branch only).
+  checkpoint_filename: "head_dynamic_grid_v3.pt"
+  # v3: question-conditioned FiLM — the single-problem optimum (breakout 98.0
+  # vs v4's 94.0).
+  film: true
+
+# Post-training temperature calibration (per question)
+calibration:
+  holdout_fraction: 0.1
+  lr: 0.01
+  max_iter: 1000
+
+# Prompt LM
+prompt_lm:
+  temperature: 0.0
+  max_tokens: 256
+  system_prompt_zero_shot: |
+    You are a text analysis assistant. Given the document below, answer each
+    question precisely using ONLY the document content.
+    Output format (one line per question, exactly these keys):
+    sentiment: <positive|negative|neutral>
+    urgency: <low|medium|high|critical>
+    quality: <0|1|2|3>
+    is_actionable: <true|false>
+    contains_pii: <true|false>
+    is_urgent: <true|false>
+
+  system_prompt_cot: |
+    You are a text analysis assistant. Given the document below, think
+    step-by-step about each question, then answer.
+    Output format:
+    Reasoning: <brief reasoning>
+    sentiment: <positive|negative|neutral>
+    urgency: <low|medium|high|critical>
+    quality: <0|1|2|3>
+    is_actionable: <true|false>
+    contains_pii: <true|false>
+    is_urgent: <true|false>
+
+# Benchmark
+benchmark:
+  warmup_runs: 5
+  timed_runs: 50
+  max_test_states: 200      # subsample test sets (0 = full set)
+  latency_sample_size: 5    # states used for warmup/timed latency runs
+  # head_trained/head_random read the pooled Qwen cache; prompt_lm calls chat()
+  # — bge-m3 serves neither.
+  skip_agents: ["head_trained", "head_random", "prompt_lm_zero_shot"]
+
+# Web UI
+web:
+  host: "127.0.0.1"
+  # Dynamic-head sub-paths (each problem gets its own head off one backbone;
+  # see docs/http-api.md). Request `path` selects one; default = doc.
+  paths:
+    doc: "head_dynamic_grid_v3.pt"     # the doc/breakout bank
+    typed: "head_dynamic_typed_v3.pt"  # LocalLLaMA/typed-decisions
+  default_path: "doc"
+  port: 8000
+  num_states: 8          # pre-generated states offered in the UI
+  random_seed: 42
+  # Capture /api/decide-dynamic calls for the real-data labeling pipeline.
+  # The UI's Run Dynamic Head button opts in automatically; external clients
+  # must also send `X-Decision-Lab-Log: 1` (see docs/real-data-pipeline.md).
+  log_traffic: true
+
+# Real-traffic dataset (capture → label in the UI → build-real → train)
+real:
+  holdout_fraction: 0.2                 # held out as test_real (never trained on)
+  teacher_model: "deepseek/deepseek-v4.1-flash"   # OpenRouter auto-label model
+  exclude_auto: false                   # true = train only on human labels
+  seed: 42

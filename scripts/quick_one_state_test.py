@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import numpy as np
 import torch
 
-from decision_lab.backbone.llama_server import LlamaServer
+from decision_lab.backbone.llama_server import server_from_config
 from decision_lab.config import load_config
 from decision_lab.head.model import (
     build_question_spec,
@@ -52,13 +52,12 @@ def main():
         with open(DATA_DIR / f"{split}.jsonl") as f:
             rows_by_split[split] = [json.loads(next(f)) for _ in range(num_states)]
 
-    gguf = Path(cfg.model.gguf_path).expanduser().resolve()
     device = get_device()
 
     head_trained = load_head(str(MODELS_DIR / "head_trained.pt"), device=device).eval()
     head_random = create_random_head(question_spec).to(device).eval()
 
-    with LlamaServer(gguf, port=cfg.model.server_port, context_length=cfg.model.context_length) as server:
+    with server_from_config(cfg) as server:
         agent_zero = PromptAgent(cfg, server, mode=PromptMode.ZERO_SHOT)
 
         for split, rows in rows_by_split.items():
