@@ -171,6 +171,106 @@ checkpoint carries `head`, `encoder_lora`, `temperature` and `metrics`.
 - Single seed (42) on a single split. The synthetic-era held-out spread was
   ~8pp, so treat ±2pp as noise and anything under ~5pp as unresolved.
 
+## Phase 0 — where the remaining error actually is (2026-10-14)
+
+Before spending more GPU time, three diagnostics. They **changed the plan**:
+the ceiling is ~74%, not ~85%, so the fine-tuning gap was mostly miscalibrated
+expectations rather than a fixable modeling failure. Scripts:
+`results_ft_bge/diag_phase0.py`, `teacher_ceiling.py`, `compare_sample.py`.
+
+### The ceiling: 71.9% (ours) vs 74.2% (teacher) on the same 299 items
+
+A stratified 20-decisions-per-question sample (300 items, 1 call failed → 299)
+labeled by `deepseek/deepseek-v4.1-flash` — the teacher already wired into
+`real/teacher.py` — then scored head-to-head:
+
+| metric | ours (ft15) | teacher |
+|---|---|---|
+| accuracy (299 items) | **71.9%** | **74.2%** |
+| vs full-test | 69.2% (2000 items) | – |
+| prediction agreement | 68% (203/299) | |
+| both wrong | 36 items (12%) | |
+| on the 89 disagreements | ours right 41 / teacher right 48 | |
+
+SE at n=299 is ~2.6pp, so **−2.3pp is not distinguishable from zero**. An
+~820k head on a LoRA-adapted 568M encoder is statistically level with a
+frontier LLM here. Only 12% of items are missed by *both*; the two models
+disagree more than they jointly fail, which is the signature of ambiguous
+labels rather than a systematic weakness either could fix.
+
+**Consequence:** the *one-sequence encoding* test — previously the top
+recommendation for closing the ~10pp Laya gap — is **dropped**. Two different
+architectures converging on the low 70s is not a reason to out-engineer a
+ceiling that is this close. Same for swapping the encoder.
+
+### Majority-class collapse is the dominant real failure mode
+
+Whole-test accuracy 69.3% vs a **49.5% majority-class baseline** (+19.7pp of
+real signal). But per question the head often just learns the prior — plain
+accuracy was inflated ~20pp over the base rate and scored `duplicate` at 0.89
+where the model has **zero** skill:
+
+| qid | acc | majority | balanced acc | worst class recall |
+|---|---|---|---|---|
+| `duplicate` | 0.890 | **0.890** | **0.500** | 11/11 positives missed |
+| `discrepancy_severity` | 0.480 | 0.470 | **0.334** | class 3: 0.11, class 1: 0.00 |
+| `churn_risk` | 0.680 | 0.470 | **0.483** | class 0: 0.00 (3/3) |
+| `disposition` | 0.615 | 0.560 | **0.464** | class 3: 0.00 (13/13) |
+| `outcome` | 0.630 | 0.500 | 0.581 | class 0: 0.00 (5/5) |
+| `action` | 0.640 | 0.415 | 0.516 | 5 classes, half the cases |
+| `severity` | 0.690 | 0.490 | 0.523 | 5 classes |
+
+The pattern is consistent: the model almost never predicts the **rarest, most
+severe** class. Loss is unweighted cross-entropy over an imbalanced label
+distribution, so "no duplicate" is overwhelmingly rewarded. **Prediction
+classes are produced by argmax, which temperature scaling cannot fix** —
+calibration corrects NLL/ECE, not the decision rule.
+
+### Truncation is not a cause (a hypothesis killed)
+
+| measure | value |
+|---|---|
+| fields > 256 tokens | **7.01%** (1525 / 21750) |
+| field tokens | mean 48, p50 13, p90 145, p99 378, max 603 |
+| fields per sample | mean 10.9, max 15 (MAX_FIELDS=16 merges, never drops) |
+
+A 7% clip rate against a measured ~11% cost from truncation cannot explain a
+26% error rate. The "separate embeddings can't do cross-field reasoning"
+mechanism is partly real but **not** the dominant error source.
+
+### What is worth fixing
+
+The head and the teacher fail on *different* questions, which localizes the
+headroom:
+
+| qid | ours | teacher | reading |
+|---|---|---|---|
+| `discrepancy_severity` | 0.400 | **0.900** | real gap (−50pp) — invoice reconciliation |
+| `matches_order` | 0.600 | **1.000** | real gap (−40pp) — invoice reconciliation |
+| `needs_human` | 0.550 | 0.700 | ours worse |
+| `churn_risk` | 0.650 | 0.750 | ours worse |
+| `needs_review` | **0.950** | 0.650 | ours better (+30pp) |
+| `disposition` | **0.750** | 0.500 | ours better (+25pp) |
+| `credential_compromise` | **0.850** | 0.600 | ours better (+25pp) |
+
+Both regressions are the invoice questions (comparing invoice vs purchase order
+vs delivery), where the teacher scores 0.9–1.0 — so those labels **are**
+learnable and that is genuine headroom.
+
+### Next (revised)
+
+1. **Report balanced accuracy, not accuracy.** Plain accuracy was inflated
+   ~20pp by the base rate; use it as the headline from here on.
+2. **Class-weighted loss** (+ balanced sampling) to attack the collapse above.
+   Targets `discrepancy_severity` / `matches_order` too (documented headroom).
+   Cheap, and requires no architecture change.
+3. **Ordinal decoding for `score`** (round(expected) vs argmax, tuned on the
+   calibration split) — the head already computes `expected`.
+4. **Do NOT** build one-sequence encoding or swap the encoder: the ceiling is
+   ~74% and we are at ~72% on the sample.
+5. Still worth measuring: a second seed (the +2.9pp LoRA gain is inside noise),
+   and the full 2,000-decision teacher run (~659k input tokens, under $0.10).
+
 ## Running on a GPU server (fresh clone)
 
 The backbone-adaptation experiment is self-contained (only HF downloads needed):
@@ -209,13 +309,16 @@ Notes:
 
 ## Next
 
-1. **Close the remaining ~7pp to Laya** (69.2% vs 76.6%). Frozen-vs-adapted is
-   now measured and worth only +2.9pp, so the next suspects are the ones left
-   untested: one sequence per sample, a `ModernBert`/long-context encoder, and
-   the 12-vs-6 epoch schedule.
+Superseded by **Phase 0** above — the "~7pp to Laya" framing below was
+miscalibrated (the measured ceiling is ~74%, and we are at ~72% on the same
+items). Kept for the trail:
+
+1. ~~Close the remaining ~7pp to Laya (69.2% vs 76.6%)~~ — **dropped**: 76.6%
+   is Laya's number on the *official* split and is not comparable to ours.
 2. **Merge the LoRA into the encoder** so the adapted model can actually be
    served — today the checkpoint only loads through PEFT (see caveats).
-3. Test **joint state+question encoding** (one sequence) vs our separate
-   embeddings — cheap, still open.
+3. ~~Test joint state+question encoding (one sequence)~~ — **dropped**: two
+   different architectures both land in the low 70s.
 4. Adopt this real-only + typed-decisions setup as the standard experiment
-   harness (52 s per run frozen; 2.1 h adapted).
+   harness (52 s per run frozen; 2.1 h adapted) — **with balanced accuracy**
+   report as the headline metric.
