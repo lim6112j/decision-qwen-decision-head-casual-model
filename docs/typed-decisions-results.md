@@ -278,9 +278,8 @@ are the one place with real, learnable headroom.
 Superseded by **Phase 0b's Next** below (which stratifies by annotator
 disagreement and deprioritizes the class-weighted loss). Kept for the trail:
 
-1. ~~Report balanced accuracy, not accuracy.~~ Accuracy sits on the annotators'
-   modal vote share (Phase 0b), so it is not the misleading part; keep it as the
-   headline.
+1. ~~Report balanced accuracy, not accuracy.~~ Plain accuracy was inflated
+   ~20pp by the base rate; use it as the headline from here on.
 2. **Class-weighted loss** (+ balanced sampling) to attack the collapse above.
    Targets `discrepancy_severity` / `matches_order` too (documented headroom).
    Cheap, and requires no architecture change.
@@ -291,13 +290,13 @@ disagreement and deprioritizes the class-weighted loss). Kept for the trail:
 5. Still worth measuring: a second seed (the +2.9pp LoRA gain is inside noise),
    and the full 2,000-decision teacher run (~659k input tokens, under $0.10).
 
-## Phase 0b — annotator disagreement is the ceiling, and a `qid` bug hid the break-down (2026-10-14)
+## Phase 0b — annotator disagreement explains the error shape, and a `qid` bug hid the break-down (2026-10-14)
 
 The parquet carries the annotators' own statistics, so the ambiguity above does
 not have to be inferred from a teacher. Two things came out of auditing them;
 the second invalidated the per-question break-downs printed in Phase 0.
 
-### Annotator disagreement, not mislabeled golds, sets the ceiling
+### Annotator disagreement predicts where we lose accuracy — it is not a ceiling
 
 The parquet carries per-decision annotation statistics. Their **names mislead**
 — an earlier draft of this section misread one of them — so the meanings below
@@ -320,7 +319,7 @@ from the other fields, so nothing keys on it.)
 What the data does show is heavy annotator disagreement, and our accuracy tracks
 it almost linearly:
 
-| annotator disagreement | n | mean modal vote share | ours |
+| annotator disagreement | n | mean plurality share | ours |
 |---|---|---|---|
 | `total_variation` [0.00, 0.05) | 335 | 0.897 | **86.0%** |
 | [0.05, 0.15) | 608 | 0.698 | 74.8% |
@@ -331,13 +330,19 @@ it almost linearly:
 The teacher follows the same curve on the balanced 400-item sample: 83.7% where
 annotators agree, 57.7% mid, **51.9%** where they are split.
 
-**The ceiling is the modal vote share.** An oracle that always predicted the
-annotators' own modal answer would score the mean modal share, **0.659**. We
-score **69.2%** — already at that level — so the bulk of the remaining error
-lives where the annotators did not agree and no model can be reliably right.
+**The mean modal vote share is 0.659 — but that is not a ceiling.** An earlier
+draft read it as one; the arithmetic rules it out. The stored gold *is* the
+annotators' modal answer — **94.2%** of the time, **98.5%** if the modal answer
+is taken as `argmax(probabilities)` — so an oracle that returned the modal
+answer would score ~94%, not 66%. 0.659 is the average *plurality share*, and
+it would equal the achievable accuracy only if the gold always tracked the
+modal share at exactly that value. **We are ~25pp below the label-side
+oracle**, and the teacher (69.3% on the balanced sample) is no closer — the
+headroom is real and neither model has taken it.
 
-That is a per-question statement, though, and the useful split is by
-disagreement. Where annotators agree, errors are real model failures:
+The *shape* of the error is still per-question, and it still tracks
+disagreement: harder items are where we lose accuracy. But "harder" is not
+"unanswerable". Where annotators agree, errors are unambiguous model failures:
 
 | question_id | mean tv | ours | teacher | reading |
 |---|---|---|---|---|
@@ -346,15 +351,14 @@ disagreement. Where annotators agree, errors are real model failures:
 | `customer_service:churn_risk` | 0.194 | 0.680 | 0.750 | some headroom |
 | `customer_service:needs_human` | 0.170 | 0.700 | 0.700 | level |
 | `security_incidents:credential_compromise` | 0.142 | 0.730 | 0.600 | ours better |
-| `agent_trace_observability:outcome` | 0.265 | 0.630 | 0.600 | noise-limited |
+| `agent_trace_observability:outcome` | 0.265 | 0.630 | 0.600 | low agreement, hard |
 | `invoice_processing:disposition` | 0.304 | 0.480 | 0.550 | both near majority (0.450) |
-| `customer_service:action` | **0.316** | 0.610 | 0.650 | noise-limited |
+| `customer_service:action` | **0.316** | 0.610 | 0.650 | low agreement, hard |
 
 `matches_order` is the clean case: annotators essentially agree (tv 0.121, 100%
 gold == majority), the teacher gets 19/20, we get 12/20. `discrepancy_severity`
-is a weaker version of the same. So the earlier "class-weighted loss" idea is
-only worth it on those — not on the high-`total_variation` questions, where
-there is no consensus to learn.
+is a weaker version of the same. Both sit where the annotators agree, so an
+error there is unambiguously the model's, not a disagreement it cannot resolve.
 
 ### `qid` is only unique within a workflow — 15 names, 20 questions
 
@@ -397,9 +401,9 @@ benign-looking number.
 The **rarest, most severe class is almost never predicted** (0.00 recall on
 8–11 items) — the unweighted-CE prior problem is real and now has exact numbers.
 But it is entangled with annotator disagreement above: several of those rare
-classes are also the ones the annotators were most split on, so how much of the
-collapse a weighted loss could recover is unknown until it is tried on the
-low-`total_variation`, high-agreement questions.
+classes are also the ones the annotators were most split on, so the weighted
+loss should be checked separately on the low-`total_variation`, high-agreement
+questions rather than assumed to transfer.
 
 ### Corrected head-to-head (balanced 400-item sample: 20 per real question)
 
@@ -425,13 +429,15 @@ worst questions; at 20 items that noise collapses to −5pp / +40pp.)
 
 ### Next (Phase 0b revision)
 
-1. **Stratify evaluation by `total_variation`.** The headline 69.2% mixes
-   questions the annotators agreed on with ones they split; the first is a
-   meaningful model score and the second is mostly noise. Report both.
+1. **Stratify evaluation by `total_variation`.** Accuracy falls monotonically
+   with it (86.0% → 51.4%), so it is the right axis to report the headline
+   against. It is a difficulty gradient, not an impossibility boundary: the
+   label-side oracle is ~94% overall, so "the annotators were split" does not
+   mean the item is unanswerable.
 2. **`matches_order` is the target** — annotators agree (tv 0.121), the teacher
    gets 0.95, we get 0.57. `discrepancy_severity` second.
-3. **Class-weighted loss: worth a try only on the high-agreement questions.**
-   Where annotators split there is no consensus for it to recover.
+3. **Class-weighted loss** for the rare-class collapse (0.00 recall on 8–11
+   items), checked against where those rare classes sit on `total_variation`.
 4. ~~One-sequence encoding / encoder swap~~ — still dropped (Phase 0).
 5. **Do NOT re-label by majority vote** — the stored gold already *is* the
    majority 94.2% of the time (an earlier draft argued the opposite from a
@@ -491,8 +497,7 @@ Notes:
 
 Superseded by **Phase 0 / Phase 0b** above — the "~7pp to Laya" framing below
 was miscalibrated (the measured ceiling is ~74%, we are level with the teacher
-on the balanced sample, and our accuracy already sits on the annotators' modal
-vote share). Kept for the trail:
+on the balanced sample, and the labels are not mislabeled). Kept for the trail:
 
 1. ~~Close the remaining ~7pp to Laya (69.2% vs 76.6%)~~ — **dropped**: 76.6%
    is Laya's number on the *official* split and is not comparable to ours.
