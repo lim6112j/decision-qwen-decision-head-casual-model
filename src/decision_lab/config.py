@@ -97,6 +97,9 @@ class DynamicHeadConfig:
     # (generalization) at integer weight `real_weight`.
     real_data_path: str = ""
     real_weight: int = 1
+    # Train ONLY on the real samples (skip the synthetic bank). A sub-path
+    # experiment: a separate head per problem, with no shared-bank interference.
+    real_only: bool = False
     # Add shape-variant duplicates of document states (flattened /
     # marker-stripped, same gold — states/shapes.py) to dynamic-head
     # training. The field-set head collapses to near-uniform logits on
@@ -142,6 +145,12 @@ class WebConfig:
     # Capture /api/decide-dynamic calls (opt-in per request via the
     # X-Decision-Lab-Log header) for the real-data labeling pipeline.
     log_traffic: bool = False
+    # Sub-paths: name → dynamic-head checkpoint filename, sharing one backbone.
+    # The caller selects one per /api/decide-dynamic request with the `path`
+    # field — explicit routing, so no learned router and no misrouting. Empty →
+    # the single `dynamic_head.checkpoint_filename` (backwards compatible).
+    paths: dict[str, str] = field(default_factory=dict)
+    default_path: str = ""
 
 
 @dataclass

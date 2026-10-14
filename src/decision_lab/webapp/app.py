@@ -34,7 +34,12 @@ from decision_lab.real.labels import (
 )
 from decision_lab.real.teacher import LabelingError, OpenRouterLabeler
 from decision_lab.states.dataset import TextState, load_dataset
-from decision_lab.webapp.agents import AGENT_INFOS, DynamicHeadAgent, build_agents
+from decision_lab.webapp.agents import (
+    AGENT_INFOS,
+    DynamicHeadAgent,
+    build_agents,
+    load_dynamic_paths,
+)
 from decision_lab.webapp.simulator import evaluate_agent
 from decision_lab.webapp.traffic_log import TrafficLogger
 
@@ -57,6 +62,7 @@ class WebAppState:
         self.cfg = cfg
         self.server: Optional[LlamaServer] = None
         self.agents = {}
+        self.dynamic_paths: dict[str, DynamicHeadAgent] = {}
         self.states: list[TextState] = []
         self.question_spec: dict = {}
         self.run_lock = asyncio.Lock()
@@ -66,8 +72,29 @@ class WebAppState:
         self.server = server_from_config(self.cfg)
         self.server.start()
         self.agents = build_agents(self.cfg, self.server)
+        self.dynamic_paths = load_dynamic_paths(self.cfg, self.server)
         self.question_spec = build_question_spec(self.cfg.questions)
         self.states = self._load_states()
+
+    def resolve_path(self, name: str | None) -> str:
+        """Validate a requested sub-path name → the key to use (or raise).
+
+        None → ``web.default_path`` if set, else the sole path. An unknown name
+        is an error, never a silent fallback (the whole point of explicit
+        routing is that the caller gets the head they asked for).
+        """
+        if name is None:
+            if self.cfg.web.default_path:
+                name = self.cfg.web.default_path
+            elif len(self.dynamic_paths) == 1:
+                return next(iter(self.dynamic_paths))
+            else:
+                raise ValueError(
+                    f"`path` is required: available {sorted(self.dynamic_paths)}")
+        if name not in self.dynamic_paths:
+            raise ValueError(
+                f"unknown path {name!r}; available {sorted(self.dynamic_paths)}")
+        return name
 
     def stop(self) -> None:
         if self.server:
@@ -121,6 +148,10 @@ class DynamicDecideRequest(BaseModel):
     Used verbatim — the caller owns the chunking, so it must match how the
     head was trained (heuristic split via states/fields.py is the default
     when omitted). Ignored for legacy v1 checkpoints (pooled state)."""
+    path: Optional[str] = None
+    """Sub-path name (a key of ``web.paths``) selecting which dynamic head
+    answers this call. Omitted → ``web.default_path``, else the sole path.
+    An unknown name is a 400 (never a silent fallback). See GET /api/paths."""
     questions: list[dict] = Field(min_length=1)
     """Each dict: {"type": "choice", "options": [...], "question": "..."}
        or {"type": "score", "levels": [...], "question": "..."}
@@ -191,6 +222,20 @@ def list_agents():
     return {"agents": [vars(info) for info in AGENT_INFOS]}
 
 
+@app.get("/api/paths")
+def list_paths():
+    """The dynamic-head sub-paths this server offers (one head each, one backbone)."""
+    if state is None:
+        raise HTTPException(status_code=503, detail="server not ready")
+    names = sorted(state.dynamic_paths)
+    default = state.cfg.web.default_path or (names[0] if len(names) == 1 else "")
+    return {
+        "paths": names,
+        "default": default,
+        "backbone": getattr(state.server, "backend_id", ""),
+    }
+
+
 @app.get("/api/states")
 def list_states():
     return {"states": [_state_payload(s) for s in state.states]}
@@ -249,7 +294,11 @@ async def decide_dynamic(req: DynamicDecideRequest, request: Request):
     if state is None:
         raise HTTPException(status_code=503, detail="server not ready")
 
-    dynamic_agent = state.agents.get("head_dynamic")
+    try:
+        path_name = state.resolve_path(req.path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    dynamic_agent = state.dynamic_paths.get(path_name)
     if dynamic_agent is None or not isinstance(dynamic_agent, DynamicHeadAgent):
         raise HTTPException(
             status_code=400,

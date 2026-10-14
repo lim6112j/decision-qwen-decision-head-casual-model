@@ -132,6 +132,12 @@ benchmark:
 # Web UI
 web:
   host: "127.0.0.1"
+  # Dynamic-head sub-paths (each problem gets its own head off one backbone;
+  # see docs/http-api.md). Request `path` selects one; default = doc.
+  paths:
+    doc: "head_dynamic_grid_v3.pt"     # the doc/breakout bank
+    typed: "head_dynamic_typed_v3.pt"  # LocalLLaMA/typed-decisions
+  default_path: "doc"
   port: 8000
   num_states: 8          # pre-generated states offered in the UI
   random_seed: 42

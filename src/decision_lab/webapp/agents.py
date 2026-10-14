@@ -322,12 +322,19 @@ def _load_trained_head(cfg: Config) -> tuple[TypedDecisionHead, dict]:
 
 
 def _load_dynamic_agent(
-    cfg: Config, server, question_spec: dict
+    cfg: Config, server, question_spec: dict,
+    checkpoint_filename: str | None = None,
 ) -> DynamicHeadAgent:
-    """Load a DynamicHeadAgent (trained or fallback to random init)."""
+    """Load a DynamicHeadAgent (trained or fallback to random init).
+
+    ``checkpoint_filename`` selects a sub-path's head; None → the config's
+    single ``dynamic_head.checkpoint_filename``. All sub-paths share one
+    backbone (``server``), so the API can offer several heads off one model.
+    """
     from decision_lab import MODELS_DIR
 
-    path = MODELS_DIR / cfg.dynamic_head.checkpoint_filename
+    path = MODELS_DIR / (checkpoint_filename
+                         or cfg.dynamic_head.checkpoint_filename)
     question_spec_copy = dict(question_spec)
 
     try:
@@ -351,3 +358,24 @@ def _load_dynamic_agent(
         temperature=temperature,
         include_summary_field=cfg.dynamic_head.include_summary_field,
     )
+
+
+def load_dynamic_paths(cfg: Config, server) -> dict[str, DynamicHeadAgent]:
+    """One DynamicHeadAgent per configured sub-path (name → checkpoint).
+
+    Sub-paths let each problem keep its own head — a domain that would degrade
+    a shared head (measured: +typed-decisions dropped the doc bank 0.916 →
+    0.765) is isolated instead. Routing is EXPLICIT (the caller's `path`), so
+    there is no router to misroute. All paths share one backbone.
+
+    Empty ``web.paths`` → a single path keyed "" using
+    ``dynamic_head.checkpoint_filename`` (backwards compatible).
+    """
+    question_spec = build_question_spec(cfg.questions)
+    paths = dict(getattr(cfg.web, "paths", None) or {})
+    if not paths:
+        return {"": _load_dynamic_agent(cfg, server, question_spec)}
+    return {
+        name: _load_dynamic_agent(cfg, server, question_spec, ckpt)
+        for name, ckpt in paths.items()
+    }
