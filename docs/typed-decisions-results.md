@@ -198,6 +198,12 @@ frontier LLM here. Only 12% of items are missed by *both*; the two models
 disagree more than they jointly fail, which is the signature of ambiguous
 labels rather than a systematic weakness either could fix.
 
+**Correction (see Phase 0b below):** this 299-item sample was drawn from the 15
+`qid` names, which are not globally unique — it therefore under-sampled the
+ambiguous questions. On the corrected 400-item sample (20 decisions per real
+question) the identical comparison is **67.0% (ours) vs 69.3% (teacher)**. The
+conclusion is unchanged: the two are level.
+
 **Consequence:** the *one-sequence encoding* test — previously the top
 recommendation for closing the ~10pp Laya gap — is **dropped**. Two different
 architectures converging on the low 70s is not a reason to out-engineer a
@@ -225,6 +231,10 @@ severe** class. Loss is unweighted cross-entropy over an imbalanced label
 distribution, so "no duplicate" is overwhelmingly rewarded. **Prediction
 classes are produced by argmax, which temperature scaling cannot fix** —
 calibration corrects NLL/ECE, not the decision rule.
+
+(`action`, `disposition` and `severity` above were also merged across
+workflows; see Phase 0b. `urgency`, the worst case, is not even in this table
+because its merged bucket hid it.)
 
 ### Truncation is not a cause (a hypothesis killed)
 
@@ -257,9 +267,19 @@ Both regressions are the invoice questions (comparing invoice vs purchase order
 vs delivery), where the teacher scores 0.9–1.0 — so those labels **are**
 learnable and that is genuine headroom.
 
+**Superseded by Phase 0b below.** These gaps were computed with `action` /
+`disposition` / `urgency` merged across workflows and on the unbalanced 299-item
+sample; under correct grouping the invoice gaps shrink (`matches_order` −35pp,
+`discrepancy_severity` −15pp) and `urgency` turns out to be the head's *best*
+relative question. The *direction* holds: the invoice reconciliation questions
+are the one place with real, learnable headroom.
+
 ### Next (revised)
 
-1. **Report balanced accuracy, not accuracy.** Plain accuracy was inflated
+Superseded by **Phase 0b's Next** below (which adds majority-only accuracy and
+deprioritizes the class-weighted loss). Kept for the trail:
+
+1. ~~Report balanced accuracy, not accuracy.~~ Plain accuracy was inflated
    ~20pp by the base rate; use it as the headline from here on.
 2. **Class-weighted loss** (+ balanced sampling) to attack the collapse above.
    Targets `discrepancy_severity` / `matches_order` too (documented headroom).
@@ -270,6 +290,143 @@ learnable and that is genuine headroom.
    ~74% and we are at ~72% on the sample.
 5. Still worth measuring: a second seed (the +2.9pp LoRA gain is inside noise),
    and the full 2,000-decision teacher run (~659k input tokens, under $0.10).
+
+## Phase 0b — the labels are the ceiling, and a `qid` bug hid the break-down (2026-10-14)
+
+The parquet carries the annotators' own statistics, so the ambiguity above does
+not have to be inferred from a teacher. Two things came out of auditing them;
+the second invalidated the per-question break-downs printed in Phase 0.
+
+### ~40% of the test labels are a MINORITY vote — unreachable by design
+
+`label_agreement[qid]["argmax_agree"]` says whether the stored gold equals the
+annotators' majority. It does **not**, for 40.6% of test decisions (812/2000;
+train 35.3%). Those golds are a label that lost the vote, so any model answering
+their *natural* question is scored wrong:
+
+| gold is the… | n | ours (ft15) | teacher (same sample) |
+|---|---|---|---|
+| annotators' majority | 1188 | **78.9%** | 81.7% |
+| a minority label | **812 (40.6%)** | **55.2%** | 50.3% |
+
+Our head **beats the teacher on the minority labels** (55.2% vs 50.3%). Two
+independent models both landing near chance on the same items is the signature
+of unreachable labels, not of headroom either could close.
+
+Accuracy tracks the chosen label's vote fraction monotonically — a clean noise
+curve, not a capability cliff:
+
+| vote fraction | n | ours | teacher |
+|---|---|---|---|
+| [0.00, 0.40) | 591 | 57.0% | – |
+| [0.40, 0.50) | 345 | 64.1% | – |
+| [0.50, 0.60) | 324 | 72.8% | – |
+| [0.60, 0.80) | 366 | 75.1% | – |
+| [0.80, 0.95) | 255 | 83.5% | – |
+| [0.95, 1.01) | 119 | **86.6%** | 98.7% |
+
+Summarised for the teacher sample (n=400): where annotators are split the
+teacher scores **51.1%**; where they agree [0.8, 1.0] it scores **98.7%**.
+Mean between-annotator total variation is 0.202 (p90 0.444).
+
+**Consequence:** the accuracy a model can reach is bounded by how often the gold
+is the majority — **59.4%** if it always matched the annotators' vote. Our 69.2%
+is above that only because the head sometimes reproduces the *specific* minority
+choice. So the honest headline on this data is majority-only accuracy (77.7%) or
+balanced accuracy, and the residual error is at least partly unmeasurable label
+noise — which is why the class-weighted loss proposed in Phase 0 is now
+**deprioritized**: it cannot recover labels that are minority votes.
+
+### `qid` is only unique within a workflow — 15 names, 20 questions
+
+Three `qid` names appear in more than one workflow and mean different questions:
+
+| qid | workflows | differs how |
+|---|---|---|
+| `urgency` | all 4 | four different phrasings ("how quickly does this trace need attention" vs "how time-sensitive is this conversation" vs …) |
+| `action` | agent_trace_observability (4 options), customer_service (5) | different question + answer space |
+| `disposition` | invoice_processing, security_incidents | "this vendor invoice" vs "this security alert" |
+
+`scripts/convert_typed_decisions.py` keyed questions only by
+`(type, options, instructions)` and dropped `workflow`, and every eval script
+bucketed by bare `qid`. So `urgency` (four questions) was reported as one, and
+its accuracy was an artifact of mixing four answer distributions. The converted
+JSONL now carries `question_id = "{workflow}:{qid}"`; eval/teacher/diagnostic
+scripts key on that. **2000 test decisions: 15 `qid` → 20 `question_id`.**
+
+### Corrected per-question break-down (ours, 100 decisions each)
+
+This is the table Phase 0's "majority-class collapse" section should have shown.
+The sharpest failure, `urgency`, was invisible before: its merged bucket averaged
+the four workflows into a benign-looking number.
+
+| question_id | acc | majority | balanced acc | worst class recall |
+|---|---|---|---|---|
+| `invoice_processing:duplicate` | 0.890 | **0.890** | **0.500** | 11/11 positives missed |
+| `security_incidents:urgency` | 0.610 | 0.500 | **0.361** | class 0: 0.00, class 1: 0.15 |
+| `invoice_processing:disposition` | 0.480 | 0.450 | **0.339** | class 3: 0.00 (5/5) |
+| `invoice_processing:discrepancy_severity` | 0.480 | 0.470 | **0.334** | class 1: 0.00 (1/1), class 3: 0.11 |
+| `security_incidents:disposition` | 0.750 | **0.740** | **0.373** | class 0: 0.00 (3/3), class 3: 0.00 (8/8) |
+| `customer_service:action` | 0.610 | 0.520 | **0.440** | class 3: 0.00 (7/7) |
+| `customer_service:churn_risk` | 0.680 | 0.470 | **0.483** | class 0: 0.00 (3/3) |
+| `agent_trace_observability:action` | 0.670 | 0.360 | 0.506 | class 3: 0.00 (2/2) |
+| `agent_trace_observability:outcome` | 0.630 | 0.500 | 0.581 | class 0: 0.00 (5/5) |
+| `security_incidents:severity` | 0.690 | 0.490 | 0.523 | class 0: 0.00 (1/1) |
+| `customer_service:needs_human` | 0.700 | 0.670 | 0.630 | class 0: 0.42 |
+
+The **rarest, most severe class is almost never predicted** (0.00 recall on
+8–11 items) — the unweighted-CE prior problem is real and now has exact numbers.
+But it is entangled with the minority-label rate above: several of those rare
+classes are also the ones annotators were split on.
+
+### Corrected head-to-head (balanced 400-item sample: 20 per real question)
+
+Re-running the teacher on 20 decisions per `question_id` — the earlier
+stratification gave the four `urgency` questions 6–13 items each — gives ours
+**67.0% vs teacher 69.3%** (−2.3pp, SE ~2.3pp → still not distinguishable).
+
+| question_id | ours | teacher | diff |
+|---|---|---|---|
+| `security_incidents:urgency` | 0.500 | 0.550 | −0.05 |
+| `agent_trace_observability:urgency` | **0.600** | 0.200 | **+0.400** |
+| `agent_trace_observability:needs_review` | **0.850** | 0.550 | +0.300 |
+| `security_incidents:disposition` | **0.800** | 0.750 | +0.05 |
+| `invoice_processing:matches_order` | 0.600 | **0.950** | **−0.350** |
+| `customer_service:urgency` | 0.450 | 0.650 | −0.200 |
+| `customer_service:churn_risk` / `:needs_human` | 0.600 / 0.550 | 0.750 / 0.700 | −0.150 |
+| `invoice_processing:discrepancy_severity` | 0.700 | 0.850 | −0.150 |
+
+`matches_order` is the one large, unambiguous, learnable gap (the teacher gets
+19/20 and we get 12/20). Prediction agreement is 68%; 18% of items are missed by
+both. (The two `urgency` questions at ±8 items looked like the head's best and
+worst questions; at 20 items that noise collapses to −5pp / +40pp.)
+
+### Next (Phase 0b revision)
+
+1. **Report majority-only and balanced accuracy alongside plain accuracy.**
+   Plain accuracy is bounded by the 59.4% majority rate and inflated by it.
+2. **Deprioritize class-weighted loss** — the collapse is partly label noise it
+   cannot fix. If tried, evaluate on balanced accuracy and per-class recall, not
+   accuracy.
+3. **`matches_order` / invoice reconciliation is the real target** — the
+   documented, learnable gap.
+4. ~~One-sequence encoding / encoder swap~~ — still dropped (Phase 0).
+5. **Consider a majority-vote re-labeling pass** before spending more GPU: if
+   the benchmark's own gold is a minority vote 40% of the time, no model can
+   chase it, and training on it teaches the head to guess.
+
+### Reproduce
+
+```bash
+# per-question ambiguity + accuracy-vs-vote-fraction + majority/minority split
+HF_HOME=models/.cache/huggingface CUDA_VISIBLE_DEVICES=1 \
+  uv run python results_ft_bge/label_audit.py
+
+# balanced teacher sample (20 per question_id) + head-to-head on the same items
+uv run python results_ft_bge/teacher_ceiling.py --per-qid 20
+HF_HOME=models/.cache/huggingface CUDA_VISIBLE_DEVICES=1 \
+  uv run python results_ft_bge/compare_sample.py
+```
 
 ## Running on a GPU server (fresh clone)
 
@@ -309,9 +466,10 @@ Notes:
 
 ## Next
 
-Superseded by **Phase 0** above — the "~7pp to Laya" framing below was
-miscalibrated (the measured ceiling is ~74%, and we are at ~72% on the same
-items). Kept for the trail:
+Superseded by **Phase 0 / Phase 0b** above — the "~7pp to Laya" framing below
+was miscalibrated (the measured ceiling is ~74%, we are level with the teacher
+on the balanced sample, and ~40% of the gold labels are minority votes). Kept
+for the trail:
 
 1. ~~Close the remaining ~7pp to Laya (69.2% vs 76.6%)~~ — **dropped**: 76.6%
    is Laya's number on the *official* split and is not comparable to ours.

@@ -93,7 +93,13 @@ def main() -> None:
             gold = it["question"]["options"][int(gold)]
         ok = is_correct_dynamic(it["question"], pred["predicted"], gold)
         n_ok += ok
-        for k in ("__all__", it["question"]["type"], it["qid"], it["workflow"]):
+        # Per-question buckets key on question_id: the raw qid is only unique
+        # WITHIN a workflow (e.g. `urgency` exists in all four workflows as
+        # four different questions), so bucketing by qid would silently merge
+        # them. The name is namespaced ("{workflow}:{qid}") but still reads
+        # as the qid it came from (see convert_typed_decisions.py).
+        question_id = it.get("question_id") or f"{it['workflow']}:{it['qid']}"
+        for k in ("__all__", it["question"]["type"], question_id, it["workflow"]):
             total[k] += 1
             correct[k] += ok
 
@@ -101,7 +107,8 @@ def main() -> None:
     for label_, keys in (
         ("type", sorted({it["question"]["type"] for it in items})),
         ("workflow", sorted({it["workflow"] for it in items})),
-        ("qid", sorted({it["qid"] for it in items})),
+        ("question_id", sorted({it.get("question_id") or
+                                f"{it['workflow']}:{it['qid']}" for it in items})),
     ):
         print(f"-- by {label_} --")
         for k in keys:

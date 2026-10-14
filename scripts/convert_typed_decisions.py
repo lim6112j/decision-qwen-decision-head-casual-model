@@ -3,11 +3,22 @@
 
 One output row per (case, question):
 
-    {"id","workflow","qid","text","question":{type,options|levels,question},"gold_idx","option_keys"}
+    {"id","workflow","qid","question_id","text","question":{...},"gold_idx","option_keys"}
 
 `text` is the case's JSON state (our field splitter chunks JSON per leaf);
 `question` is our serving-format config so the row can be fed straight to the
 head. Used to measure the head on real typed-decision data (OOD).
+
+**`qid` is NOT globally unique — it is only unique within a workflow.** Three
+names collide across workflows and mean genuinely different questions:
+
+    action       agent_trace_observability (4 opts) vs customer_service (5 opts)
+    disposition  invoice_processing vs security_incidents
+    urgency      all four workflows (four different phrasings)
+
+15 distinct qids are therefore 19 distinct questions on the test split. Every
+row additionally carries `question_id = "{workflow}:{qid}"`, which IS globally
+unique, and that is what anything grouping "per question" must key on.
 
 Their schema (verified 2026-10-13):
   choice.qdef.criteria = {option_key: description}          → options = descriptions
@@ -69,6 +80,16 @@ def _gold_index(kind: str, label, keys: list[str] | None) -> int | None:
         return None
 
 
+def question_id(workflow: str, qid: str) -> str:
+    """Globally-unique question name: workflow-scoped qid.
+
+    `qid` alone is only unique within a workflow (see the module docstring),
+    so `(workflow, qid)` is the identity of a question. The namespace is kept
+    in the name so a bare qid is still recoverable via `rsplit(":", 1)[-1]`.
+    """
+    return f"{workflow}:{qid}"
+
+
 def _labels_row(rec: dict) -> dict:
     """Our LabelItem-shaped row (for the real-traffic `build-real` pipeline)."""
     from decision_lab.real.labels import make_item_id
@@ -77,7 +98,7 @@ def _labels_row(rec: dict) -> dict:
     kind = q["type"]
     options = q["options"] if kind == "choice" else (
         q["levels"] if kind == "score" else ["false", "true"])
-    question = q.get("question") or rec["qid"]
+    question = q.get("question") or rec["question_id"]
     return {
         "item_id": make_item_id(rec["text"], None, question, options, kind),
         "call_id": rec["id"], "text": rec["text"], "question": question,
@@ -103,6 +124,7 @@ def convert(parquet_paths: list[str], out_path: str, labels_out: str | None = No
                     continue
                 rec = {
                     "id": row["id"], "workflow": row["workflow"], "qid": qid,
+                    "question_id": question_id(row["workflow"], qid),
                     "text": row["state"], "question": cfg, "gold_idx": gold_idx,
                 }
                 if keys is not None:
