@@ -469,13 +469,14 @@ def train_dynamic_head(
           f"calibration holdout: {calib_n} "
           f"(stage-1 pool: {len(stage1_pool)})")
 
-    # Model — v4 question-field attention architecture
+    # Model — v3 (film) or v4 question-field attention architecture
     model = DynamicDecisionHead(
         input_dim=1024,
         hidden_dim=hc.hidden_dim,
         d_k=hc.d_k,
         dropout=hc.dropout,
         state_set=True,
+        film=getattr(hc, "film", False),
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=hc.learning_rate, weight_decay=hc.weight_decay)

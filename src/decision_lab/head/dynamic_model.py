@@ -181,12 +181,16 @@ class DynamicDecisionHead(nn.Module):
         d_k: int = D_K,
         dropout: float = 0.1,
         state_set: bool = False,
+        film: bool = False,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.d_k = d_k
         self.state_set = state_set
+        # v3: question-conditioned FiLM instead of v4's question-field
+        # attention (see the film branch below).
+        self.film = film
 
         if state_set:
             # v2 field-set cross-attention (shared option path)
@@ -204,53 +208,71 @@ class DynamicDecisionHead(nn.Module):
             # small random projections), softmax is uniform, every option
             # reads the same mean field, and training stalls at ln(n_max).
             self.attn_scale = nn.Parameter(torch.tensor(float(d_k) ** 0.5))
-            # v4 question-field attention: the question reads the SAME field
-            # keys via its own cosine-attention query. attn_scale_q is a
-            # SEPARATE scale from attn_scale (sharing would couple the two
-            # heads' softmax temperature).
-            self.q_question = nn.Linear(input_dim, d_k)
-            self.attn_scale_q = nn.Parameter(torch.tensor(float(d_k) ** 0.5))
-            # v4 question-conditioned option queries: the question's attended
-            # field context (z_q) shifts every option's query before it reads
-            # the field set. This is the per-option steering the task needs:
-            # the SAME option text must match a different field under a
-            # different question (breakout "left" matches the ball's POSITION
-            # field for paddle_direction but must not be pulled by the
-            # "moving right" MOTION field). A per-field bias shared across
-            # options cannot do that — measured: small bias leaves the
-            # distractor winning (paddle_direction 0.68 vs v3's 0.98), large
-            # bias homogenizes every option onto one field (identical logits
-            # for all options, the symmetric plateau), and the learned scale
-            # settles at roughly half attn_scale, i.e. between the two.
-            # Zero-init (weight AND bias) → gate 0, shift 0 → identity at init.
-            # The (1 + gate) form is load-bearing for the same reason it was in
-            # v3: a bare gate * opt_query would be normalize(0) at init → NaN.
-            # The multiplicative gate is what a purely additive shift lacks —
-            # it reshapes each option's query per dimension (amplify/suppress),
-            # not just translates it, which is the expressiveness v3's FiLM had
-            # for the breakout position-vs-motion discrimination.
-            self.q_query_gate = nn.Linear(hidden_dim, d_k)
-            self.q_query_shift = nn.Linear(hidden_dim, d_k)
-            for lin in (self.q_query_gate, self.q_query_shift):
-                nn.init.zeros_(lin.weight)
-                nn.init.zeros_(lin.bias)
-            # Zero-init residual read-out: at init, output == v2 forward for
-            # ANY question (stall-recurrence guard). LoRA-style bootstrap —
-            # first Linear default-init, GELU, LAST Linear zero-init:
-            # identity at init holds, the last layer's gradient is alive at
-            # init (grad ⊗ GELU(first(x)) ≠ 0), and the first layer follows
-            # once the last moves off zero.
-            # The GELU nonlinearity is load-bearing: with a purely linear
-            # read-out into the linear score_head, the question component
-            # v·W2·z_q is constant across options and cancels in the softmax
-            # over options — the question could never flip an argmax.
-            self.qz_readout = nn.Sequential(
-                nn.Linear(2 * hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, hidden_dim),
-            )
-            nn.init.zeros_(self.qz_readout[2].weight)
-            nn.init.zeros_(self.qz_readout[2].bias)
+            if film:
+                # v3: question-conditioned FiLM — the question embedding
+                # modulates each option's query (q_mod_scale/bias) and the
+                # attended read-out (z_mod_scale/bias). Zero-init → starts
+                # as v2 and learns the conditioning. Simpler than v4's
+                # question-field attention and, on a SINGLE fixed problem,
+                # strictly better: v3 measured 98.0 on breakout vs v4's
+                # 94.0 — v4's machinery buys unseen-QUESTION generalization,
+                # which a single-problem system never uses and pays for.
+                self.q_mod_scale = nn.Linear(input_dim, d_k)
+                self.q_mod_bias = nn.Linear(input_dim, d_k)
+                self.z_mod_scale = nn.Linear(input_dim, hidden_dim)
+                self.z_mod_bias = nn.Linear(input_dim, hidden_dim)
+                for _lin in (self.q_mod_scale, self.q_mod_bias,
+                             self.z_mod_scale, self.z_mod_bias):
+                    nn.init.zeros_(_lin.weight)
+                    nn.init.zeros_(_lin.bias)
+            else:
+                                # v4 question-field attention: the question reads the SAME field
+                # keys via its own cosine-attention query. attn_scale_q is a
+                # SEPARATE scale from attn_scale (sharing would couple the two
+                # heads' softmax temperature).
+                self.q_question = nn.Linear(input_dim, d_k)
+                self.attn_scale_q = nn.Parameter(torch.tensor(float(d_k) ** 0.5))
+                # v4 question-conditioned option queries: the question's attended
+                # field context (z_q) shifts every option's query before it reads
+                # the field set. This is the per-option steering the task needs:
+                # the SAME option text must match a different field under a
+                # different question (breakout "left" matches the ball's POSITION
+                # field for paddle_direction but must not be pulled by the
+                # "moving right" MOTION field). A per-field bias shared across
+                # options cannot do that — measured: small bias leaves the
+                # distractor winning (paddle_direction 0.68 vs v3's 0.98), large
+                # bias homogenizes every option onto one field (identical logits
+                # for all options, the symmetric plateau), and the learned scale
+                # settles at roughly half attn_scale, i.e. between the two.
+                # Zero-init (weight AND bias) → gate 0, shift 0 → identity at init.
+                # The (1 + gate) form is load-bearing for the same reason it was in
+                # v3: a bare gate * opt_query would be normalize(0) at init → NaN.
+                # The multiplicative gate is what a purely additive shift lacks —
+                # it reshapes each option's query per dimension (amplify/suppress),
+                # not just translates it, which is the expressiveness v3's FiLM had
+                # for the breakout position-vs-motion discrimination.
+                self.q_query_gate = nn.Linear(hidden_dim, d_k)
+                self.q_query_shift = nn.Linear(hidden_dim, d_k)
+                for lin in (self.q_query_gate, self.q_query_shift):
+                    nn.init.zeros_(lin.weight)
+                    nn.init.zeros_(lin.bias)
+                # Zero-init residual read-out: at init, output == v2 forward for
+                # ANY question (stall-recurrence guard). LoRA-style bootstrap —
+                # first Linear default-init, GELU, LAST Linear zero-init:
+                # identity at init holds, the last layer's gradient is alive at
+                # init (grad ⊗ GELU(first(x)) ≠ 0), and the first layer follows
+                # once the last moves off zero.
+                # The GELU nonlinearity is load-bearing: with a purely linear
+                # read-out into the linear score_head, the question component
+                # v·W2·z_q is constant across options and cancels in the softmax
+                # over options — the question could never flip an argmax.
+                self.qz_readout = nn.Sequential(
+                    nn.Linear(2 * hidden_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+                nn.init.zeros_(self.qz_readout[2].weight)
+                nn.init.zeros_(self.qz_readout[2].bias)
         else:
             # v1: pooled-state attention (legacy, kept for checkpoint compat)
             self.trunk = nn.Sequential(
@@ -275,6 +297,55 @@ class DynamicDecisionHead(nn.Module):
             return state_embedding.unsqueeze(0), 1                # (M, D) unbatched
         return state_embedding, state_embedding.shape[0]
 
+    def _forward_film_set(
+        self,
+        state_embedding: torch.Tensor,
+        option_embeddings: torch.Tensor,
+        state_mask: torch.Tensor | None = None,
+        question_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """v3 core: question-modulated option queries read the field set.
+
+        The question embedding FiLM-modulates each option's cosine-attention
+        query (q_mod_scale/bias) and the attended read-out (z_mod_scale/bias).
+        Both are zero-init, so the head starts as v2 and learns the
+        conditioning. Cheaper than v4's question-field attention, and on a
+        single fixed problem strictly better (v3 = 98.0 on breakout vs v4's
+        94.0; v4's machinery is for unseen-QUESTION generalization).
+
+        question_emb=None → zero vector (a learned constant modulation).
+        """
+        state, batch_size = self._normalize_state_set(state_embedding)
+        if option_embeddings.dim() == 2:
+            option_embeddings = option_embeddings.unsqueeze(0)    # (1, N, D)
+        if option_embeddings.shape[0] == 1 and batch_size > 1:
+            option_embeddings = option_embeddings.expand(batch_size, -1, -1)
+
+        if question_emb is None:
+            question_emb = torch.zeros(
+                batch_size, self.input_dim, device=state.device, dtype=state.dtype,
+            )
+        elif question_emb.dim() == 1:
+            question_emb = question_emb.unsqueeze(0).expand(batch_size, -1)
+
+        field_repr = self.field_enc(state)                        # (B, M, H)
+        K = F.normalize(self.field_key(field_repr), dim=-1)       # (B, M, d_k)
+        Q_opt = self.opt_query(option_embeddings)                 # (B, N, d_k)
+        gate = self.q_mod_scale(question_emb).unsqueeze(1)        # (B, 1, d_k)
+        shift = self.q_mod_bias(question_emb).unsqueeze(1)        # (B, 1, d_k)
+        Q = F.normalize((1.0 + gate) * Q_opt + shift, dim=-1)     # (B, N, d_k)
+
+        attn = torch.bmm(Q, K.transpose(1, 2)) * self.attn_scale
+        if state_mask is not None:
+            mask = state_mask.unsqueeze(0) if state_mask.dim() == 1 else state_mask
+            attn = attn.masked_fill(~mask.unsqueeze(1), float("-inf"))
+        alpha = torch.softmax(attn, dim=-1)                       # over fields
+        z = torch.bmm(alpha, field_repr)                          # (B, N, H)
+        z_gate = self.z_mod_scale(question_emb).unsqueeze(1)      # (B, 1, H)
+        z_shift = self.z_mod_bias(question_emb).unsqueeze(1)      # (B, 1, H)
+        z = (1.0 + z_gate) * z + z_shift                          # (B, N, H)
+        return self.score_head(z).squeeze(-1)                     # (B, N)
+
     def _forward_attention_set(
         self,
         state_embedding: torch.Tensor,
@@ -298,6 +369,10 @@ class DynamicDecisionHead(nn.Module):
                 embedding, or None for an empty question (zero vector — a
                 learned constant query, trained on empty-question samples).
         """
+        if self.film:
+            return self._forward_film_set(
+                state_embedding, option_embeddings, state_mask, question_emb,
+            )
         state, batch_size = self._normalize_state_set(state_embedding)
         if option_embeddings.dim() == 2:
             option_embeddings = option_embeddings.unsqueeze(0)    # (1, N, D)
@@ -611,7 +686,10 @@ def save_dynamic_head(
             "arch": {
                 "type": "dynamic",
                 "state_set": model.state_set,
-                "arch_version": 4,
+                # v3 = question-conditioned FiLM (single-problem optimal);
+                # v4 = question-field attention (unseen-question generalization).
+                "arch_version": 3 if model.film else 4,
+                "film": model.film,
                 "input_dim": model.input_dim,
                 "hidden_dim": model.hidden_dim,
                 "d_k": model.d_k,
@@ -641,23 +719,25 @@ def load_dynamic_head(
             f"(arch.type={arch.get('type', 'missing')})"
         )
     arch_version = arch.get("arch_version", 2)
-    if arch_version < 4:
+    if arch_version < 3:
         raise ValueError(
             f"Checkpoint at {path} is arch_version {arch_version}; this "
-            f"build only loads v4 question-attention heads. v1-v3 "
-            f"checkpoints are preserved (main checkout models/ + backups) "
-            f"but require their own release to serve — no silent upgrade."
+            f"build loads v3 (FiLM) and v4 (question-attention) heads. "
+            f"v1/v2 checkpoints are preserved (models/ + backups) but need "
+            f"their own release — no silent upgrade."
         )
     if not arch.get("state_set", False):
         raise ValueError(
-            f"Checkpoint at {path} is a v4 non-state_set head — v4 implies "
-            f"state_set=True (question-field attention requires field sets)."
+            f"Checkpoint at {path} is not a field-set head — v3/v4 imply "
+            f"state_set=True (both read field sets)."
         )
+    film = bool(arch.get("film", arch_version == 3))
     model = DynamicDecisionHead(
         input_dim=arch.get("input_dim", 1024),
         hidden_dim=arch.get("hidden_dim", 256),
         d_k=arch.get("d_k", D_K),
         state_set=True,
+        film=film,
     )
     model.load_state_dict(checkpoint["model_state"])
     if device is not None:

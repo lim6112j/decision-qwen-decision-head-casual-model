@@ -68,6 +68,10 @@ class DynamicHeadConfig:
     weight_decay: float = 1e-5
     batch_size: int = 128
     max_epochs: int = 100
+    # v3: question-conditioned FiLM instead of v4's question-field attention.
+    # Optimal for a SINGLE fixed problem (v3 = 98.0 on breakout vs v4's 94.0);
+    # v4 is for unseen-question generalization. Off by default (= v4).
+    film: bool = False
     patience: int = 10
     # Curriculum: epochs before introducing varied option sets
     anchor_epochs: int = 30

@@ -751,21 +751,53 @@ class TestQuestionAttentionCheckpoint:
                     atol=1e-6,
                 )
 
-    def test_v3_checkpoint_refused(self, capsys):
-        """Clean break: a hand-built v3-style checkpoint (FiLM keys) raises
-        ValueError — no silent fallback, the v3 checkpoint stays preserved
-        in the main checkout."""
-        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16, dropout=0.0, state_set=True)
+    def test_v3_film_head_roundtrips(self):
+        """v3 (question-conditioned FiLM) heads now load: arch_version 3 →
+        film=True, and the forward round-trips."""
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16,
+                                   dropout=0.0, state_set=True, film=True)
+        head.eval()
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        q = torch.randn(64)
+        with torch.no_grad():
+            orig = head.forward_choice(fields, opt_embs, question_emb=q)
         with tempfile.TemporaryDirectory() as tmp:
-            v4_path = Path(tmp) / "v4.pt"
-            save_dynamic_head(head, v4_path)
-            checkpoint = torch.load(str(v4_path), map_location="cpu")
-            checkpoint["arch"]["arch_version"] = 3
             path = Path(tmp) / "v3.pt"
-            torch.save(checkpoint, str(path))
+            save_dynamic_head(head, path)
+            loaded = load_dynamic_head(path)
+            loaded.eval()
+            assert loaded.film is True
+            with torch.no_grad():
+                assert torch.allclose(
+                    orig, loaded.forward_choice(fields, opt_embs, question_emb=q),
+                    atol=1e-6,
+                )
 
+    def test_v3_film_identity_at_init(self):
+        """Zero-init FiLM → a fresh film head ignores the question (starts as
+        v2); this is what makes v3 trainable at all."""
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16,
+                                   dropout=0.0, state_set=True, film=True).eval()
+        fields = torch.randn(4, 64)
+        opt_embs = torch.randn(3, 64)
+        with torch.no_grad():
+            a = head.forward_choice(fields, opt_embs, question_emb=torch.randn(64))
+            b = head.forward_choice(fields, opt_embs, question_emb=None)
+        assert torch.allclose(a, b)
+
+    def test_v2_arch_version_refused(self):
+        """v1/v2 (arch_version < 3) are still refused — no silent upgrade."""
+        head = DynamicDecisionHead(input_dim=64, hidden_dim=32, d_k=16,
+                                   dropout=0.0, state_set=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "v2.pt"
+            save_dynamic_head(head, p)
+            checkpoint = torch.load(str(p), map_location="cpu")
+            checkpoint["arch"]["arch_version"] = 2
+            torch.save(checkpoint, str(p))
             with pytest.raises(ValueError, match="arch_version"):
-                load_dynamic_head(path)
+                load_dynamic_head(p)
 
 
 class TestPredictDynamicQuestionCache:
