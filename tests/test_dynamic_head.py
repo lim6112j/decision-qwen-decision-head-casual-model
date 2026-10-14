@@ -1068,3 +1068,19 @@ class TestBackboneIdentity:
         head.backbone_id = "qwen|pooling=last"
         check_backbone_match(head, object())
         assert "warning" not in capsys.readouterr().out
+
+
+class TestEarlyStopVsEscapeGuard:
+    """Regression: patience must not early-stop BEFORE the escape guard — a
+    run stuck at the stage-1 plateau would otherwise stop and save a near-chance
+    model that looks like a success (observed 2026-10-14: a grid run early-stopped
+    at epoch 24 with best_val_acc 0.484; a retrain gave 0.973)."""
+
+    def test_patience_cannot_fire_before_guard(self):
+        from decision_lab.head.dynamic_train import _early_stop_due
+        assert _early_stop_due(epoch=24, patience_counter=20, patience=20,
+                               guard_epoch=40) is False
+        assert _early_stop_due(epoch=40, patience_counter=20, patience=20,
+                               guard_epoch=40) is True
+        assert _early_stop_due(epoch=50, patience_counter=3, patience=20,
+                               guard_epoch=40) is False

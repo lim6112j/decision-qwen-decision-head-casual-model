@@ -410,6 +410,17 @@ def _variants_for_bank_entry(
 # ---------------------------------------------------------------------------
 
 
+def _early_stop_due(epoch: int, patience_counter: int, patience: int,
+                    guard_epoch: int) -> bool:
+    """Patience-based early stop, held back until the escape guard has fired.
+
+    The guard checks the stage-1 plateau at ``guard_epoch``; if patience could
+    fire first, a plateaued run would stop and SAVE a near-chance model that
+    looks like a success (observed: epoch 24, val_acc 0.484 on a grid run).
+    """
+    return epoch >= guard_epoch and patience_counter >= patience
+
+
 def train_dynamic_head(
     samples: Sequence[DynamicTrainingSample],
     cfg: Config,
@@ -570,7 +581,13 @@ def train_dynamic_head(
         else:
             patience_counter += 1
 
-        if patience_counter >= hc.patience:
+        # Early stop must not preempt the escape guard above: a run stuck at the
+        # stage-1 plateau burns `patience` epochs BEFORE `guard_epoch` and would
+        # stop first — saving a garbage model that looks like a success.
+        # (Observed 2026-10-14: a grid run early-stopped at epoch 24 with
+        # best_val_acc 0.484 ≈ chance; a retrain gave 0.973.) Hold patience
+        # until the guard has had its chance.
+        if _early_stop_due(epoch, patience_counter, hc.patience, guard_epoch):
             print(f"  early stop at epoch {epoch}")
             break
 
