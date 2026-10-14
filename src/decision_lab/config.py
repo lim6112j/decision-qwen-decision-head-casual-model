@@ -17,6 +17,11 @@ class GeneratorConfig:
     # dynamic-head training only — never into typed-head training.
     num_breakout_train: int = 4000
     num_breakout_test: int = 500
+    # Cover every (latent, template) pair ONCE instead of sampling num_* random
+    # draws. The random bank is ~52 renderings of each of 192 label vectors
+    # (~12% exact-duplicate texts); the grid is ~6x smaller with full coverage.
+    # train/test_indist = 192 x len(templates), test_heldout = 192 x held-out.
+    systematic: bool = False
 
 
 @dataclass
