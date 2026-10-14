@@ -212,9 +212,8 @@ ceiling that is this close. Same for swapping the encoder.
 ### Majority-class collapse is the dominant real failure mode
 
 Whole-test accuracy 69.3% vs a **49.5% majority-class baseline** (+19.7pp of
-real signal). But per question the head often just learns the prior — plain
-accuracy was inflated ~20pp over the base rate and scored `duplicate` at 0.89
-where the model has **zero** skill:
+real signal). But per question the head often just learns the prior — e.g. it
+scored `duplicate` at 0.89 where the model has **zero** skill (0.500 balanced):
 
 | qid | acc | majority | balanced acc | worst class recall |
 |---|---|---|---|---|
@@ -276,11 +275,12 @@ are the one place with real, learnable headroom.
 
 ### Next (revised)
 
-Superseded by **Phase 0b's Next** below (which adds majority-only accuracy and
-deprioritizes the class-weighted loss). Kept for the trail:
+Superseded by **Phase 0b's Next** below (which stratifies by annotator
+disagreement and deprioritizes the class-weighted loss). Kept for the trail:
 
-1. ~~Report balanced accuracy, not accuracy.~~ Plain accuracy was inflated
-   ~20pp by the base rate; use it as the headline from here on.
+1. ~~Report balanced accuracy, not accuracy.~~ Accuracy sits on the annotators'
+   modal vote share (Phase 0b), so it is not the misleading part; keep it as the
+   headline.
 2. **Class-weighted loss** (+ balanced sampling) to attack the collapse above.
    Targets `discrepancy_severity` / `matches_order` too (documented headroom).
    Cheap, and requires no architecture change.
@@ -291,51 +291,70 @@ deprioritizes the class-weighted loss). Kept for the trail:
 5. Still worth measuring: a second seed (the +2.9pp LoRA gain is inside noise),
    and the full 2,000-decision teacher run (~659k input tokens, under $0.10).
 
-## Phase 0b — the labels are the ceiling, and a `qid` bug hid the break-down (2026-10-14)
+## Phase 0b — annotator disagreement is the ceiling, and a `qid` bug hid the break-down (2026-10-14)
 
 The parquet carries the annotators' own statistics, so the ambiguity above does
 not have to be inferred from a teacher. Two things came out of auditing them;
 the second invalidated the per-question break-downs printed in Phase 0.
 
-### ~40% of the test labels are a MINORITY vote — unreachable by design
+### Annotator disagreement, not mislabeled golds, sets the ceiling
 
-`label_agreement[qid]["argmax_agree"]` says whether the stored gold equals the
-annotators' majority. It does **not**, for 40.6% of test decisions (812/2000;
-train 35.3%). Those golds are a label that lost the vote, so any model answering
-their *natural* question is scored wrong:
+The parquet carries per-decision annotation statistics. Their **names mislead**
+— an earlier draft of this section misread one of them — so the meanings below
+were verified against the data:
 
-| gold is the… | n | ours (ft15) | teacher (same sample) |
+| field | verified meaning |
+|---|---|
+| `gold[qid].label` | the stored gold — what we are graded on |
+| `gold[qid].probabilities` | annotator distribution over the option keys (sums to 1.0) |
+| `label_agreement[qid].argmax_majority` | the annotators' majority choice |
+| `label_agreement[qid].total_variation` | divergence between annotator distributions (0 = unanimous, 1 = maximally split) |
+
+The stored gold **is** the annotators' majority 94.2% of the time (train 94.9%).
+So the labels are not mislabeled: only 5.8% of test decisions (116/2000) carry a
+gold that lost the vote. (An earlier draft put this at 40.6% by reading
+`argmax_agree` as "label == argmax_majority". It is not that — nor
+"label == argmax(probabilities)" — and its construction could not be recovered
+from the other fields, so nothing keys on it.)
+
+What the data does show is heavy annotator disagreement, and our accuracy tracks
+it almost linearly:
+
+| annotator disagreement | n | mean modal vote share | ours |
 |---|---|---|---|
-| annotators' majority | 1188 | **78.9%** | 81.7% |
-| a minority label | **812 (40.6%)** | **55.2%** | 50.3% |
+| `total_variation` [0.00, 0.05) | 335 | 0.897 | **86.0%** |
+| [0.05, 0.15) | 608 | 0.698 | 74.8% |
+| [0.15, 0.25) | 421 | 0.607 | 67.7% |
+| [0.25, 0.40) | 348 | 0.546 | 60.1% |
+| [0.40, 1.01) | 288 | 0.512 | **51.4%** |
 
-Our head **beats the teacher on the minority labels** (55.2% vs 50.3%). Two
-independent models both landing near chance on the same items is the signature
-of unreachable labels, not of headroom either could close.
+The teacher follows the same curve on the balanced 400-item sample: 83.7% where
+annotators agree, 57.7% mid, **51.9%** where they are split.
 
-Accuracy tracks the chosen label's vote fraction monotonically — a clean noise
-curve, not a capability cliff:
+**The ceiling is the modal vote share.** An oracle that always predicted the
+annotators' own modal answer would score the mean modal share, **0.659**. We
+score **69.2%** — already at that level — so the bulk of the remaining error
+lives where the annotators did not agree and no model can be reliably right.
 
-| vote fraction | n | ours | teacher |
-|---|---|---|---|
-| [0.00, 0.40) | 591 | 57.0% | – |
-| [0.40, 0.50) | 345 | 64.1% | – |
-| [0.50, 0.60) | 324 | 72.8% | – |
-| [0.60, 0.80) | 366 | 75.1% | – |
-| [0.80, 0.95) | 255 | 83.5% | – |
-| [0.95, 1.01) | 119 | **86.6%** | 98.7% |
+That is a per-question statement, though, and the useful split is by
+disagreement. Where annotators agree, errors are real model failures:
 
-Summarised for the teacher sample (n=400): where annotators are split the
-teacher scores **51.1%**; where they agree [0.8, 1.0] it scores **98.7%**.
-Mean between-annotator total variation is 0.202 (p90 0.444).
+| question_id | mean tv | ours | teacher | reading |
+|---|---|---|---|---|
+| `invoice_processing:matches_order` | **0.121** | 0.570 | **0.950** | **real headroom** — annotators agree, we miss it |
+| `invoice_processing:discrepancy_severity` | 0.226 | 0.480 | **0.850** | partial headroom |
+| `customer_service:churn_risk` | 0.194 | 0.680 | 0.750 | some headroom |
+| `customer_service:needs_human` | 0.170 | 0.700 | 0.700 | level |
+| `security_incidents:credential_compromise` | 0.142 | 0.730 | 0.600 | ours better |
+| `agent_trace_observability:outcome` | 0.265 | 0.630 | 0.600 | noise-limited |
+| `invoice_processing:disposition` | 0.304 | 0.480 | 0.550 | both near majority (0.450) |
+| `customer_service:action` | **0.316** | 0.610 | 0.650 | noise-limited |
 
-**Consequence:** the accuracy a model can reach is bounded by how often the gold
-is the majority — **59.4%** if it always matched the annotators' vote. Our 69.2%
-is above that only because the head sometimes reproduces the *specific* minority
-choice. So the honest headline on this data is majority-only accuracy (77.7%) or
-balanced accuracy, and the residual error is at least partly unmeasurable label
-noise — which is why the class-weighted loss proposed in Phase 0 is now
-**deprioritized**: it cannot recover labels that are minority votes.
+`matches_order` is the clean case: annotators essentially agree (tv 0.121, 100%
+gold == majority), the teacher gets 19/20, we get 12/20. `discrepancy_severity`
+is a weaker version of the same. So the earlier "class-weighted loss" idea is
+only worth it on those — not on the high-`total_variation` questions, where
+there is no consensus to learn.
 
 ### `qid` is only unique within a workflow — 15 names, 20 questions
 
@@ -357,8 +376,9 @@ scripts key on that. **2000 test decisions: 15 `qid` → 20 `question_id`.**
 ### Corrected per-question break-down (ours, 100 decisions each)
 
 This is the table Phase 0's "majority-class collapse" section should have shown.
-The sharpest failure, `urgency`, was invisible before: its merged bucket averaged
-the four workflows into a benign-looking number.
+The sharpest failure (`security_incidents:urgency`, balanced acc 0.361) was
+invisible before: its merged bucket averaged four answer distributions into a
+benign-looking number.
 
 | question_id | acc | majority | balanced acc | worst class recall |
 |---|---|---|---|---|
@@ -376,8 +396,10 @@ the four workflows into a benign-looking number.
 
 The **rarest, most severe class is almost never predicted** (0.00 recall on
 8–11 items) — the unweighted-CE prior problem is real and now has exact numbers.
-But it is entangled with the minority-label rate above: several of those rare
-classes are also the ones annotators were split on.
+But it is entangled with annotator disagreement above: several of those rare
+classes are also the ones the annotators were most split on, so how much of the
+collapse a weighted loss could recover is unknown until it is tried on the
+low-`total_variation`, high-agreement questions.
 
 ### Corrected head-to-head (balanced 400-item sample: 20 per real question)
 
@@ -403,22 +425,23 @@ worst questions; at 20 items that noise collapses to −5pp / +40pp.)
 
 ### Next (Phase 0b revision)
 
-1. **Report majority-only and balanced accuracy alongside plain accuracy.**
-   Plain accuracy is bounded by the 59.4% majority rate and inflated by it.
-2. **Deprioritize class-weighted loss** — the collapse is partly label noise it
-   cannot fix. If tried, evaluate on balanced accuracy and per-class recall, not
-   accuracy.
-3. **`matches_order` / invoice reconciliation is the real target** — the
-   documented, learnable gap.
+1. **Stratify evaluation by `total_variation`.** The headline 69.2% mixes
+   questions the annotators agreed on with ones they split; the first is a
+   meaningful model score and the second is mostly noise. Report both.
+2. **`matches_order` is the target** — annotators agree (tv 0.121), the teacher
+   gets 0.95, we get 0.57. `discrepancy_severity` second.
+3. **Class-weighted loss: worth a try only on the high-agreement questions.**
+   Where annotators split there is no consensus for it to recover.
 4. ~~One-sequence encoding / encoder swap~~ — still dropped (Phase 0).
-5. **Consider a majority-vote re-labeling pass** before spending more GPU: if
-   the benchmark's own gold is a minority vote 40% of the time, no model can
-   chase it, and training on it teaches the head to guess.
+5. **Do NOT re-label by majority vote** — the stored gold already *is* the
+   majority 94.2% of the time (an earlier draft argued the opposite from a
+   misread field). The useful signal is the disagreement itself, which the
+   benchmark exposes; use it to stratify, not to overwrite.
 
 ### Reproduce
 
 ```bash
-# per-question ambiguity + accuracy-vs-vote-fraction + majority/minority split
+# per-question disagreement + accuracy stratified by total_variation
 HF_HOME=models/.cache/huggingface CUDA_VISIBLE_DEVICES=1 \
   uv run python results_ft_bge/label_audit.py
 
@@ -468,8 +491,8 @@ Notes:
 
 Superseded by **Phase 0 / Phase 0b** above — the "~7pp to Laya" framing below
 was miscalibrated (the measured ceiling is ~74%, we are level with the teacher
-on the balanced sample, and ~40% of the gold labels are minority votes). Kept
-for the trail:
+on the balanced sample, and our accuracy already sits on the annotators' modal
+vote share). Kept for the trail:
 
 1. ~~Close the remaining ~7pp to Laya (69.2% vs 76.6%)~~ — **dropped**: 76.6%
    is Laya's number on the *official* split and is not comparable to ours.
@@ -478,5 +501,5 @@ for the trail:
 3. ~~Test joint state+question encoding (one sequence)~~ — **dropped**: two
    different architectures both land in the low 70s.
 4. Adopt this real-only + typed-decisions setup as the standard experiment
-   harness (52 s per run frozen; 2.1 h adapted) — **with balanced accuracy**
-   report as the headline metric.
+   harness (52 s per run frozen; 2.1 h adapted) — reporting accuracy and
+   balanced accuracy together.
