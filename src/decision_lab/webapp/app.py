@@ -39,6 +39,7 @@ from decision_lab.webapp.agents import (
     DynamicHeadAgent,
     build_agents,
     load_dynamic_paths,
+    resolve_default_path,
 )
 from decision_lab.webapp.simulator import evaluate_agent
 from decision_lab.webapp.traffic_log import TrafficLogger
@@ -71,8 +72,10 @@ class WebAppState:
     def start(self) -> None:
         self.server = server_from_config(self.cfg)
         self.server.start()
-        self.agents = build_agents(self.cfg, self.server)
+        # Load the sub-path heads FIRST: build_agents reuses one of them as the
+        # SSE `head_dynamic` agent, so the checkpoint is loaded once, not twice.
         self.dynamic_paths = load_dynamic_paths(self.cfg, self.server)
+        self.agents = build_agents(self.cfg, self.server, self.dynamic_paths)
         self.question_spec = build_question_spec(self.cfg.questions)
         self.states = self._load_states()
 
@@ -84,13 +87,7 @@ class WebAppState:
         routing is that the caller gets the head they asked for).
         """
         if name is None:
-            if self.cfg.web.default_path:
-                name = self.cfg.web.default_path
-            elif len(self.dynamic_paths) == 1:
-                return next(iter(self.dynamic_paths))
-            else:
-                raise ValueError(
-                    f"`path` is required: available {sorted(self.dynamic_paths)}")
+            return resolve_default_path(self.cfg, self.dynamic_paths)
         if name not in self.dynamic_paths:
             raise ValueError(
                 f"unknown path {name!r}; available {sorted(self.dynamic_paths)}")

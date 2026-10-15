@@ -79,9 +79,14 @@ refuses that same checkpoint (`arch_version 3 ... this build only loads v4`)
 
 Two more things worth knowing:
 
-- **One dynamic head per process.** `build_agents` registers a single
-  `head_dynamic`; switching versions means switching the config (or running
-  two checkouts on different ports), not selecting per request.
+- **One dynamic head per version, shared by both entry points.** The
+  checkpoint named by `dynamic_head.checkpoint_filename` is loaded **once**:
+  `/api/decide-dynamic` reaches it through the `dynamic_paths` map and the SSE
+  endpoints (`/api/run`, `/api/compare`) through `agents["head_dynamic"]`,
+  which is the same object, not a second load. Switching versions still means
+  switching the config (or running two checkouts on different ports) — with
+  `web.paths` you can additionally serve several heads off one backbone and
+  select per request.
 - **The feature caches are shared, not per-version.** Both architectures
   read the same `data/features_*_fields.npz` (the field splitter and
   `include_summary_field` are identical in v3 and v4, so the cache
