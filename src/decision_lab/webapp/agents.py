@@ -281,8 +281,16 @@ class DynamicHeadAgent:
         return results, latency_ms
 
 
-def build_agents(cfg: Config, server) -> dict[str, object]:
-    """Instantiate the 4 selectable agents from config + a running LlamaServer."""
+def build_agents(
+    cfg: Config, server, dynamic_paths: dict[str, DynamicHeadAgent] | None = None,
+) -> dict[str, object]:
+    """Instantiate the selectable agents from config + a running LlamaServer.
+
+    ``dynamic_paths`` is the already-loaded sub-path map (see
+    ``load_dynamic_paths``). Pass it in so the SSE ``head_dynamic`` agent and
+    the ``/api/decide-dynamic`` path map share ONE loaded head instead of
+    loading the same checkpoint twice. None → load it here (standalone use).
+    """
     agents: dict[str, object] = {}
 
     trained, temperatures = _load_trained_head(cfg)
@@ -293,11 +301,41 @@ def build_agents(cfg: Config, server) -> dict[str, object]:
                            hidden_dim=cfg.head.hidden_dim, dropout=cfg.head.dropout),
         server, "head_random",
     )
-    agents["head_dynamic"] = _load_dynamic_agent(cfg, server, question_spec)
+    # The SSE path (/api/run, /api/compare) has no `path` field, so it gets the
+    # default sub-path's head — the same object, not a second load of its file.
+    if dynamic_paths is None:
+        dynamic_paths = load_dynamic_paths(cfg, server)
+    try:
+        agents["head_dynamic"] = dynamic_paths[resolve_default_path(cfg, dynamic_paths)]
+    except ValueError as exc:
+        # /api/decide-dynamic still works with an explicit `path`; only the
+        # path-less SSE endpoints lose the agent. Warn rather than abort startup.
+        print(f"  warning: head_dynamic is unavailable on /api/run — {exc}")
     agents["prompt_lm_zero_shot"] = PromptAgentAdapter(
         PromptAgent(cfg, server, mode=PromptMode.ZERO_SHOT)
     )
     return agents
+
+
+def resolve_default_path(cfg: Config, dynamic_paths: dict) -> str:
+    """The sub-path the SSE endpoints use: ``web.default_path``, else the sole one.
+
+    Raises ``ValueError`` when there is no valid answer, distinguishing the two
+    causes so the message blames the right one: a declared-but-missing default
+    is a *config* error (a typo), while several paths with no declared default
+    means the *caller* must supply one. Ambiguity is never resolved by guessing
+    — the whole point of explicit routing is that the caller gets the head they
+    asked for.
+    """
+    if cfg.web.default_path:
+        if cfg.web.default_path not in dynamic_paths:
+            raise ValueError(
+                f"web.default_path {cfg.web.default_path!r} is not among the "
+                f"configured paths {sorted(dynamic_paths)}")
+        return cfg.web.default_path
+    if len(dynamic_paths) == 1:
+        return next(iter(dynamic_paths))
+    raise ValueError(f"`path` is required: available {sorted(dynamic_paths)}")
 
 
 def _load_trained_head(cfg: Config) -> tuple[TypedDecisionHead, dict]:

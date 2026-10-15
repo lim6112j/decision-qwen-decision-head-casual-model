@@ -119,6 +119,14 @@ Then select one per request: `{"path": "typed", "custom_text": ...,
 - Each path is trained independently on its own problem's data. With
   `dynamic_head.real_only: true` a path trains on just its real samples (the
   typed-decisions path trains in ~40 s).
+- **Each checkpoint is loaded once**, at startup. `/api/decide-dynamic` picks a
+  head from the path map; the SSE endpoints (`/api/run`, `/api/compare`) have
+  no `path` field and use `web.default_path` instead — it is the *same object*
+  as that path's head, so nothing is loaded twice.
+- **With several paths and no `web.default_path`**, the SSE endpoints cannot
+  choose: `head_dynamic` is left out of `/api/agents` and a startup warning
+  names the available paths. `/api/decide-dynamic` still works with an explicit
+  `path`. The ambiguity is never resolved by guessing.
 
 ### Supported question domains
 
