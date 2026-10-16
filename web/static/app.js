@@ -654,6 +654,13 @@ for (const t of tabButtons) {
   t.addEventListener("click", () => showView(t.dataset.view));
 }
 
+// Deep-link a view, so an embedding page can open straight onto it (laya's
+// static/decision_lab.html frames this UI with `?tab=label`). Validated against
+// `views` — own keys only, since `in` would also accept "constructor" and blank the
+// view — so an unknown value leaves the default view alone instead of hiding everything.
+const requestedView = new URLSearchParams(location.search).get("tab");
+if (Object.hasOwn(views, requestedView)) showView(requestedView);
+
 /* ---------- real-traffic labeling ---------- */
 
 els.labelList = document.getElementById("label-list");
